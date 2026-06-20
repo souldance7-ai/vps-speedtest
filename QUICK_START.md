@@ -1,43 +1,71 @@
-# 快速下载执行
+# QUICK START / Windows CMD 正确执行版
 
-## 标准综合测试
+## 重点说明
+
+Windows CMD 不能直接运行：
+
+```bash
+bash <(curl -fsSL URL) --standard
+```
+
+这是 Linux Bash 语法。Windows CMD 正确方式是通过 `ssh root@VPS "bash -lc '...'"` 让 VPS 去执行 Linux 命令。
+
+---
+
+## 1. Windows CMD：远程触发 VPS 标准回程测试
+
+**Windows CMD 执行：**
+
+```cmd
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
+```
+
+## 2. Windows CMD：远程安装依赖并测试
+
+**Windows CMD 执行：**
+
+```cmd
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --install --standard'"
+```
+
+## 3. Windows CMD：远程深度测试
+
+**Windows CMD 执行：**
+
+```cmd
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --deep'"
+```
+
+## 4. Windows CMD：本地端去程 + 代理体感
+
+**Windows CMD 执行：**
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_client_probe.ps1 -OutFile .\cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的VPS_IP -Ports 22,443 -Proxy http://127.0.0.1:7890"
+```
+
+## 5. Windows CMD：本地端只测去程 / TCP 端口
+
+**Windows CMD 执行：**
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_client_probe.ps1 -OutFile .\cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的VPS_IP -Ports 22,443"
+```
+
+## 6. 如果已经进入 VPS/Linux
 
 **VPS/Linux 执行：**
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --standard
+curl -fsSL -o cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh
+chmod +x cn3_vps_server_test.sh
+bash cn3_vps_server_test.sh --standard
 ```
 
-## 首次安装依赖并测试
-
-**VPS/Linux 执行：**
+或：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --install --standard
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh) --standard
 ```
 
-## 深度测试
-
-**VPS/Linux 执行：**
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --deep
-```
-
-## 仅延迟 / 回程骨干
-
-**VPS/Linux 执行：**
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --route-only
-```
-
-## 下载后运行，推荐留档
-
-**VPS/Linux 执行：**
-
-```bash
-curl -fsSL -o cn3_vps_net_test_plus.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh
-chmod +x cn3_vps_net_test_plus.sh
-bash cn3_vps_net_test_plus.sh --standard
-```
+> 这一条只适合 Linux Bash，不适合 Windows CMD。
