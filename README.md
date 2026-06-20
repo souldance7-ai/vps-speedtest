@@ -26,6 +26,13 @@
 
 > **注意：** 本项目评分口径为 **VPS 中国方向质量评估**，并非家用宽带测速模型，**评级仅供参考**。
 
+> **最快使用：**
+>
+> ```bash
+> bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --standard
+> ```
+
+
 ---
 
 ## 功能特性
@@ -48,6 +55,81 @@
 ### 2）开源使用说明图
 
 ![开源使用说明图](docs/usage-flow.png)
+
+---
+
+## 一键下载执行
+
+如果你把 `cn3_vps_net_test_plus.sh` 放在 GitHub 仓库根目录，用户可以直接复制下面命令运行。
+
+> 当前按你的仓库地址预填：`souldance7-ai/VPS-`  
+> 若你后续换仓库名，只需要把命令里的 RAW 地址改掉即可。
+
+### 方式一：直接在线运行
+
+**VPS/Linux 执行：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --standard
+```
+
+### 方式二：下载到本地再运行，推荐
+
+**VPS/Linux 执行：**
+
+```bash
+curl -fsSL -o cn3_vps_net_test_plus.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh
+chmod +x cn3_vps_net_test_plus.sh
+bash cn3_vps_net_test_plus.sh --standard
+```
+
+### 方式三：wget 下载运行
+
+**VPS/Linux 执行：**
+
+```bash
+wget -O cn3_vps_net_test_plus.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh
+chmod +x cn3_vps_net_test_plus.sh
+bash cn3_vps_net_test_plus.sh --standard
+```
+
+### 首次安装依赖并测试
+
+**VPS/Linux 执行：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --install --standard
+```
+
+### 深度测试
+
+**VPS/Linux 执行：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --deep
+```
+
+### 只看延迟 / 回程骨干
+
+**VPS/Linux 执行：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_net_test_plus.sh) --route-only
+```
+
+### 如果脚本放在子目录
+
+如果你不是放在仓库根目录，而是放在例如：
+
+```text
+tools/cn3_vps_net_test_plus.sh
+```
+
+那么 RAW 地址要改成：
+
+```bash
+https://raw.githubusercontent.com/souldance7-ai/VPS-/main/tools/cn3_vps_net_test_plus.sh
+```
 
 ---
 
