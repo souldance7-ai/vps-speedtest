@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =====================================================================
-# LazyVPS CN3 VPS Net Test Plus
+# LazyVPS CN3 VPS SpeedTest Official
 # 中国电信 / 中国联通 / 中国移动 三网 VPS 网络质量测试脚本（非家宽口径）
 # License: MIT
-# Version: 2.2.0-open
+# Version: VPS测速正式v1.0
 # =====================================================================
 
 set -Eeuo pipefail
 
-VERSION="2.6.0-open"
+VERSION="VPS测速正式v1.0"
 SCRIPT_NAME="CN3 VPS 三网综合测试（VPS版）"
 MODE="standard"          # quick / standard / deep / route
 RUN_SPEED=1
@@ -48,8 +48,10 @@ if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then NO_COLOR_MODE=1; fi
 if [[ "$NO_COLOR_MODE" -eq 0 ]]; then
   RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
   RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; MAGENTA=$'\033[35m'; CYAN=$'\033[36m'; WHITE=$'\033[37m'
+  BG_DARK=$'\033[48;5;234m'; BG_PANEL=$'\033[48;5;236m'; BG_BLUE=$'\033[48;5;24m'; BG_SELECT=$'\033[48;5;58m'; BG_RED=$'\033[48;5;52m'; BG_GREEN=$'\033[48;5;22m'
 else
   RESET=""; BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""
+  BG_DARK=""; BG_PANEL=""; BG_BLUE=""; BG_SELECT=""; BG_RED=""; BG_GREEN=""
 fi
 
 if locale 2>/dev/null | grep -qi 'UTF-8'; then
@@ -87,21 +89,32 @@ horse_art() {
    ____/ 0 0\  ____/ 0 0\  ____/ 0 0\  ____/ 0 0\
   /  __    _/ /  __    _/ /  __    _/ /  __    _/
  /__/  \__/  /__/  \__/  /__/  \__/  /__/  \__/
-   /_/ \_\     /_/ \_\     /_/ \_\     /_/ \_\      万马奔腾测速版
+   /_/ \_\     /_/ \_\     /_/ \_\     /_/ \_\        万马奔腾测速版
 EOF_HORSE
+}
+
+ansi_rule() {
+  local width="${1:-86}" ch="${2:--}"
+  printf '%s' "$CYAN"
+  repeat_char "$ch" "$width"
+  printf '%s\n' "$RESET"
 }
 
 banner() {
   clear_screen
-  printf '%s%s%s\n' "$CYAN" "$(hr 86)" "$RESET"
+  ansi_rule 86 "="
+  printf '%s' "$CYAN"
   horse_art
-  printf '%s%s%s\n' "$CYAN" "$(hr 86)" "$RESET"
-  printf '%s%s%s\n' "$BOLD" "LazyVPS CN3 VPS Net Test Plus" "$RESET"
+  printf '%s' "$RESET"
+  ansi_rule 86 "="
+  printf '%s%s%s  %s%s%s\n' "$BOLD" "LazyVPS CN3 VPS SpeedTest Official" "$RESET" "$CYAN" "万马奔腾测速版" "$RESET"
   printf '中国电信 / 中国联通 / 中国移动 · VPS 中国方向评估\n'
-  printf '延迟 · 丢包 · 路由 · 测速 · 回程骨干观察 · 综合参考评分\n'
-  printf '%s开源版 v%s · 交互菜单 · CMD仪表盘 · 评级仅供参考%s\n' "$DIM" "$VERSION" "$RESET"
-  printf '%s%s%s\n\n' "$CYAN" "$(hr 86)" "$RESET"
+  printf '回程骨干 · 延迟丢包 · TCP连通 · Speedtest · 报告留档\n'
+  printf '%sVPS测速正式版 %s · BBS信息板 · 一键快捷 · 评级仅供参考%s\n' "$DIM" "$VERSION" "$RESET"
+  ansi_rule 86 "="
+  printf '\n'
 }
+
 
 # ---------- 评分条 / 进度 ----------
 color_by_score() {
@@ -195,10 +208,10 @@ USAGE
 }
 
 choose_mode_by_arrow() {
-  # 交互式菜单：支持 ↑↓ / W/S / J/K / 数字 / Enter
-  # 返回选择编号：0-6
+  # BBS信息板 菜单：只高亮当前选项，不再每行铺满底色，避免 CMD 视觉混乱
   local selected=2
   local key rest
+  MENU_CHOICE=""
 
   while true; do
     banner
@@ -208,46 +221,42 @@ choose_mode_by_arrow() {
 提示：
   - 可直接按数字 1/2/3/4/5/6/0
   - 也可用 ↑ ↓ 方向键选择，Enter 确认
-  - 本脚本面向 VPS 中国方向质量评估，不按家宽口径打分，评级仅供参考
+  - 当前版改为 BBS信息板 风格：重点高亮，不再整行底色铺满
 
 MENU_HEAD
 
-    local i
-    local names=(
+    local items=(
       "0|退出脚本|不执行任何测试"
-      "1|快速体验测试|Ping + TCP + 每网 1 个测速点，适合先看大概"
-      "2|标准综合测试|Ping + TCP + MTR + Traceroute + 每网 2 个测速点，推荐"
-      "3|深度三网测试|更多采样 + 每网 3 个测速点，适合晚高峰留档/发报告"
-      "4|仅延迟路由测试|不跑 Speedtest，只看三网延迟、丢包、MTR、回程骨干"
-      "5|安装/补齐依赖|curl / python3 / mtr / traceroute / speedtest"
+      "1|快速体验|Ping + TCP + 每网 1 个测速点，先看大概"
+      "2|标准综合|Ping + TCP + MTR + Traceroute + 每网 2 个测速点，推荐"
+      "3|深度三网|更多采样 + 每网 3 个测速点，适合晚高峰留档/发报告"
+      "4|仅路由延迟|不跑 Speedtest，只看延迟、丢包、MTR、回程骨干"
+      "5|安装依赖|安装 curl / python3 / mtr / traceroute / speedtest"
       "6|帮助说明|查看参数与使用方式"
     )
 
-    printf '%s+----+----------------+------------------------------------------------------------+%s\n' "$CYAN" "$RESET"
-    printf '%s| %-2s | %-14s | %-58s |%s\n' "$CYAN" "序" "模式" "说明" "$RESET"
-    printf '%s+----+----------------+------------------------------------------------------------+%s\n' "$CYAN" "$RESET"
-
-    for item in "${names[@]}"; do
+    printf '%s%s%s\n' "$CYAN" "──────────────────────────────────────────────────────────────────────────────" "$RESET"
+    local item num title desc prefix line_color
+    for item in "${items[@]}"; do
       IFS='|' read -r num title desc <<< "$item"
       if [[ "$num" -eq "$selected" ]]; then
-        if [[ "$NO_COLOR_MODE" -eq 0 ]]; then
-          printf '%s| %s%-2s%s | %s%-14s%s | %s%-58s%s |%s\n' "$CYAN" "$YELLOW" "▶$num" "$CYAN" "$YELLOW" "$title" "$CYAN" "$YELLOW" "$desc" "$CYAN" "$RESET"
-        else
-          printf '| >%-1s | %-14s | %-58s |\n' "$num" "$title" "$desc"
-        fi
+        prefix="▶"
+        line_color="$YELLOW$BOLD"
       else
-        printf '%s| %-2s | %-14s | %-58s |%s\n' "$CYAN" "$num" "$title" "$desc" "$RESET"
+        prefix=" "
+        line_color="$CYAN"
       fi
+      printf '%s %s [%s] %-12s %s%s\n' "$line_color" "$prefix" "$num" "$title" "$desc" "$RESET"
     done
+    printf '%s%s%s\n' "$CYAN" "──────────────────────────────────────────────────────────────────────────────" "$RESET"
 
-    printf '%s+----+----------------+------------------------------------------------------------+%s\n' "$CYAN" "$RESET"
     printf '\n当前选择：%s%s%s  （↑↓切换 / Enter确认 / 数字直选）' "$BOLD" "$selected" "$RESET"
 
     IFS= read -rsn1 key || key=""
     case "$key" in
       "")
         printf '\n'
-        echo "$selected"
+        MENU_CHOICE="$selected"
         return 0
         ;;
       $'\x1b')
@@ -259,23 +268,21 @@ MENU_HEAD
         ;;
       [0-6])
         printf '\n'
-        echo "$key"
+        MENU_CHOICE="$key"
         return 0
         ;;
       w|W|k|K)
-        selected=$((selected-1)); [[ "$selected" -lt 0 ]] && selected=6
-        ;;
+        selected=$((selected-1)); [[ "$selected" -lt 0 ]] && selected=6 ;;
       s|S|j|J)
-        selected=$((selected+1)); [[ "$selected" -gt 6 ]] && selected=0
-        ;;
+        selected=$((selected+1)); [[ "$selected" -gt 6 ]] && selected=0 ;;
       q|Q)
         printf '\n'
-        echo "0"
-        return 0
-        ;;
+        MENU_CHOICE="0"
+        return 0 ;;
     esac
   done
 }
+
 
 set_mode_from_option() {
   local opt="$1"
@@ -302,7 +309,8 @@ interactive_menu() {
   local opt
   while true; do
     if [[ -t 0 && "$QUIET" -eq 0 ]]; then
-      opt="$(choose_mode_by_arrow)"
+      choose_mode_by_arrow
+      opt="${MENU_CHOICE:-2}"
     else
       banner
       cat <<MENU
@@ -499,7 +507,7 @@ except Exception:
 lines = [
     '# VPS 基础信息',
     '',
-    '- 脚本版本：2.6.0-open',
+    '- 脚本版本：VPS测速正式v1.0',
     '- 测试时间：' + sh("date '+%F %T %Z'"),
     '- Hostname：' + sh('hostname'),
     '- Kernel：' + sh('uname -a'),
@@ -1079,281 +1087,204 @@ isp_emoji() {
 render_summary_screen() {
   clear_screen
   banner
-  section_title "测试完成：CMD 对齐表格 + 组合柱状图"
-  info_note "VPS 中国方向评估；CMD 只展示整理后的可视化结果，完整长路由已放到 mtr/ 与 traceroute/。"
-  if [[ -n "${IP_BRIEF:-}" ]]; then info_note "出口来源地：${IP_BRIEF}"; fi
+  section_title "测试完成：BBS 信息板结果页"
+  info_note "CMD 显示整理后的可视化结果；完整长路由保存在 mtr/ 与 traceroute/。"
   printf '\n'
 
   if [[ ! -s "$OVERVIEW_CSV" ]]; then warn "没有生成总表。"; return 0; fi
 
-  python3 - "$OVERVIEW_CSV" "$ROUTE_CSV" "$REPORT_MD" "$LATENCY_CSV" "$SPEED_CSV" "$OUT_DIR" <<'PYCODE'
-import sys, csv, re, math, unicodedata
+  python3 - "$OVERVIEW_CSV" "$ROUTE_CSV" "$BASEINFO_MD" "$REPORT_MD" "$LATENCY_CSV" "$SPEED_CSV" "$OUT_DIR" <<'PYCODE'
+import sys, csv, re, textwrap
+overview, route_csv, base_info, report_md, latency_csv, speed_csv, out_dir = sys.argv[1:8]
 
-overview, route_csv, report_md, latency_csv, speed_csv, out_dir = sys.argv[1:7]
 RESET="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
-RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; MAGENTA="\033[35m"; CYAN="\033[36m"; WHITE="\033[37m"
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"; BLUE="\033[34m"; CYAN="\033[36m"; WHITE="\033[37m"
+if not sys.stdout.isatty():
+    RESET=BOLD=DIM=RED=GREEN=YELLOW=BLUE=CYAN=WHITE=""
 
 ansi_re=re.compile(r'\x1b\[[0-9;]*m')
-
-def strip_ansi(s):
-    return ansi_re.sub('', str(s))
-
-def dw(s):
-    s=strip_ansi(str(s))
-    total=0
-    for ch in s:
-        if unicodedata.combining(ch):
-            continue
-        if unicodedata.east_asian_width(ch) in ('F','W'):
-            total += 2
-        else:
-            total += 1
-    return total
-
-def fit(s, width):
-    s=str(s)
-    raw=strip_ansi(s)
-    if dw(raw) <= width:
-        return s + ' ' * (width - dw(raw))
-    out=''
-    cur=0
-    for ch in raw:
-        w=2 if unicodedata.east_asian_width(ch) in ('F','W') else 1
-        if cur + w > max(0,width-1):
-            break
-        out += ch
-        cur += w
-    return out + '…' + ' ' * max(0, width - cur - 1)
-
-def right(s, width):
-    s=str(s)
-    return ' ' * max(0, width-dw(s)) + s
-
-def center(s, width):
-    s=str(s); pad=max(0, width-dw(s)); l=pad//2; r=pad-l
-    return ' '*l + s + ' '*r
-
-def score_color(x):
-    try: x=float(x)
-    except: x=0
-    if x>=82: return GREEN
-    if x>=66: return CYAN
-    if x>=56: return YELLOW
-    return RED
-
-def risk_color_good_pct(x):
-    try: x=float(x)
-    except: x=0
-    if x>=90: return GREEN
-    if x>=70: return CYAN
-    if x>=50: return YELLOW
-    return RED
-
-def loss_color(x):
-    try: x=float(x)
-    except: x=100
-    if x<=2: return GREEN
-    if x<=8: return CYAN
-    if x<=20: return YELLOW
-    return RED
-
-def grade_pos(score):
-    try: s=float(score)
-    except: s=0
-    if s>=90: return 'A+主力'
-    if s>=82: return 'A主力'
-    if s>=74: return 'B+良好'
-    if s>=66: return 'B可用'
-    if s>=56: return 'C备用'
-    return 'D谨慎'
-
-def usage_label(score):
-    try: s=float(score)
-    except: s=0
-    if s>=82: return '主力'
-    if s>=66: return '观察'
-    if s>=56: return '备用'
-    return '轻量'
-
-def bar(value, width=18, invert=False):
-    try: v=float(value)
-    except: v=0
-    v=max(0,min(100,v))
-    n=round(v/100*width)
-    col=score_color(v) if not invert else loss_color(v)
-    return col + '█'*n + DIM + '░'*(width-n) + RESET
-
-def metric_bar(value, maxv, width=12, lower_is_better=False):
-    try: v=float(value)
-    except: return DIM + '░'*width + RESET
-    pct=max(0,min(100, v/maxv*100 if maxv else 0))
-    if lower_is_better:
-        if v<=70: col=GREEN
-        elif v<=120: col=CYAN
-        elif v<=180: col=YELLOW
-        else: col=RED
+def strip(s): return ansi_re.sub('', str(s))
+def num(x):
+    try:
+        sx=str(x).strip()
+        if sx.upper() in ('NA','N/A','--',''): return None
+        return float(sx)
+    except Exception:
+        return None
+def fmt(v, nd=1):
+    x=num(v); return '--' if x is None else f'{x:.{nd}f}'
+def pct(v):
+    x=num(v); return '--' if x is None else f'{x:.1f}%'
+def color_score(v):
+    x=num(v) or 0
+    return GREEN if x>=82 else CYAN if x>=66 else YELLOW if x>=56 else RED
+def color_loss(v):
+    x=num(v)
+    if x is None: return YELLOW
+    return GREEN if x<=2 else CYAN if x<=8 else YELLOW if x<=20 else RED
+def color_good(v):
+    x=num(v)
+    if x is None: return YELLOW
+    return GREEN if x>=90 else CYAN if x>=70 else YELLOW if x>=50 else RED
+def bar(v,width=26,maxv=100,low_good=False):
+    x=num(v)
+    if x is None:
+        return DIM+'░'*width+RESET
+    pctv=max(0,min(100,x/maxv*100 if maxv else 0))
+    if low_good:
+        col=GREEN if x<=70 else CYAN if x<=120 else YELLOW if x<=180 else RED
     else:
-        if pct>=80: col=GREEN
-        elif pct>=50: col=CYAN
-        elif pct>=25: col=YELLOW
-        else: col=RED
-    n=round(pct/100*width)
+        col=color_score(pctv)
+    n=round(pctv/100*width)
     return col+'█'*n+DIM+'░'*(width-n)+RESET
-
 def read_csv(p):
     try:
-        with open(p, encoding='utf-8') as f:
+        with open(p, encoding='utf-8-sig') as f:
             return list(csv.DictReader(f))
     except Exception:
         return []
+def read_base(p):
+    data={}
+    try:
+        for line in open(p, encoding='utf-8', errors='ignore'):
+            line=line.strip()
+            for key in ['IPv4','IPv6','归属地','ASN','组织/运营商','默认网关']:
+                if line.startswith(f'- {key}：'):
+                    data[key]=line.split('：',1)[1].strip()
+    except Exception:
+        pass
+    return data
+def isp_code(r):
+    isp=r.get('ISP',''); name=r.get('运营商','')
+    if isp=='CT' or '电信' in name: return 'CT'
+    if isp=='CU' or '联通' in name: return 'CU'
+    if isp=='CM' or '移动' in name: return 'CM'
+    return isp or name[:2]
+def isp_cn(code):
+    return {'CT':'中国电信','CU':'中国联通','CM':'中国移动'}.get(code,code)
+def use_label(score):
+    x=num(score) or 0
+    return '主力' if x>=82 else '可用' if x>=66 else '备用' if x>=56 else '轻量'
+def speed_state(r):
+    dn=num(r.get('平均下载Mbps')); up=num(r.get('平均上传Mbps')); n=num(r.get('测速点数'))
+    if dn is not None or up is not None: return 'OK'
+    if n is None or n==0: return 'NO-ST'
+    return 'FAIL'
+routes=read_csv(route_csv)
+route_map={r.get('ISP',''):{'bb':r.get('回程骨干识别',''), 'ft':r.get('关键特征','')} for r in routes}
+def route_short(isp):
+    bb=(route_map.get(isp,{}) or {}).get('bb','') or 'UNKNOWN'
+    for a,b in [
+        ('电信国际/CTG 或 163 出口','CTG/163'),('电信 163 骨干','163'),('CN2 精品网','CN2'),
+        ('联通 169 骨干 / AS4837','169/4837'),('联通 A 网 / CUII / 9929 疑似','9929/CUII'),
+        ('联通国际精品 / AS10099','AS10099'),('移动 CMNET 骨干 / AS9808','CMNET'),('移动国际 CMI','CMI'),
+        ('快速模式未执行路由采样','NO-ROUTE'),('路由隐藏较多，暂无法自动识别','HIDDEN'),
+        ('未识别到典型骨干标记','CHECK-RAW'),('未取得路由样本','NO-SAMPLE')]:
+        bb=bb.replace(a,b)
+    return bb.replace(' / ','+')
+def key_short(isp):
+    ft=(route_map.get(isp,{}) or {}).get('ft','') or ''
+    keys=['59.43','202.97','219.158','218.105','210.51','210.52','221.183','221.176','223.120','223.121','223.118','AS4837','AS9929','AS9808','CTG','CMI','CN2']
+    out=[]
+    for k in keys:
+        if k.lower() in ft.lower() and k not in out:
+            out.append(k)
+    return '/'.join(out[:6]) if out else 'CHECK-RAW'
+def section(title):
+    print()
+    print(CYAN+'='*92+RESET)
+    print(CYAN+'◆ '+BOLD+title+RESET)
+    print(CYAN+'-'*92+RESET)
+def wrap_print(prefix, text, width=86):
+    text=str(text or '').replace('\n',' ')
+    lines=textwrap.wrap(text, width=width-len(prefix), break_long_words=False, replace_whitespace=True) or ['']
+    for i,line in enumerate(lines):
+        print((prefix if i==0 else ' '*len(prefix)) + line)
+def compact_advice(s):
+    s=str(s or '').replace('\n',' ')
+    replacements=[
+        ('波动或样本偏弱，建议结合路由与高峰复测再判断','波动偏弱，建议晚高峰复测'),
+        ('基础可用，更适合作为备用或轻量线路','基础可用，偏备用/轻量'),
+        ('中等偏上，可用性尚可，建议结合实际业务与高峰表现判断','可用，需结合业务体感'),
+        ('整体良好，日常使用问题不大，兼顾主力/备用均可','整体良好，可主备两用'),
+        ('整体很强，可作为主力使用；建议晚高峰再复测确认','整体很强，建议高峰确认'),
+    ]
+    for a,b in replacements:
+        s=s.replace(a,b)
+    return s
 
 rows=read_csv(overview)
-routes=read_csv(route_csv)
-route_map={r.get('ISP',''):{'backbone':r.get('回程骨干识别',''), 'feature':r.get('关键特征','')} for r in routes}
+rows.sort(key=lambda r: num(r.get('综合评分')) or 0, reverse=True)
+base=read_base(base_info)
 
-# Ensure numeric sort
-def sc(r):
-    try: return float(r.get('综合评分') or 0)
-    except: return 0
-rows.sort(key=sc, reverse=True)
+section('一、VPS 基础信息')
+print(f"IPv4        : {base.get('IPv4','--')}")
+print(f"IPv6        : {base.get('IPv6','--')}")
+print(f"归属地      : {base.get('归属地','--')}")
+print(f"ASN/组织    : {base.get('ASN','--')} / {base.get('组织/运营商','--')}")
+print(f"默认网关    : {base.get('默认网关','--')}")
 
-def route_short(isp):
-    r=route_map.get(isp,{})
-    bb=r.get('backbone') or '未识别'
-    # simplify readable labels
-    reps=[
-        ('电信国际/CTG 或 163 出口','电信CTG/163'),
-        ('电信 163 骨干','电信163'),
-        ('CN2 精品网','CN2'),
-        ('联通 169 骨干 / AS4837','联通169/4837'),
-        ('联通 A 网 / CUII / 9929 疑似','联通9929/CUII'),
-        ('联通国际精品 / AS10099','联通AS10099'),
-        ('移动 CMNET 骨干 / AS9808','移动CMNET'),
-        ('移动国际 CMI','移动CMI'),
-        ('快速模式未执行路由采样','未采样'),
-        ('未识别到典型骨干标记','需人工核对'),
-        ('路由隐藏较多，暂无法自动识别','隐藏较多'),
-    ]
-    for a,b in reps:
-        bb=bb.replace(a,b)
-    bb=bb.replace(' / ','+')
-    return bb
-
-def feature_short(isp):
-    ft=(route_map.get(isp,{}) or {}).get('feature','') or '无'
-    # keep only first meaningful tokens, avoid long IP flood
-    tokens=[]
-    for key in ['59.43','202.97','219.158','218.105','210.51','210.52','221.183','221.176','223.120','223.121','223.118','AS4837','AS9929','AS9808','CTG','CMI']:
-        if key.lower() in ft.lower() and key not in tokens:
-            tokens.append(key)
-    if tokens:
-        return '/'.join(tokens[:6])
-    if '快速模式' in ft:
-        return '需标准/深度'
-    if '人工查看' in ft:
-        return '看原始路由'
-    return '样本不足'
-
-def line(w=118):
-    print(CYAN + '+' + '-'*(w-2) + '+' + RESET)
-
-print(CYAN + '+' + '-'*116 + '+' + RESET)
-print(CYAN + '|' + center('中国三网 VPS 可视化仪表盘（CMD 对齐版）',116) + '|' + RESET)
-print(CYAN + '+' + '-'*116 + '+' + RESET)
-
-# Table 1
-cols=[('排',4),('运营商',10),('评分',7),('级别',6),('定位',8),('Ping',10),('丢包',8),('TCP',8),('下载/上传',16),('回程骨干',20)]
-width=sum(w for _,w in cols)+len(cols)+1
-print('\n'+CYAN+'+'+'+'.join('-'*w for _,w in cols)+'+'+RESET)
-print(CYAN+'|'+'|'.join(center(h,w) for h,w in cols)+'|'+RESET)
-print(CYAN+'+'+'+'.join('-'*w for _,w in cols)+'+'+RESET)
-for idx,r in enumerate(rows, start=1):
+section('二、三网核心总览')
+print('说明：Score 为综合参考分；Down/Up 单位 Mb/s；-- 表示本轮无有效 Speedtest。')
+for i,r in enumerate(rows,1):
+    code=isp_code(r)
     score=r.get('综合评分','0')
-    col=score_color(score)
-    rank='🏆1' if idx==1 else str(idx)
-    ping=(r.get('平均Pingms') or 'NA')+'ms'
-    loss=(r.get('平均Ping丢包%') or 'NA')+'%'
-    tcp=(r.get('TCP成功率%') or 'NA')+'%'
-    sp=(r.get('平均下载Mbps') or 'NA')+'/'+(r.get('平均上传Mbps') or 'NA')
-    cells=[
-        rank,
-        r.get('运营商',''),
-        col+right(score,5)+RESET,
-        col+fit(r.get('评级',''),4)+RESET,
-        usage_label(score),
-        ping,
-        loss_color(r.get('平均Ping丢包%'))+fit(loss,7)+RESET,
-        risk_color_good_pct(r.get('TCP成功率%'))+fit(tcp,7)+RESET,
-        sp,
-        route_short(r.get('ISP','')),
-    ]
-    print(CYAN+'|'+ '|'.join(fit(c,w) for c,(_,w) in zip(cells,cols)) + '|' + RESET)
-print(CYAN+'+'+'+'.join('-'*w for _,w in cols)+'+'+RESET)
+    col=color_score(score)
+    print()
+    print(col+BOLD+f"[{i}] {code} {isp_cn(code)}  Score {fmt(score)} / Grade {r.get('评级','--')} / Use {use_label(score)}"+RESET)
+    print(f"    Score : {bar(score,30,100)}  {fmt(score)}/100")
+    print(f"    Ping  : {bar(r.get('平均Pingms'),18,220,True)}  {fmt(r.get('平均Pingms'))} ms")
+    print(f"    Loss  : {color_loss(r.get('平均Ping丢包%'))}{pct(r.get('平均Ping丢包%'))}{RESET}    "
+          f"TCP : {color_good(r.get('TCP成功率%'))}{pct(r.get('TCP成功率%'))}{RESET}")
+    print(f"    Speed : Down {bar(r.get('平均下载Mbps'),14,500)} {fmt(r.get('平均下载Mbps'))} Mb/s    "
+          f"Up {bar(r.get('平均上传Mbps'),14,200)} {fmt(r.get('平均上传Mbps'))} Mb/s    ST {speed_state(r)}")
+    print(f"    Route : {CYAN}{route_short(r.get('ISP',''))}{RESET}    Key {CYAN}{key_short(r.get('ISP',''))}{RESET}")
+    wrap_print("    Note  : ", compact_advice(r.get('建议','')), 88)
 
-# Combined bar chart
-print('\n'+CYAN+'+'+'-'*116+'+'+RESET)
-print(CYAN+'|'+center('柱状组合图：综合评分 + 延迟/丢包/TCP/下载',116)+'|'+RESET)
-print(CYAN+'+'+'-'*116+'+'+RESET)
+section('三、组合柱状图')
 for r in rows:
-    isp=fit(r.get('运营商',''),8)
-    score=r.get('综合评分','0')
-    ping=r.get('平均Pingms','NA')
-    loss=r.get('平均Ping丢包%','NA')
-    tcp=r.get('TCP成功率%','NA')
-    down=r.get('平均下载Mbps','NA')
-    print(
-        f"{CYAN}|{RESET} {isp} "
-        f"总分 {bar(score,22)} {right(score,5)}  "
-        f"Ping {metric_bar(ping,180,10,True)} {right(ping,6)}ms  "
-        f"丢包 {metric_bar(loss,50,10,False)} {right(loss,6)}%  "
-        f"TCP {metric_bar(tcp,100,10,False)} {right(tcp,6)}%  "
-        f"下载 {metric_bar(down,500,10,False)} {right(down,7)}Mbps"
-    )
-print(CYAN+'+'+'-'*116+'+'+RESET)
-print(DIM+'  评分区间：D≤55 | C 56-65 | B 66-73 | B+ 74-81 | A 82-89 | A+ ≥90；测速为 VPS 中国方向口径。'+RESET)
+    code=isp_code(r)
+    print(f"{code} Score {bar(r.get('综合评分'),16,100)} {fmt(r.get('综合评分')):>5}  "
+          f"Ping {bar(r.get('平均Pingms'),10,220,True)} {fmt(r.get('平均Pingms')):>6}ms  "
+          f"Loss {bar(r.get('平均Ping丢包%'),10,50)} {pct(r.get('平均Ping丢包%')):>7}  "
+          f"TCP {bar(r.get('TCP成功率%'),10,100)} {pct(r.get('TCP成功率%')):>7}")
+    print(f"   Down {bar(r.get('平均下载Mbps'),14,500)} {fmt(r.get('平均下载Mbps')):>6} Mb/s  "
+          f"Up {bar(r.get('平均上传Mbps'),14,200)} {fmt(r.get('平均上传Mbps')):>6} Mb/s  "
+          f"Backbone {route_short(r.get('ISP',''))}")
 
-# Backbone compact table
-cols2=[('运营商',10),('骨干判断',28),('关键命中',28),('阅读建议',36)]
-print('\n'+CYAN+'+'+'+'.join('-'*w for _,w in cols2)+'+'+RESET)
-print(CYAN+'|'+'|'.join(center(h,w) for h,w in cols2)+'|'+RESET)
-print(CYAN+'+'+'+'.join('-'*w for _,w in cols2)+'+'+RESET)
+section('四、回程骨干识别')
 for r in rows:
-    isp=r.get('ISP','')
-    bb=route_short(isp)
-    ft=feature_short(isp)
-    if bb in ['未采样','隐藏较多','需人工核对','未识别']:
-        tip='建议 --deep 后人工看 traceroute'
-    elif 'CN2' in bb or '9929' in bb or 'CMI' in bb:
-        tip='疑似优质/国际骨干，建议高峰复核'
+    code=isp_code(r); bb=route_short(r.get('ISP','')); ks=key_short(r.get('ISP',''))
+    if 'CN2' in bb or '9929' in bb or 'CMI' in bb:
+        tip='疑似优质/国际骨干，建议晚高峰复核'
     elif '163' in bb or '169' in bb or 'CMNET' in bb:
         tip='普通骨干，重点看晚高峰拥塞'
     else:
-        tip='结合 MTR 原始结果判断'
-    cells=[r.get('运营商',''),bb,ft,tip]
-    print(CYAN+'|'+ '|'.join(fit(c,w) for c,(_,w) in zip(cells,cols2)) + '|' + RESET)
-print(CYAN+'+'+'+'.join('-'*w for _,w in cols2)+'+'+RESET)
+        tip='建议查看原始 MTR / Traceroute'
+    print(f"{code:<2} Backbone : {bb:<18}  Key : {ks:<26}  Tip : {tip}")
 
-# Report conclusion compact
-print('\n'+CYAN+'+'+'-'*116+'+'+RESET)
-print(CYAN+'|'+center('报告式结论（CMD 精简版）',116)+'|'+RESET)
-print(CYAN+'+'+'-'*116+'+'+RESET)
+section('五、结论')
 for r in rows:
-    msg=f"{r.get('运营商')}：{r.get('综合评分')}分 / {r.get('评级')} / {grade_pos(r.get('综合评分'))}；Ping {r.get('平均Pingms')}ms，丢包 {r.get('平均Ping丢包%')}%，TCP {r.get('TCP成功率%')}%；{r.get('建议')}"
-    print(f"- {msg}")
+    code=isp_code(r)
+    print(f"- {code}: score {r.get('综合评分')} / {r.get('评级')} / Ping {fmt(r.get('平均Pingms'))}ms / "
+          f"Loss {pct(r.get('平均Ping丢包%'))} / TCP {pct(r.get('TCP成功率%'))} / "
+          f"Down {fmt(r.get('平均下载Mbps'))} Mb/s / Up {fmt(r.get('平均上传Mbps'))} Mb/s")
 if rows:
     top=rows[0]
-    print(f"\n一句话：本轮优先看 {top.get('运营商')}，综合 {top.get('综合评分')} 分；是否做主力仍建议晚高峰 + 业务实测确认。")
-print()
+    print(YELLOW+f"\n一句话：本轮优先看 {isp_code(top)}，综合 {top.get('综合评分')} 分；是否做主力仍建议晚高峰 + 业务实测确认。"+RESET)
 
-print(CYAN+'+'+'-'*116+'+'+RESET)
-print(CYAN+'|'+center('输出文件',116)+'|'+RESET)
-print(CYAN+'+'+'-'*116+'+'+RESET)
-print(f"  - Markdown 报告：{report_md}")
-print(f"  - 总表 CSV：{overview}")
-print(f"  - 路由摘要：{route_csv}")
-print(f"  - 延迟明细：{latency_csv}")
-print(f"  - 测速明细：{speed_csv}")
-print(f"  - MTR/Traceroute 原始路由：{out_dir}/{{mtr,traceroute}}")
+if rows and all(speed_state(r)!='OK' for r in rows):
+    print()
+    print(RED+BOLD+"Speedtest 提示：本轮没有有效 Down/Up Mb/s。若要显示上下行速度，请先运行菜单 5 安装依赖，或执行 --install --standard。"+RESET)
+    print(RED+BOLD+"命令：bash cn3_vps_server_test.sh --install --standard"+RESET)
+
+section('六、输出文件')
+print(f"- Markdown 报告 : {report_md}")
+print(f"- 总表 CSV      : {overview}")
+print(f"- 路由摘要      : {route_csv}")
+print(f"- 延迟明细      : {latency_csv}")
+print(f"- 测速明细      : {speed_csv}")
+print(f"- MTR/Traceroute: {out_dir}/{{mtr,traceroute}}")
 print()
 PYCODE
 }
