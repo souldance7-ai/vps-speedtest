@@ -1,3 +1,29 @@
+# QUICK START / 快速执行
+
+## VPS/Linux：交互式菜单模式，推荐人工操作
+
+**VPS/Linux 执行：**
+
+```bash
+bash cn3_vps_server_test.sh
+```
+
+支持：
+
+```text
+1) 快速体验测试
+2) 标准综合测试
+3) 深度三网测试
+4) 仅延迟路由测试
+5) 安装/补齐依赖
+6) 帮助说明
+0) 退出
+```
+
+可直接按数字，也可用 ↑ ↓ 方向键选择，Enter 确认。
+
+---
+
 # QUICK START / Windows CMD 正确执行版
 
 ## 重点说明

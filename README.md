@@ -30,6 +30,43 @@
 
 ---
 
+# 交互式菜单模式
+
+如果你已经登录 VPS，最推荐直接运行脚本本体，不带任何参数：
+
+**VPS/Linux 执行：**
+
+```bash
+bash cn3_vps_server_test.sh
+```
+
+进入后会出现菜单：
+
+```text
+1) 快速体验测试
+2) 标准综合测试（推荐）
+3) 深度三网测试
+4) 仅延迟路由测试
+5) 安装/补齐依赖
+6) 帮助说明
+0) 退出
+```
+
+支持两种操作方式：
+
+```text
+- 直接按数字 1/2/3/4/5/6/0
+- 使用 ↑ ↓ 方向键选择，Enter 确认
+```
+
+如果你是在 Windows CMD 远程触发 VPS 执行，并且不想进入菜单，就继续使用：
+
+```cmd
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
+```
+
+---
+
 # Windows CMD 正确执行方式
 
 > **重要修正：** Windows CMD 不能直接运行 `bash <(curl ...)`。  

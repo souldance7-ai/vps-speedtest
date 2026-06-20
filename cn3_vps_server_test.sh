@@ -8,7 +8,7 @@
 
 set -Eeuo pipefail
 
-VERSION="2.5.0-open"
+VERSION="2.6.0-open"
 SCRIPT_NAME="CN3 VPS 三网综合测试（VPS版）"
 MODE="standard"          # quick / standard / deep / route
 RUN_SPEED=1
@@ -99,7 +99,7 @@ banner() {
   printf '%s%s%s\n' "$BOLD" "LazyVPS CN3 VPS Net Test Plus" "$RESET"
   printf '中国电信 / 中国联通 / 中国移动 · VPS 中国方向评估\n'
   printf '延迟 · 丢包 · 路由 · 测速 · 回程骨干观察 · 综合参考评分\n'
-  printf '%s开源版 v%s · CMD表格仪表盘 · 精简骨干识别 · 评级仅供参考%s\n' "$DIM" "$VERSION" "$RESET"
+  printf '%s开源版 v%s · 交互菜单 · CMD仪表盘 · 评级仅供参考%s\n' "$DIM" "$VERSION" "$RESET"
   printf '%s%s%s\n\n' "$CYAN" "$(hr 86)" "$RESET"
 }
 
@@ -194,45 +194,175 @@ ${SCRIPT_NAME} v${VERSION}
 USAGE
 }
 
-interactive_menu() {
+choose_mode_by_arrow() {
+  # 交互式菜单：支持 ↑↓ / W/S / J/K / 数字 / Enter
+  # 返回选择编号：0-6
+  local selected=2
+  local key rest
+
   while true; do
     banner
-    cat <<MENU
-${BOLD}请选择测试模式：${RESET}
+    cat <<'MENU_HEAD'
+请选择测试模式：
 
-${DIM}提示：本脚本面向 VPS 中国方向质量评估，不按家宽口径苛刻打分；评级仅供参考。${RESET}
+提示：
+  - 可直接按数字 1/2/3/4/5/6/0
+  - 也可用 ↑ ↓ 方向键选择，Enter 确认
+  - 本脚本面向 VPS 中国方向质量评估，不按家宽口径打分，评级仅供参考
 
-  ${CYAN}1${RESET}) 快速体验测试       Ping + TCP + 每网 1 个测速点，适合先看大概
-  ${CYAN}2${RESET}) 标准综合测试       Ping + TCP + MTR + Traceroute + 每网 2 个测速点，推荐
-  ${CYAN}3${RESET}) 深度三网测试       更多采样 + 每网 3 个测速点，适合留档/发报告
-  ${CYAN}4${RESET}) 仅延迟路由测试     不跑 Speedtest，只看三网延迟、丢包、MTR、回程
-  ${CYAN}5${RESET}) 安装/补齐依赖      curl / python3 / mtr / traceroute / speedtest
-  ${CYAN}6${RESET}) 帮助说明
-  ${CYAN}0${RESET}) 退出
+MENU_HEAD
+
+    local i
+    local names=(
+      "0|退出脚本|不执行任何测试"
+      "1|快速体验测试|Ping + TCP + 每网 1 个测速点，适合先看大概"
+      "2|标准综合测试|Ping + TCP + MTR + Traceroute + 每网 2 个测速点，推荐"
+      "3|深度三网测试|更多采样 + 每网 3 个测速点，适合晚高峰留档/发报告"
+      "4|仅延迟路由测试|不跑 Speedtest，只看三网延迟、丢包、MTR、回程骨干"
+      "5|安装/补齐依赖|curl / python3 / mtr / traceroute / speedtest"
+      "6|帮助说明|查看参数与使用方式"
+    )
+
+    printf '%s+----+----------------+------------------------------------------------------------+%s\n' "$CYAN" "$RESET"
+    printf '%s| %-2s | %-14s | %-58s |%s\n' "$CYAN" "序" "模式" "说明" "$RESET"
+    printf '%s+----+----------------+------------------------------------------------------------+%s\n' "$CYAN" "$RESET"
+
+    for item in "${names[@]}"; do
+      IFS='|' read -r num title desc <<< "$item"
+      if [[ "$num" -eq "$selected" ]]; then
+        if [[ "$NO_COLOR_MODE" -eq 0 ]]; then
+          printf '%s| %s%-2s%s | %s%-14s%s | %s%-58s%s |%s\n' "$CYAN" "$YELLOW" "▶$num" "$CYAN" "$YELLOW" "$title" "$CYAN" "$YELLOW" "$desc" "$CYAN" "$RESET"
+        else
+          printf '| >%-1s | %-14s | %-58s |\n' "$num" "$title" "$desc"
+        fi
+      else
+        printf '%s| %-2s | %-14s | %-58s |%s\n' "$CYAN" "$num" "$title" "$desc" "$RESET"
+      fi
+    done
+
+    printf '%s+----+----------------+------------------------------------------------------------+%s\n' "$CYAN" "$RESET"
+    printf '\n当前选择：%s%s%s  （↑↓切换 / Enter确认 / 数字直选）' "$BOLD" "$selected" "$RESET"
+
+    IFS= read -rsn1 key || key=""
+    case "$key" in
+      "")
+        printf '\n'
+        echo "$selected"
+        return 0
+        ;;
+      $'\x1b')
+        IFS= read -rsn2 -t 0.05 rest || rest=""
+        case "$rest" in
+          "[A") selected=$((selected-1)); [[ "$selected" -lt 0 ]] && selected=6 ;;
+          "[B") selected=$((selected+1)); [[ "$selected" -gt 6 ]] && selected=0 ;;
+        esac
+        ;;
+      [0-6])
+        printf '\n'
+        echo "$key"
+        return 0
+        ;;
+      w|W|k|K)
+        selected=$((selected-1)); [[ "$selected" -lt 0 ]] && selected=6
+        ;;
+      s|S|j|J)
+        selected=$((selected+1)); [[ "$selected" -gt 6 ]] && selected=0
+        ;;
+      q|Q)
+        printf '\n'
+        echo "0"
+        return 0
+        ;;
+    esac
+  done
+}
+
+set_mode_from_option() {
+  local opt="$1"
+  case "$opt" in
+    1)
+      MODE="quick"; PING_COUNT=5; TCP_COUNT=2; MTR_COUNT=0; SPEED_COUNT=1; RUN_SPEED=1
+      ;;
+    2)
+      MODE="standard"; PING_COUNT=10; TCP_COUNT=3; MTR_COUNT=20; SPEED_COUNT=2; RUN_SPEED=1
+      ;;
+    3)
+      MODE="deep"; PING_COUNT=20; TCP_COUNT=5; MTR_COUNT=50; SPEED_COUNT=3; RUN_SPEED=1
+      ;;
+    4)
+      MODE="route"; PING_COUNT=15; TCP_COUNT=4; MTR_COUNT=30; SPEED_COUNT=0; RUN_SPEED=0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+interactive_menu() {
+  local opt
+  while true; do
+    if [[ -t 0 && "$QUIET" -eq 0 ]]; then
+      opt="$(choose_mode_by_arrow)"
+    else
+      banner
+      cat <<MENU
+请选择测试模式：
+
+  1) 快速体验测试
+  2) 标准综合测试（推荐）
+  3) 深度三网测试
+  4) 仅延迟路由测试
+  5) 安装/补齐依赖
+  6) 帮助说明
+  0) 退出
+
 MENU
-    printf '\n请输入选项 [默认 2]：'
-    read -r opt || opt="2"
-    opt="${opt:-2}"
+      printf '请输入选项 [默认 2]：'
+      read -r opt || opt="2"
+      opt="${opt:-2}"
+    fi
+
     case "$opt" in
-      1) MODE="quick"; PING_COUNT=5; TCP_COUNT=2; MTR_COUNT=0; SPEED_COUNT=1; RUN_SPEED=1; break ;;
-      2) MODE="standard"; PING_COUNT=10; TCP_COUNT=3; MTR_COUNT=20; SPEED_COUNT=2; RUN_SPEED=1; break ;;
-      3) MODE="deep"; PING_COUNT=20; TCP_COUNT=5; MTR_COUNT=50; SPEED_COUNT=3; RUN_SPEED=1; break ;;
-      4) MODE="route"; PING_COUNT=15; TCP_COUNT=4; MTR_COUNT=30; SPEED_COUNT=0; RUN_SPEED=0; break ;;
-      5) install_deps; printf '\n按 Enter 返回菜单...'; read -r _ || true ;;
-      6) clear_screen; usage; printf '\n按 Enter 返回菜单...'; read -r _ || true ;;
-      0) exit 0 ;;
-      *) warn "选项无效。"; sleep 1 ;;
+      1|2|3|4)
+        set_mode_from_option "$opt"
+        break
+        ;;
+      5)
+        install_deps
+        printf '\n按 Enter 返回菜单...'
+        read -r _ || true
+        ;;
+      6)
+        clear_screen
+        usage
+        printf '\n按 Enter 返回菜单...'
+        read -r _ || true
+        ;;
+      0)
+        exit 0
+        ;;
+      *)
+        warn "选项无效。"
+        sleep 1
+        ;;
     esac
   done
 
+  banner
+  printf '%s已选择模式：%s%s%s\n' "$BOLD" "$CYAN" "$MODE" "$RESET"
+  printf '%s采样参数：Ping=%s 次 / TCP=%s 次 / MTR=%s 包 / Speedtest每网=%s 个%s\n' "$DIM" "$PING_COUNT" "$TCP_COUNT" "$MTR_COUNT" "$SPEED_COUNT" "$RESET"
   printf '\n输出目录留空则自动生成，直接回车即可：'
   read -r custom_out || custom_out=""
   [[ -n "$custom_out" ]] && OUT_BASE="$custom_out"
+
   printf '\n是否开始测试？[Y/n]：'
   read -r yesno || yesno="Y"
   yesno="${yesno:-Y}"
-  case "$yesno" in n|N|no|NO) exit 0 ;; esac
+  case "$yesno" in
+    n|N|no|NO) exit 0 ;;
+  esac
 }
+
 
 parse_args() {
   if [[ "$#" -eq 0 && -t 0 ]]; then NON_INTERACTIVE=0; return 0; fi
@@ -369,7 +499,7 @@ except Exception:
 lines = [
     '# VPS 基础信息',
     '',
-    '- 脚本版本：2.5.0-open',
+    '- 脚本版本：2.6.0-open',
     '- 测试时间：' + sh("date '+%F %T %Z'"),
     '- Hostname：' + sh('hostname'),
     '- Kernel：' + sh('uname -a'),
