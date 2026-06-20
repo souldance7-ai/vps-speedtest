@@ -15,7 +15,7 @@
 
 ---
 
-## 这是什么
+## 项目简介
 
 `LazyVPS VPS 测速正式 v1.0` 是一个面向 **海外 VPS / 中转机 / 代理节点** 的中国三网综合测速工具包。
 
@@ -26,13 +26,33 @@
      去程          VPS端           回程
 ```
 
+> **评分口径：** VPS 中国方向参考模型，评级仅供参考。建议普通时段 + 晚高峰各测一轮。
+
+---
+
+## 界面预览（已脱敏）
+
+> 下方图片为 README 展示用脱敏示例，使用文档保留 IP、示例 ASN 与示例供应商，不暴露真实 VPS 信息。
+
+### 1）交互菜单界面
+
+![交互菜单界面](docs/interactive-menu-sanitized.png)
+
+### 2）测速结果仪表盘
+
+![测速结果仪表盘](docs/result-dashboard-sanitized.png)
+
+### 3）完整闭环流程
+
+![完整闭环流程](docs/workflow-closed-loop.png)
+
 ---
 
 ## 一句话快速使用
 
 ### Windows CMD：远程触发 VPS 标准测速
 
-> 适合你在 Windows CMD 里操作，直接让 VPS 自己下载并执行脚本。
+> 适合在 Windows CMD 里操作，让 VPS 自己下载并执行测试脚本。
 
 **Windows CMD 执行：**
 
@@ -45,6 +65,8 @@ ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh http
 ```cmd
 ssh root@103.97.200.42 "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
 ```
+
+> Windows CMD 不要直接执行 `bash <(curl ...)`，那是 Linux Bash 语法。
 
 ---
 
@@ -92,13 +114,13 @@ bash cn3_vps_server_test.sh
 
 ## 菜单模式
 
-VPS 上直接执行：
+在 VPS 上直接执行：
 
 ```bash
 bash cn3_vps_server_test.sh
 ```
 
-会进入交互菜单：
+进入交互菜单：
 
 ```text
 0  退出脚本
@@ -129,9 +151,9 @@ bash cn3_vps_server_test.sh
 
 ---
 
-## 测试内容
+## VPS 端测试内容
 
-### VPS 端：`cn3_vps_server_test.sh`
+脚本：`cn3_vps_server_test.sh`
 
 - VPS 基础信息
 - 出口 IP / ASN / 归属地
@@ -147,7 +169,18 @@ bash cn3_vps_server_test.sh
 - CMD BBS 信息板结果页
 - Markdown / CSV 输出
 
-### 本地端：`cn3_client_probe.ps1` / `cn3_client_probe.sh`
+---
+
+## 本地端测试内容
+
+脚本：
+
+```text
+cn3_client_probe.ps1    Windows 本地端
+cn3_client_probe.sh     Linux / macOS 本地端
+```
+
+测试：
 
 - 本地 Ping VPS
 - 本地 Tracert / Traceroute VPS
@@ -158,23 +191,17 @@ bash cn3_vps_server_test.sh
   - GitHub
   - OpenAI
 
-### 合并报告：`merge_lazyvps_report.py`
+---
+
+## 合并报告
+
+脚本：`merge_lazyvps_report.py`
 
 ```bash
 python merge_lazyvps_report.py --server-dir cn3_test_xxx --client-dir cn3_client_test_xxx --out combined_report.md
 ```
 
----
-
-## 效果图
-
-### 综合闭环架构
-
-![综合闭环架构](docs/full-chain-architecture.png)
-
-### 快捷命令说明图
-
-![快捷命令说明图](docs/quick-command-card.png)
+输出一个完整的闭环 Markdown 报告。
 
 ---
 
@@ -206,7 +233,7 @@ cn3_client_test_YYYYmmdd_HHMMSS/
 
 ---
 
-## 推荐流程
+## 推荐测试流程
 
 ### 第一步：VPS 测回程
 
@@ -228,17 +255,6 @@ python merge_lazyvps_report.py --server-dir cn3_test_xxx --client-dir cn3_client
 
 ---
 
-## 注意事项
-
-- Windows CMD 不能直接执行 `bash <(curl ...)`。
-- `bash <(curl ...)` 只适合 Linux Bash。
-- Windows CMD 请使用 `ssh root@VPS "bash -lc '...'"` 远程触发 VPS 执行。
-- Speedtest Down / Up 为 VPS 与测速节点之间的参考，不等于所有本地网络体感。
-- 评分为 VPS 中国方向参考模型，不是家宽满速模型。
-- 最终判断建议普通时段与晚高峰各测一轮。
-
----
-
 ## 文件结构
 
 ```text
@@ -252,9 +268,22 @@ LazyVPS-VPS-SpeedTest-v1.0/
 ├── RELEASE_NOTES_v1.0.md
 ├── LICENSE
 └── docs/
-    ├── full-chain-architecture.png
-    └── quick-command-card.png
+    ├── interactive-menu-sanitized.png
+    ├── result-dashboard-sanitized.png
+    └── workflow-closed-loop.png
 ```
+
+---
+
+## 注意事项
+
+- Windows CMD 不能直接执行 `bash <(curl ...)`。
+- `bash <(curl ...)` 只适合 Linux Bash。
+- Windows CMD 请使用 `ssh root@VPS "bash -lc '...'"` 远程触发 VPS 执行。
+- Speedtest Down / Up 为 VPS 与测速节点之间的参考，不等于所有本地网络体感。
+- 评分为 VPS 中国方向参考模型，不是家宽满速模型。
+- 最终判断建议普通时段与晚高峰各测一轮。
+- README 截图均为脱敏示例，不包含真实 VPS IP / ASN / 供应商。
 
 ---
 

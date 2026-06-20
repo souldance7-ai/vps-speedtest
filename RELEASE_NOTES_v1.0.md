@@ -13,6 +13,14 @@
 - CMD BBS 信息板可视化
 - Markdown / CSV / MTR / Traceroute 留档
 
+## 界面与文档
+
+- README 已加入脱敏界面图：
+  - `docs/interactive-menu-sanitized.png`
+  - `docs/result-dashboard-sanitized.png`
+  - `docs/workflow-closed-loop.png`
+- 截图使用文档保留 IP、示例 ASN 与示例供应商，不包含真实 VPS 信息。
+
 ## 核心功能
 
 ### VPS 端

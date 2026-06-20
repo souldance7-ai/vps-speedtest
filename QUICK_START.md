@@ -37,3 +37,5 @@ bash cn3_vps_server_test.sh
 ```cmd
 python merge_lazyvps_report.py --server-dir cn3_test_xxx --client-dir cn3_client_test_xxx --out combined_report.md
 ```
+
+> 注意：Windows CMD 不要直接执行 `bash <(curl ...)`。那是 Linux Bash 语法。
