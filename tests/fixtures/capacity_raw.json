@@ -1,0 +1,13 @@
+{
+  "schema": "lazyvps.capacity.v2.1",
+  "mode": "standard",
+  "endpoint": "https://speed.cloudflare.com",
+  "summary": {
+    "单线下行Mbps": "212.40",
+    "多线下行Mbps": "786.50",
+    "最大下行Mbps": "914.80",
+    "单线上行Mbps": "118.70",
+    "多线上行Mbps": "492.60",
+    "最大上行Mbps": "566.20"
+  }
+}

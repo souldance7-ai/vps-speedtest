@@ -1,292 +1,254 @@
-# LazyVPS VPS 测速正式 v1.0
+<div align="center">
 
-<p align="center">
-  <b>中国三网 VPS 综合闭环测速工具包</b><br>
-  <sub>VPS 回程 · 中国本地去程 · 代理体感 · BBS 信息板 · Markdown / CSV / MTR / Traceroute 留档</sub>
+# LazyVPS CN3 SpeedTest v2.1
+
+### 全量容量压测 · 中国三网回程 · CMD / SVG Pro
+
+<p>
+  <img alt="release" src="https://img.shields.io/badge/release-v2.1.0-22d3ee?style=for-the-badge">
+  <img alt="shell" src="https://img.shields.io/badge/shell-Bash-60a5fa?style=for-the-badge&logo=gnubash&logoColor=white">
+  <img alt="report" src="https://img.shields.io/badge/report-SVG%20%2B%20JSON%20%2B%20CSV-a78bfa?style=for-the-badge">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-34d399?style=for-the-badge">
 </p>
 
-<p align="center">
-  <img alt="version" src="https://img.shields.io/badge/Release-VPS%E6%B5%8B%E9%80%9F%E6%AD%A3%E5%BC%8F%20v1.0-0ea5e9?style=flat-square">
-  <img alt="bash" src="https://img.shields.io/badge/Shell-Bash-1f6feb?style=flat-square">
-  <img alt="powershell" src="https://img.shields.io/badge/Windows-CMD%20%2B%20PowerShell-2563eb?style=flat-square">
-  <img alt="output" src="https://img.shields.io/badge/Output-CMD%20%2B%20Markdown%20%2B%20CSV-22c55e?style=flat-square">
-  <img alt="license" src="https://img.shields.io/badge/License-MIT-f59e0b?style=flat-square">
-</p>
+**一套脚本同时量出单线、多线、最大上下行能力，以及中国电信／联通／移动的延迟、丢包与回程骨干。**
+
+[快速开始](#一分钟开始) · [模式差异](#五种测试怎么选) · [SVG 报告](#svg-可视化报告) · [完整输出](#输出文件)
+
+</div>
 
 ---
 
-## 项目简介
+## 这次升级了什么
 
-`LazyVPS VPS 测速正式 v1.0` 是一个面向 **海外 VPS / 中转机 / 代理节点** 的中国三网综合测速工具包。
+v2.1 在 v2.0 的三网测试基础上，完整整合旧版容量压测包的关键能力：
 
-它不是单纯跑网速，也不是家宽满速模型，而是围绕 VPS 在中国联外网环境下的真实可用性做闭环观察：
+- ANSI 渐变 `LAZYVPS` 字幕＋“万马奔腾”ASCII 封面，首次进入轻量动画。
+- 支持数字直选、`↑/↓`、`W/S`、`Enter`、`Q` 的 CMD／BBS 风格互动菜单。
+- 新增单线下行、多线下行、最大下行、单线上行、多线上行、最大上行。
+- 新增 HTTP 平均延迟、P50、P95、抖动、HTTP 层丢包率与 ICMP 品质。
+- 每 250 ms 读取 Linux 网卡 RX/TX，最大值采用约 1 秒滚动峰值，减少瞬间尖峰误判。
+- 自动保存容量时间序列 CSV 与完整原始 JSON，SVG 同时显示容量曲线和三网看板。
+- 保留 Markdown、CSV、MTR、Traceroute 原始数据，视觉结论与底层证据一一对应。
+- 修正旧 README 下载地址误指向 `souldance7-ai/VPS-` 的问题；正式地址统一为本仓库。
 
-```text
-中国本地端  →  海外 VPS  →  中国三网目标
-     去程          VPS端           回程
+## SVG 可视化报告
+
+下面这张图由脚本依据容量与三网 CSV 自动生成，不是截图；每次测试都会输出同结构的 `report.svg`。
+
+![LazyVPS CN3 SVG 测试报告示例](docs/sample-report.svg)
+
+## 一分钟开始
+
+### 方法一：VPS 直接进入互动菜单
+
+**VPS/Linux 执行：**
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/cn3_vps_server_test.sh)
 ```
 
-> **评分口径：** VPS 中国方向参考模型，评级仅供参考。建议普通时段 + 晚高峰各测一轮。
+> 首次运行若缺少 MTR 或 Ookla Speedtest，请在菜单选择 `[6] 安装依赖`。
 
----
-
-## 界面预览（已脱敏）
-
-> 下方图片为 README 展示用脱敏示例，使用文档保留 IP、示例 ASN 与示例供应商，不暴露真实 VPS 信息。
-
-### 1）交互菜单界面
-
-![交互菜单界面](docs/interactive-menu-sanitized.png)
-
-### 2）测速结果仪表盘
-
-![测速结果仪表盘](docs/result-dashboard-sanitized.png)
-
-### 3）完整闭环流程
-
-![完整闭环流程](docs/workflow-closed-loop.png)
-
----
-
-## 一句话快速使用
-
-### Windows CMD：远程触发 VPS 标准测速
-
-> 适合在 Windows CMD 里操作，让 VPS 自己下载并执行测试脚本。
+### 方法二：Windows CMD 远程触发标准测试
 
 **Windows CMD 执行：**
 
 ```cmd
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && /root/cn3_vps_server_test.sh --install --standard'"
 ```
 
-示例：
+### 方法三：下载后长期使用
 
-```cmd
-ssh root@103.97.200.42 "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
-```
-
-> Windows CMD 不要直接执行 `bash <(curl ...)`，那是 Linux Bash 语法。
-
----
-
-## 快捷命令
-
-### 1. Windows CMD：VPS 标准测速
-
-```cmd
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
-```
-
-### 2. Windows CMD：VPS 安装依赖并测速
-
-```cmd
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --install --standard'"
-```
-
-### 3. Windows CMD：VPS 深度测速
-
-```cmd
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --deep'"
-```
-
-### 4. Windows 本地端：去程 + TCP + 代理体感
-
-```cmd
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_client_probe.ps1 -OutFile .\cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的VPS_IP -Ports 22,443 -Proxy http://127.0.0.1:7890"
-```
-
-### 5. Windows 本地端：只测去程 / TCP 端口
-
-```cmd
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_client_probe.ps1 -OutFile .\cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的VPS_IP -Ports 22,443"
-```
-
-### 6. VPS/Linux：进入菜单模式
+**VPS/Linux 执行：**
 
 ```bash
-curl -fsSL -o cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh
-chmod +x cn3_vps_server_test.sh
-bash cn3_vps_server_test.sh
+curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/cn3_vps_server_test.sh
+chmod +x /root/cn3_vps_server_test.sh
+/root/cn3_vps_server_test.sh
 ```
 
----
-
-## 菜单模式
-
-在 VPS 上直接执行：
-
-```bash
-bash cn3_vps_server_test.sh
-```
-
-进入交互菜单：
+## 互动界面
 
 ```text
-0  退出脚本
-1  快速体验
-2  标准综合
-3  深度三网
-4  仅路由延迟
-5  安装依赖
-6  帮助说明
+██╗      █████╗ ███████╗██╗   ██╗██╗   ██╗██████╗ ███████╗
+██║     ██╔══██╗╚══███╔╝╚██╗ ██╔╝██║   ██║██╔══██╗██╔════╝
+██║     ███████║  ███╔╝  ╚████╔╝ ██║   ██║██████╔╝███████╗
+███████╗██║  ██║███████╗   ██║    ╚████╔╝ ██║     ███████║
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ ▶ [2] 标准综合 │ 8 线程容量 + 三网完整测试 · 日常推荐             │
+│ · [3] 深度三网 │ 12 线程容量 + 加强采样 · 高峰留档                │
+│ · [4] 容量压测 │ 只测单线/多线/峰值上下行、HTTP/ICMP 品质         │
+└──────────────────────────────────────────────────────────────────────┘
+READY  当前 [2]  ↑↓ / W/S · Enter · Q
 ```
 
-支持：
+按键说明：
 
-```text
-- 直接按数字 1 / 2 / 3 / 4 / 5 / 6 / 0
-- 使用 ↑ ↓ 方向键选择，Enter 确认
-```
+| 按键 | 动作 |
+|---|---|
+| `1`～`7`、`0` | 直接执行对应选项 |
+| `↑ / ↓` 或 `W / S` | 移动选择 |
+| `Enter` | 确认当前选项 |
+| `Q` | 安全退出 |
 
----
+## 五种测试怎么选
 
-## 功能总览
+| 模式 | 容量参数 | 三网采样 | 路由 | 适用场景 |
+|---|---|---|---|---|
+| 快速 `--quick` | 4 线程，单线 4s／多线 5s | 每网 1 点 | 不跑 MTR | 新 VPS 快速筛选 |
+| 标准 `--standard` | 8 线程，单线 6s／多线 8s | 每网 2 点 | MTR 20 包 | 日常完整判断，默认推荐 |
+| 深度 `--deep` | 12 线程，单线 10s／多线 14s | 每网 3 点 | MTR 50 包 | 晚高峰留档、横向对比 |
+| 容量 `--capacity-only` | 12 线程容量专测 | 不执行 | 不执行 | 只看最大上下行与稳定性 |
+| 路由 `--route-only` | 不执行 | Ping / TCP | MTR 30 包 | 只看回程、延迟与丢包 |
 
-| 模块 | 执行位置 | 主要测试 |
+实际时间取决于 VPS 性能、三网测速点状态与网络超时情况。
+
+默认容量端点为 `https://speed.cloudflare.com`。如使用 `--capacity-endpoint` 更换端点，该服务需兼容 `/__down`、`/__up` 与 `/cdn-cgi/trace` 路径。
+
+## 测试内容
+
+| 维度 | 输出内容 | 用途 |
 |---|---|---|
-| VPS 端测速 | 海外 VPS | VPS → 中国三网，回程、骨干、延迟、丢包、TCP、Speedtest |
-| 本地端探测 | Windows / Linux / macOS | 中国本地 → VPS，去程、端口、Traceroute、代理体感 |
-| 合并报告 | Windows / VPS / Linux | 汇总回程、去程、代理体感，生成闭环 Markdown 报告 |
+| VPS 基础信息 | IPv4 / IPv6、ASN、地区、系统、BBR、拥塞控制 | 确认测试对象与出口身份 |
+| 单线容量 | 单线下行 Mbps、单线上行 Mbps | 判断单连接／单任务实际能力 |
+| 多线容量 | 多线下行 Mbps、多线上行 Mbps、线程数 | 判断并发饱和能力 |
+| 最大能力 | 最大下行 Mbps、最大上行 Mbps | 约 1 秒滚动峰值，观察短时上限 |
+| HTTP 品质 | 平均、P50、P95、抖动、HTTP 层丢包率 | 判断网页、API 与代理交互稳定性 |
+| ICMP 品质 | 平均延迟、抖动、丢包率 | 对照基础网络波动 |
+| 延迟与稳定性 | Ping 平均／最低／最高、抖动、丢包 | 判断交互体感与波动 |
+| TCP 连通 | 53 / 443 等目标端口成功率与耗时 | 避免只看 ICMP 造成误判 |
+| 三网速度 | Ookla Down / Up，统一使用 Mb/s | 观察当前样本的传输能力 |
+| 回程骨干 | CN2 / 163 / CTG、AS4837 / 9929、CMI / CMNET | 快速识别三网回程特征 |
+| 综合评分 | CT / CU / CM 排名、等级、使用建议 | 用于同口径横向筛选 |
 
----
+## 常用命令
 
-## VPS 端测试内容
+### 标准模式并自动安装依赖
 
-脚本：`cn3_vps_server_test.sh`
-
-- VPS 基础信息
-- 出口 IP / ASN / 归属地
-- 中国电信 / 联通 / 移动 Ping
-- 丢包率
-- TCP Connect 成功率
-- MTR / Traceroute 原始路由
-- 回程骨干识别：
-  - 电信：`CN2 / 163 / CTG`
-  - 联通：`169 / AS4837 / 9929 / CUII`
-  - 移动：`CMNET / CMI`
-- Speedtest 中国方向 Down / Up
-- CMD BBS 信息板结果页
-- Markdown / CSV 输出
-
----
-
-## 本地端测试内容
-
-脚本：
-
-```text
-cn3_client_probe.ps1    Windows 本地端
-cn3_client_probe.sh     Linux / macOS 本地端
-```
-
-测试：
-
-- 本地 Ping VPS
-- 本地 Tracert / Traceroute VPS
-- TCP 端口连通
-- 可选代理体感：
-  - Cloudflare
-  - Google 204
-  - GitHub
-  - OpenAI
-
----
-
-## 合并报告
-
-脚本：`merge_lazyvps_report.py`
+**VPS/Linux 执行：**
 
 ```bash
-python merge_lazyvps_report.py --server-dir cn3_test_xxx --client-dir cn3_client_test_xxx --out combined_report.md
+bash cn3_vps_server_test.sh --install --standard
 ```
 
-输出一个完整的闭环 Markdown 报告。
+### 深度模式
 
----
+**VPS/Linux 执行：**
 
-## 输出目录
+```bash
+bash cn3_vps_server_test.sh --deep
+```
 
-### VPS 端输出
+### 只跑上下行容量与延迟丢包
+
+**VPS/Linux 执行：**
+
+```bash
+bash cn3_vps_server_test.sh --capacity-only
+```
+
+**Windows CMD 执行：**
+
+```cmd
+ssh root@你的VPS_IP "bash -lc '/root/cn3_vps_server_test.sh --capacity-only'"
+```
+
+### 自定义采样与输出目录
+
+**VPS/Linux 执行：**
+
+```bash
+bash cn3_vps_server_test.sh --standard --capacity-threads 12 --capacity-single-seconds 8 --capacity-multi-seconds 12 --http-samples 30 --out cn3_tokyo_peak
+```
+
+### 关闭颜色或首次封面动画
+
+**VPS/Linux 执行：**
+
+```bash
+bash cn3_vps_server_test.sh --standard --no-color --no-animation
+```
+
+## 输出文件
 
 ```text
 cn3_test_YYYYmmdd_HHMMSS/
-├── report.md
-├── cn3_overview.csv
-├── route_backbone_summary.csv
-├── latency_summary.csv
-├── speedtest_summary.csv
-├── mtr/
-└── traceroute/
+├── report.svg                  # GitHub / 浏览器可直接显示的主视觉报告
+├── report.md                   # 完整 Markdown 报告
+├── capacity_summary.csv        # 单线／多线／最大上下行及 HTTP / ICMP 总表
+├── capacity_timeseries.csv     # 每 250 ms 容量时间序列
+├── capacity_raw.json           # 每阶段、每请求与方法口径的原始数据
+├── cn3_overview.csv            # 三网排名与综合评分
+├── latency_summary.csv         # Ping / 丢包 / TCP 明细
+├── speedtest_summary.csv       # Down / Up 与测速点明细
+├── route_backbone_summary.csv  # 回程骨干摘要
+├── base_info.md                # VPS、IP、ASN 与系统信息
+├── ookla_cn_servers.csv        # 本轮使用的三网测速点
+├── speedtest_json/             # Ookla 原始 JSON
+├── mtr/                        # MTR 原始记录
+└── traceroute/                 # Traceroute 原始记录
 ```
 
-### 本地端输出
+`report.svg` 使用纯 SVG 元素与系统字体，不需要 JavaScript，也不依赖额外绘图库。
+
+## 本地端闭环探测
+
+VPS 端脚本负责“VPS → 中国三网”。如果还要补齐“中国本地 → VPS”的去程、端口和代理体感，可使用仓库里的客户端脚本。
+
+**Windows CMD 执行：**
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/cn3_client_probe.ps1 -OutFile .\cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的VPS_IP -Ports 22,443 -Proxy http://127.0.0.1:7890"
+```
+
+**Linux/macOS 执行：**
+
+```bash
+bash cn3_client_probe.sh --host 你的VPS_IP --ports 22,443
+```
+
+再使用 `merge_lazyvps_report.py` 合并去程与回程：
+
+```bash
+python3 merge_lazyvps_report.py --server-dir cn3_test_xxx --client-dir cn3_client_test_xxx --out combined_report.md
+```
+
+## 评分与数据边界
+
+- 容量测试会产生实际上下行流量，使用流量取决于线路能力、线程数与持续时间。
+- 单线／多线是持续平均；最大值是网卡计数器约 1 秒滚动峰值，不是虚构的理论带宽。
+- HTTP 抖动采用成功样本的总体标准差；HTTP 丢包率为失败请求占总样本比例。
+- 评分是 **VPS 中国方向参考模型**，不是家宽跑满带宽考核。
+- Speedtest 数值受测试节点、时段、路由与单连接状态影响，不代表线路绝对上限。
+- DNS、官网目标可能禁 Ping 或受 CDN 调度影响；脚本同时参考 TCP，避免用单项结论替代整体判断。
+- 回程识别基于 MTR / Traceroute 关键字自动归类，复杂路由请回看原始文件。
+- 建议同一台 VPS 至少在普通时段与晚高峰各测一次，再比较稳定性。
+
+## 项目结构
 
 ```text
-cn3_client_test_YYYYmmdd_HHMMSS/
-├── client_report.md
-├── client_summary.csv
-├── tcp_ports.csv
-├── proxy_experience.csv
-└── tracert_to_vps.txt
-```
-
----
-
-## 推荐测试流程
-
-### 第一步：VPS 测回程
-
-```cmd
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
-```
-
-### 第二步：本地测去程
-
-```cmd
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -UseBasicParsing https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_client_probe.ps1 -OutFile .\cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的VPS_IP -Ports 22,443 -Proxy http://127.0.0.1:7890"
-```
-
-### 第三步：合并报告
-
-```cmd
-python merge_lazyvps_report.py --server-dir cn3_test_xxx --client-dir cn3_client_test_xxx --out combined_report.md
-```
-
----
-
-## 文件结构
-
-```text
-LazyVPS-VPS-SpeedTest-v1.0/
-├── cn3_vps_server_test.sh
-├── cn3_client_probe.ps1
-├── cn3_client_probe.sh
-├── merge_lazyvps_report.py
-├── README.md
+vps-speedtest/
+├── cn3_vps_server_test.sh      # 正式主入口 v2.1
+├── cn3_vps_net_test_plus.sh    # 历史命令兼容入口
+├── cn3_client_probe.ps1        # Windows 本地端探测
+├── cn3_client_probe.sh         # Linux / macOS 本地端探测
+├── merge_lazyvps_report.py     # 去程／回程报告合并
 ├── QUICK_START.md
-├── RELEASE_NOTES_v1.0.md
-├── LICENSE
-└── docs/
-    ├── interactive-menu-sanitized.png
-    ├── result-dashboard-sanitized.png
-    └── workflow-closed-loop.png
+├── RELEASE_NOTES_v2.1.md
+├── tests/smoke.sh
+└── docs/sample-report.svg
 ```
-
----
-
-## 注意事项
-
-- Windows CMD 不能直接执行 `bash <(curl ...)`。
-- `bash <(curl ...)` 只适合 Linux Bash。
-- Windows CMD 请使用 `ssh root@VPS "bash -lc '...'"` 远程触发 VPS 执行。
-- Speedtest Down / Up 为 VPS 与测速节点之间的参考，不等于所有本地网络体感。
-- 评分为 VPS 中国方向参考模型，不是家宽满速模型。
-- 最终判断建议普通时段与晚高峰各测一轮。
-- README 截图均为脱敏示例，不包含真实 VPS IP / ASN / 供应商。
-
----
 
 ## License
 
-MIT
+[MIT](LICENSE) — 可自由使用、修改与分发；保留许可证与来源说明即可。
+
+---
+
+<div align="center">
+
+**LazyVPS · 让测速结果不只是一串数字，而是一张能直接判断的工程看板。**
+
+</div>

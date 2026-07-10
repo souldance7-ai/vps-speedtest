@@ -1,0 +1,7 @@
+ISP,运营商,ServerID,测速点名称,赞助商,城市,SpeedtestPingms,下载Mbps,上传Mbps,结果URL,状态
+CT,中国电信,10001,示例电信一,Demo,Shanghai,45.2,438.4,121.3,https://example.com/ct1,OK
+CT,中国电信,10002,示例电信二,Demo,Guangzhou,49.8,418.8,111.5,https://example.com/ct2,OK
+CU,中国联通,20001,示例联通一,Demo,Beijing,57.7,362.1,96.4,https://example.com/cu1,OK
+CU,中国联通,20002,示例联通二,Demo,Guangzhou,62.9,340.3,91.2,https://example.com/cu2,OK
+CM,中国移动,30001,示例移动一,Demo,Shanghai,68.1,295.6,81.7,https://example.com/cm1,OK
+CM,中国移动,30002,示例移动二,Demo,Guangzhou,73.4,277.8,75.3,https://example.com/cm2,OK
