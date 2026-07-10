@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+set -u
+
+args="$*"
+sleep 0.03
+if [[ "$args" == *"cdn-cgi/trace"* ]]; then
+  printf '0.025|200'
+elif [[ "$args" == *"/__up"* ]]; then
+  printf '0|2000000|0.050|200'
+else
+  printf '5000000|0|0.050|200'
+fi
