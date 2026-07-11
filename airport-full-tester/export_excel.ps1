@@ -111,10 +111,12 @@ function Write-LazyVpsXlsx {
         if (Test-Path $Path) { Remove-Item $Path -Force }
         $archive = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Create)
         try {
+            $baseUri = New-Object System.Uri(([System.IO.Path]::GetFullPath([string]$temp).TrimEnd([char]92, [char]47) + [System.IO.Path]::DirectorySeparatorChar))
             foreach ($file in Get-ChildItem -LiteralPath $temp -File -Recurse) {
                 # Use explicit characters: Windows PowerShell can otherwise select a
                 # surprising string overload and preserve backslashes in ZIP names.
-                $relative = ($file.FullName -replace ('^' + [regex]::Escape([string]$temp) + '[\\/]+'), '').Replace([char]92, [char]47)
+                $fileUri = New-Object System.Uri([System.IO.Path]::GetFullPath($file.FullName))
+                $relative = [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($fileUri).ToString())
                 $entry = $archive.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
                 $entryStream = $entry.Open()
                 $fileStream = [System.IO.File]::OpenRead($file.FullName)
