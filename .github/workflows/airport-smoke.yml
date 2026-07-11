@@ -69,7 +69,8 @@ jobs:
           foreach ($name in $expected) { if (-not (Test-Path (Join-Path $out $name))) { throw "Missing renderer output: $name" } }
           [xml](Get-Content (Join-Path $out 'report.svg') -Raw) | Out-Null
           $svgText = Get-Content (Join-Path $out 'report.svg') -Raw -Encoding UTF8
-          if ($svgText -notmatch '台灣-示範節點') { throw 'UTF-8 node name missing from SVG output' }
+          $utf8Needle = -join @([char]0x53F0,[char]0x7063,[char]0x2D,[char]0x793A,[char]0x7BC4,[char]0x7BC0,[char]0x9EDE)
+          if (-not $svgText.Contains($utf8Needle)) { throw 'UTF-8 node name missing from SVG output' }
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $xlsx = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $out 'report.xlsx'))
           try {
