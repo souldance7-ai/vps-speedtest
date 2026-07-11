@@ -74,7 +74,15 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $xlsx = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $out 'report.xlsx'))
           try {
-            if (-not ($xlsx.Entries | Where-Object { $_.FullName -eq 'xl/workbook.xml' })) { throw 'Invalid XLSX: missing workbook.xml' }
+            $entryNames = @($xlsx.Entries | ForEach-Object { $_.FullName })
+            $entryNames | ForEach-Object { Write-Host "XLSX entry: $_" }
+            foreach ($required in @('[Content_Types].xml', '_rels/.rels', 'xl/workbook.xml', 'xl/styles.xml')) {
+              if ($required -notin $entryNames) { throw "Invalid XLSX: missing $required" }
+            }
+            foreach ($entry in @($xlsx.Entries | Where-Object { $_.FullName.EndsWith('.xml') -or $_.FullName.EndsWith('.rels') })) {
+              $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
+              try { [xml]$reader.ReadToEnd() | Out-Null } finally { $reader.Dispose() }
+            }
           } finally { $xlsx.Dispose() }
           Write-Host "Offline renderer: OK"
       - name: Build Windows package
