@@ -33,6 +33,7 @@ function Write-LazyVpsXlsx {
         [System.Collections.IDictionary]$Sheets,
         [string]$Path
     )
+    Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $temp = Join-Path $env:TEMP ("lazyvps-xlsx-" + [guid]::NewGuid().ToString("N"))
     $utf8 = New-Object System.Text.UTF8Encoding($false)
