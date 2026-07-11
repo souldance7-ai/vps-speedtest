@@ -108,7 +108,18 @@ function Write-LazyVpsXlsx {
         [System.IO.File]::WriteAllText((Join-Path $temp "xl\styles.xml"), $styles, $utf8)
 
         if (Test-Path $Path) { Remove-Item $Path -Force }
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($temp, $Path, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+        $archive = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($file in Get-ChildItem -LiteralPath $temp -File -Recurse) {
+                $relative = $file.FullName.Substring($temp.Length + 1).Replace('\', '/')
+                $entry = $archive.CreateEntry($relative, [System.IO.Compression.CompressionLevel]::Optimal)
+                $entryStream = $entry.Open()
+                $fileStream = [System.IO.File]::OpenRead($file.FullName)
+                try { $fileStream.CopyTo($entryStream) } finally { $fileStream.Dispose(); $entryStream.Dispose() }
+            }
+        } finally {
+            $archive.Dispose()
+        }
     } finally {
         if (Test-Path $temp) { Remove-Item $temp -Recurse -Force -ErrorAction SilentlyContinue }
     }
