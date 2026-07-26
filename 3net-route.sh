@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.8 TRUE-FORWARD-CLOSURE"
+VERSION="v0.9 RC4.2.9 SEQUENTIAL-PROBE-FIX"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.8 真去程闭环版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.9 去程测点顺序回退修正版
 
 用法：
   bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh
@@ -104,7 +104,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.8 TRUE-FORWARD-CLOSURE")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.9 SEQUENTIAL-PROBE-FIX")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
@@ -398,7 +398,7 @@ def ask_target() -> tuple[str, int]:
 
 def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int = 25) -> Any:
     data = None
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2", "Accept": "application/json"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.9", "Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -411,7 +411,7 @@ ASN_CACHE: dict[str, str] = {}
 
 
 def http_text(url: str, timeout: int = 25) -> str:
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.8", "Accept": "text/plain,*/*"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.9", "Accept": "text/plain,*/*"}
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read().decode("utf-8-sig", "replace")
@@ -456,10 +456,6 @@ def first_index(text: str, patterns: list[str]) -> int:
     return min(indexes) if indexes else -1
 
 
-def pattern_count(text: str, patterns: list[str]) -> int:
-    return len({(m.start(), m.group(0)) for p in patterns for m in re.finditer(p, text, re.I)})
-
-
 def matching_hop_count(text: str, patterns: list[str]) -> int:
     """Count matching route hops, not duplicate ASN/IP tags on one hop."""
     return sum(
@@ -475,16 +471,32 @@ def classify(carrier: str, route: str, direction: str) -> tuple[str, int, str]:
         cn2 = [r"AS4809", r"59\.43\."]
         normal = [r"AS4134", r"202\.97\."]
         ci, ni = first_index(plain, cn2), first_index(plain, normal)
-        ccount, ncount = pattern_count(plain, cn2), pattern_count(plain, normal)
+        cn2_hops = matching_hop_count(plain, cn2)
+        normal_hops = matching_hop_count(plain, normal)
         if ci >= 0:
             if direction == "Forward":
-                if ni < 0 or (ni < ci and ncount <= 2 and ccount >= 2):
+                if cn2_hops < 2:
+                    return "CN2 证据不足／混合", 3, (
+                        "去程仅一个可见跳点命中 AS4809／59.43，"
+                        "不足以单独判定 CN2 GIA"
+                    )
+                if ni < 0 or (ni < ci and normal_hops <= 1):
                     return "CN2 GIA", 5, "去程连续进入 AS4809／59.43，普通 163 仅为接入段或未出现"
                 if ni < ci:
                     return "CN2 GT", 3, "去程先经过 AS4134／202.97 普通骨干，出口才切入 CN2"
                 return "CN2／163 混合", 3, "去程进入 CN2 后又出现普通 163，骨干不纯"
-            if ni < 0 or ci < ni:
+            if cn2_hops < 2:
+                return "CN2 证据不足／混合", 3, (
+                    "回程仅一个可见跳点命中 AS4809／59.43，"
+                    "不足以单独判定 CN2 GIA"
+                )
+            if ni < 0 or (ci < ni and normal_hops <= 1):
                 return "CN2 GIA", 5, "回程优先进入 AS4809／59.43，普通 163 仅作目的网交付"
+            if ci < ni:
+                return "CN2／163 混合", 3, (
+                    "回程先进入 CN2，但随后出现多个 163 骨干跳点，"
+                    "不按纯 CN2 GIA 计算"
+                )
             return "CN2 GT／混合", 3, "回程先走普通 163，随后才进入 CN2"
         if first_index(plain, [r"AS23764", r"CTGNet", r"69\.194\."]) >= 0:
             return "CTG GIA", 4, "检测到 AS23764／CTGNet 特征"
@@ -657,23 +669,28 @@ def public_ip() -> tuple[str, str]:
 
 
 GLOBALPING_SEARCH_CACHE: dict[
-    tuple[str, int, tuple[str, ...]], tuple[list[dict[str, Any]], str]
+    tuple[str, int, str], tuple[list[dict[str, Any]], str]
 ] = {}
 
 
 def globalping_directed_results(
-    target: str, port: int, magic_values: list[str]
+    target: str, port: int, magic_value: str
 ) -> tuple[list[dict[str, Any]], str]:
-    """Request carrier-directed probes instead of sampling a whole city."""
-    cache_key = (target, port, tuple(magic_values))
+    """Request exactly one Globalping location condition.
+
+    Globalping treats every item in ``locations`` as a required probe selection,
+    not as an OR-list. RC4.2.8 bundled ISP and ASN alternatives in one request;
+    one unavailable alternative could therefore reject the whole measurement.
+    """
+    cache_key = (target, port, magic_value)
     if cache_key in GLOBALPING_SEARCH_CACHE:
         return GLOBALPING_SEARCH_CACHE[cache_key]
 
     payload = {
-        "limit": min(8, max(1, len(magic_values))),
+        "limit": 1,
         "target": target,
         "type": "traceroute",
-        "locations": [{"magic": value} for value in magic_values],
+        "locations": [{"magic": magic_value}],
         "measurementOptions": {"protocol": "TCP", "port": port},
     }
     try:
@@ -707,7 +724,7 @@ def globalping_directed_results(
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         if exc.code == 422 and "no_probes_found" in detail:
-            message = "定向条件当前无在线探针（Globalping no_probes_found）"
+            message = f"{magic_value} 无在线探针（Globalping no_probes_found）"
         else:
             message = f"Globalping HTTP {exc.code}｜{detail[:180]}"
         GLOBALPING_SEARCH_CACHE[cache_key] = ([], message)
@@ -737,22 +754,27 @@ def globalping_trace(target: str, port: int, carrier: str,
     province_cities = FORWARD_PROVINCE_CITIES[region]
     for city_index, candidate_city in enumerate(province_cities):
         magic_values = directed_magic_values(candidate_city, carrier, region)
-        attempted.extend(magic_values)
-        entries, availability = globalping_directed_results(
-            target, port, magic_values
-        )
-        availability_notes.append(f"{candidate_city}：{availability}")
-        candidates = [
-            entry for entry in entries
-            if (
-                normalize_city(str(entry.get("probe", {}).get("city") or ""))
-                == normalize_city(candidate_city)
-                and probe_matches_carrier(entry.get("probe", {}), carrier)
+        for magic_value in magic_values:
+            attempted.append(magic_value)
+            entries, availability = globalping_directed_results(
+                target, port, magic_value
             )
-        ]
+            availability_notes.append(f"{magic_value}：{availability}")
+            candidates = [
+                entry for entry in entries
+                if (
+                    normalize_city(str(entry.get("probe", {}).get("city") or ""))
+                    == normalize_city(candidate_city)
+                    and probe_matches_carrier(entry.get("probe", {}), carrier)
+                )
+            ]
+            if candidates:
+                selected_city = candidate_city
+                selection_scope = (
+                    "CAPITAL" if city_index == 0 else "PROVINCE_FALLBACK"
+                )
+                break
         if candidates:
-            selected_city = candidate_city
-            selection_scope = "CAPITAL" if city_index == 0 else "PROVINCE_FALLBACK"
             break
     candidates.sort(key=lambda entry: (
         int(entry.get("probe", {}).get("asn") or 0) != preferred_asn,
@@ -766,7 +788,7 @@ def globalping_trace(target: str, port: int, carrier: str,
             "access": f"{CAPITALS.get(region, region)}｜{CARRIER_NAME[carrier]}",
             "actualProbeCity": "",
             "selectionScope": "NO_PROBE",
-            "probeHealth": "OFFLINE｜省会及同省均无该运营商在线测点",
+            "probeHealth": "NOT-AVAILABLE｜省会及同省当前无该运营商在线测点",
             "verified": False, "route": "", "class": "省会测点不可用", "rank": 0,
             "evidence": (
                 f"已先定向查找 {CAPITALS.get(region, region)}，再查同省候选城市；"
@@ -776,7 +798,7 @@ def globalping_trace(target: str, port: int, carrier: str,
                 "本组绝不跨省替代、不参与评分。"
             ),
             "targetReached": False,
-            "reachability": "INCONCLUSIVE｜省会及同省无该运营商在线测点",
+            "reachability": "NOT-TESTED｜无探针，不代表入口不通",
             "stats": asdict(empty), "score": 0, "stars": "☆☆☆☆☆",
         }
 
@@ -1312,6 +1334,21 @@ def self_test_regressions() -> None:
             5,
             "联通 AS9929",
         ),
+        (
+            "CT",
+            "1 59.43.181.145 AS4809\n2 202.97.10.1 AS4134",
+            "Return",
+            3,
+            "单跳 CN2 不得判 GIA",
+        ),
+        (
+            "CT",
+            "1 59.43.181.145 AS4809\n2 59.43.80.141 AS4809\n"
+            "3 202.97.10.1 AS4134\n4 202.97.20.1 AS4134",
+            "Return",
+            3,
+            "多跳 163 交付不得判纯 GIA",
+        ),
     ]
     for carrier, route, direction, expected_rank, label in cases:
         _, actual_rank, _ = classify(carrier, route, direction)
@@ -1352,19 +1389,29 @@ def format_stats(data: dict[str, Any]) -> str:
 
 def dedicated_line_assessment(target: str, port: int, exit_ip: str,
                               forward: list[dict[str, Any]]) -> dict[str, Any]:
+    tested = [
+        x for x in forward
+        if x.get("verified") and x.get("selectionScope") != "NO_PROBE"
+    ]
     reached_samples = [
         f"{x['carrier']}-{x.get('region', '中国')}"
-        for x in forward if x.get("targetReached")
+        for x in tested if x.get("targetReached")
     ]
-    reached = sorted({x["carrier"] for x in forward if x.get("targetReached")})
+    reached = sorted({x["carrier"] for x in tested if x.get("targetReached")})
     entry_asn = origin_asn(target)
     exit_asn = origin_asn(exit_ip) if valid_public_ipv4(exit_ip) else ""
     if reached_samples:
         port_status = (
-            f"PASS｜{len(reached_samples)}/{len(forward)} 组六省会外部 TCP traceroute 到达入口"
+            f"PASS｜已取得探针中 {len(reached_samples)}/{len(tested)} 组到达入口"
+            f"｜完整矩阵覆盖 {len(tested)}/{len(forward)}"
+        )
+    elif tested:
+        port_status = (
+            f"INCONCLUSIVE｜已取得 {len(tested)}/{len(forward)} 组探针，"
+            "但 traceroute 未显示终点；不能据此判定端口关闭"
         )
     else:
-        port_status = "INCONCLUSIVE｜探针未显示终点；不能据此判定端口关闭"
+        port_status = "NOT-TESTED｜未取得去程探针；不能据此判定端口不通"
     return {
         "topology": "中国入口端口映射／NAT → 出口 VPS",
         "entry": f"{mask_ip(target)}:{port}",
@@ -1385,7 +1432,7 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
 def representative_route(items: list[dict[str, Any]], direction: str) -> str:
     valid_items = [x for x in items if int(x.get("rank", 0)) > 0]
     if not valid_items:
-        return f"{direction}探针不可用（不参与判定）"
+        return f"{direction}未取得可判定测点（不参与线路评分）"
     unique = sorted({str(x["class"]) for x in valid_items})
     if len(unique) == 1:
         return unique[0]
@@ -1414,12 +1461,21 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
     return_score = round(statistics.mean(x["score"] for x in valid_returns)) if valid_returns else 0
     if valid_forwards and valid_returns:
         overall = round(forward_score * 0.4 + return_score * 0.6)
+        score_basis = "BIDIRECTIONAL"
     elif valid_returns:
         overall = return_score
+        score_basis = "RETURN_ONLY"
     elif valid_forwards:
         overall = forward_score
+        score_basis = "FORWARD_ONLY"
     else:
         overall = 0
+        score_basis = "NO_EVIDENCE"
+    coverage = round(
+        (len(valid_forwards) + len(valid_returns))
+        / max(1, len(forward_items) + len(return_items)),
+        3,
+    )
     forward_premium = sum(1 for x in valid_forwards if premium_route(carrier, x))
     return_premium = sum(1 for x in valid_returns if premium_route(carrier, x))
     bidirectional_premium = (
@@ -1437,6 +1493,8 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         "forwardPremium": f"{forward_premium}/{len(valid_forwards)}",
         "returnPremium": f"{return_premium}/{len(valid_returns)}",
         "bidirectionalPremium": bidirectional_premium,
+        "scoreBasis": score_basis,
+        "evidenceCoverage": coverage,
         "score": overall, "stars": stars(overall),
     }
 
@@ -1507,7 +1565,7 @@ document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2
 <tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部入口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
-document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
+document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>评分依据：${{E(g.scoreBasis)}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
 document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六省会双程证据</h2><table><thead><tr><th>方向／省会</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
@@ -1517,7 +1575,7 @@ function nodeSeek(){{
     const returns=R.returns.filter(x=>x.carrier===c);
     const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
     const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
-    return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜去程有效 ${{g.forwardValid}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
+    return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜依据 ${{g.scoreBasis}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%｜去程有效 ${{g.forwardValid}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
 }}
@@ -1625,9 +1683,20 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "forwardProbes": forward_probes,
             "forwardScore": grade_item["forwardScore"],
             "returnScore": grade_item["returnScore"],
+            "scoreBasis": grade_item["scoreBasis"],
+            "evidenceCoverage": grade_item["evidenceCoverage"],
             "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
         })
     final_score = round(statistics.mean(x["score"] for x in report["grades"]))
+    forward_valid_total = sum(
+        int(str(x["forwardValid"]).split("/", 1)[0])
+        for x in report["grades"]
+    )
+    final_title = (
+        "三网双程综合判定"
+        if forward_valid_total == 18
+        else f"回程为主参考｜去程有效 {forward_valid_total}/18"
+    )
     return {
         "version": report["version"], "generated": report["generated"],
         "target": report["target"]["host"], "targetPort": report["target"]["port"],
@@ -1638,7 +1707,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         "bgp": {"asn": report["dedicatedLine"]["exitAsn"],
                 "provider": report["exit"]["identity"], "location": ""},
         "final": {"score": final_score, "stars": stars(final_score),
-                  "title": "三网双程综合判定", "elapsed": "N/A"},
+                  "title": final_title, "elapsed": "N/A"},
         "carriers": carriers,
         "dedicatedLine": report["dedicatedLine"],
     }
@@ -1765,6 +1834,7 @@ def main() -> int:
             CARRIER_NAME[item["carrier"]],
             f"去程 {item['forwardRoute']}〔有效 {item['forwardValid']}〕｜"
             f"回程 {item['returnRoute']}〔有效 {item['returnValid']}〕｜"
+            f"依据 {item['scoreBasis']}｜覆盖 {round(item['evidenceCoverage'] * 100)}%｜"
             f"{premium_text}｜{item['score']} 分｜{item['stars']}",
             color,
         )
@@ -1781,7 +1851,7 @@ def main() -> int:
             "clientActive": true_forward_count,
             "total": len(forward),
         },
-        "methodology": "去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖的地区和运营商才由 Globalping 请求同省真实外部探针，仍无探针即保持 INCONCLUSIVE。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。线路等级只依据可见 AS4809／AS9929／AS58807 等骨干证据。",
+        "methodology": "去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖的地区和运营商才由 Globalping 请求同省真实外部探针。Globalping 的 ISP 名称与 ASN 是备选条件，必须逐项独立请求，命中即停止；不能放进同一 locations 数组，否则任一无探针条件都可能使整笔测量失败。仍无探针时标记 NOT-TESTED，不得写成入口不通。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
