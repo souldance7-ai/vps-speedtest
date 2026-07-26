@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.10 BSG-PRIMARY-NATIONAL-FALLBACK"
+VERSION="v0.9 RC4.2.11 SHARED-PROBE-POOL"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.10 北上广主矩阵＋全国同运营商参考
+中国三网 VPS 双程质量检测 v0.9 RC4.2.11 北上广主矩阵＋共享探针池
 
 用法：
   bash 3net-route.sh
@@ -22,7 +22,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   去程：优先读取中国本地端主动实测证据；缺项才使用 Globalping 同省远端探针。
-  同省无探针时：退到中国境内同运营商探针，只标“全国参考”，不冒充指定省份。
+  同省无探针时：一次收集中国境内同运营商多探针快照，按地区分配并避免重复。
+  全国参考与指定地区分开统计，不会把 REFERENCE-PASS 写成指定地区 PASS。
   回程：当前出口 VPS → 对应地区三网固定／动态目标。
   net.sh／TcpQuality 的节点均是 VPS→中国回程目标，不会被冒充为中国→VPS 去程。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
@@ -111,7 +112,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.10 BSG-PRIMARY-NATIONAL-FALLBACK")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.11 SHARED-PROBE-POOL")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
@@ -250,9 +251,11 @@ FORWARD_REGION_ASNS = {
 }
 FORWARD_NATIONAL_ASNS = {
     "CT": (4134, 4812, 4816),
-    "CU": (4837, 4808, 17622),
-    "CM": (9808, 56048),
+    # 联通必须覆盖北上广省网 ASN，不能命中第一个 AS4808 后就停止。
+    "CU": (4808, 17621, 17622, 17623, 4837, 17816),
+    "CM": (56048, 9808, 24445),
 }
+NATIONAL_PROBE_LIMIT = len(ALL_FORWARD_REGIONS)
 
 
 def normalize_city(value: str) -> str:
@@ -427,7 +430,7 @@ def ask_target() -> tuple[str, int]:
 
 def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int = 25) -> Any:
     data = None
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.10", "Accept": "application/json"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.11", "Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -440,7 +443,7 @@ ASN_CACHE: dict[str, str] = {}
 
 
 def http_text(url: str, timeout: int = 25) -> str:
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.10", "Accept": "text/plain,*/*"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.11", "Accept": "text/plain,*/*"}
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read().decode("utf-8-sig", "replace")
@@ -698,12 +701,16 @@ def public_ip() -> tuple[str, str]:
 
 
 GLOBALPING_SEARCH_CACHE: dict[
-    tuple[str, int, str], tuple[list[dict[str, Any]], str]
+    tuple[str, int, str, int], tuple[list[dict[str, Any]], str]
 ] = {}
+GLOBALPING_NATIONAL_POOL_CACHE: dict[
+    tuple[str, int, str], tuple[list[dict[str, Any]], list[str]]
+] = {}
+GLOBALPING_NATIONAL_USED: dict[tuple[str, int, str], set[str]] = {}
 
 
 def globalping_directed_results(
-    target: str, port: int, magic_value: str
+    target: str, port: int, magic_value: str, limit: int = 1
 ) -> tuple[list[dict[str, Any]], str]:
     """Request exactly one Globalping location condition.
 
@@ -711,12 +718,12 @@ def globalping_directed_results(
     not as an OR-list. RC4.2.8 bundled ISP and ASN alternatives in one request;
     one unavailable alternative could therefore reject the whole measurement.
     """
-    cache_key = (target, port, magic_value)
+    cache_key = (target, port, magic_value, limit)
     if cache_key in GLOBALPING_SEARCH_CACHE:
         return GLOBALPING_SEARCH_CACHE[cache_key]
 
     payload = {
-        "limit": 1,
+        "limit": limit,
         "target": target,
         "type": "traceroute",
         "locations": [{"magic": magic_value}],
@@ -764,6 +771,111 @@ def globalping_directed_results(
     return GLOBALPING_SEARCH_CACHE[cache_key]
 
 
+def probe_fingerprint(entry: dict[str, Any]) -> str:
+    probe = entry.get("probe", {})
+    return "|".join((
+        str(probe.get("country") or "").upper(),
+        normalize_city(str(probe.get("state") or "")),
+        normalize_city(str(probe.get("city") or "")),
+        str(probe.get("asn") or 0),
+        str(probe.get("network") or "").strip().lower(),
+    ))
+
+
+def actual_region_for_probe(entry: dict[str, Any]) -> str:
+    probe = entry.get("probe", {})
+    actual_city = normalize_city(str(probe.get("city") or ""))
+    for region, cities in FORWARD_PROVINCE_CITIES.items():
+        if actual_city in {normalize_city(city) for city in cities}:
+            return region
+    return ""
+
+
+def globalping_national_pool(
+    target: str, port: int, carrier: str
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build one shared China/carrier snapshot for both 18- and 36-group modes."""
+    cache_key = (target, port, carrier)
+    if cache_key in GLOBALPING_NATIONAL_POOL_CACHE:
+        return GLOBALPING_NATIONAL_POOL_CACHE[cache_key]
+
+    attempts: list[str] = []
+    collected: dict[str, dict[str, Any]] = {}
+    magic_values = [f"China+{FORWARD_ISP_MAGIC[carrier]}"]
+    magic_values.extend(
+        f"China+AS{asn}" for asn in FORWARD_NATIONAL_ASNS[carrier]
+    )
+    for magic_value in magic_values:
+        entries, availability = globalping_directed_results(
+            target, port, magic_value, NATIONAL_PROBE_LIMIT
+        )
+        attempts.append(f"{magic_value}：{availability}")
+        for entry in entries:
+            probe = entry.get("probe", {})
+            if (
+                str(probe.get("country") or "").upper() == "CN"
+                and probe_matches_carrier(probe, carrier)
+            ):
+                collected.setdefault(probe_fingerprint(entry), entry)
+
+    pool = list(collected.values())
+    pool.sort(key=lambda entry: (
+        "eyeball-network" not in (entry.get("probe", {}).get("tags") or []),
+        str(entry.get("probe", {}).get("city") or ""),
+        int(entry.get("probe", {}).get("asn") or 0),
+    ))
+    GLOBALPING_NATIONAL_POOL_CACHE[cache_key] = (pool, attempts)
+    return GLOBALPING_NATIONAL_POOL_CACHE[cache_key]
+
+
+def choose_national_candidate(
+    pool: list[dict[str, Any]], carrier: str, region: str, used: set[str]
+) -> tuple[dict[str, Any] | None, bool]:
+    expected_asns = set(FORWARD_REGION_ASNS[carrier][region])
+
+    def candidate_rank(entry: dict[str, Any]) -> tuple[Any, ...]:
+        probe = entry.get("probe", {})
+        fingerprint = probe_fingerprint(entry)
+        actual_region = actual_region_for_probe(entry)
+        reserved_for_other_region = (
+            bool(actual_region)
+            and actual_region != region
+            and actual_region in ACTIVE_REGION_NAMES
+        )
+        return (
+            actual_region != region,
+            reserved_for_other_region,
+            fingerprint in used,
+            int(probe.get("asn") or 0) not in expected_asns,
+            "eyeball-network" not in (probe.get("tags") or []),
+            str(probe.get("city") or ""),
+        )
+
+    if not pool:
+        return None, False
+    entry = min(pool, key=candidate_rank)
+    fingerprint = probe_fingerprint(entry)
+    actual_region = actual_region_for_probe(entry)
+    reserved_for_other_region = (
+        bool(actual_region)
+        and actual_region != region
+        and actual_region in ACTIVE_REGION_NAMES
+    )
+    reused = fingerprint in used or reserved_for_other_region
+    used.add(fingerprint)
+    return entry, reused
+
+
+def select_national_candidate(
+    target: str, port: int, carrier: str, region: str
+) -> tuple[dict[str, Any] | None, bool, list[str]]:
+    pool, attempts = globalping_national_pool(target, port, carrier)
+    used_key = (target, port, carrier)
+    used = GLOBALPING_NATIONAL_USED.setdefault(used_key, set())
+    entry, reused = choose_national_candidate(pool, carrier, region, used)
+    return entry, reused, attempts
+
+
 def directed_magic_values(city: str, carrier: str, region: str) -> list[str]:
     values = [f"{city}+{FORWARD_ISP_MAGIC[carrier]}"]
     values.extend(
@@ -805,27 +917,32 @@ def globalping_trace(target: str, port: int, carrier: str,
                 break
         if candidates:
             break
-    # Globalping 在中国大陆的指定城市探针很稀疏。RC4.2.3 起完全禁止
-    # 跨省后，北上广也会被大量显示为 NOT-TESTED。这里恢复早期版本稳定的
-    # “中国境内同运营商”兜底，但明确降级为全国参考，绝不冒充请求省份。
+    national_reused = False
+    # 同省缺探针时，RC4.2.11 不再用 limit=1 的首个全国探针重复填满矩阵。
+    # 一次收集运营商名称及各省网 ASN 的共享快照，再按地区优先级分配。
     if not candidates:
-        for asn in FORWARD_NATIONAL_ASNS[carrier]:
-            magic_value = f"China+AS{asn}"
-            attempted.append(magic_value)
-            entries, availability = globalping_directed_results(
-                target, port, magic_value
-            )
-            availability_notes.append(f"{magic_value}：{availability}")
-            candidates = [
-                entry for entry in entries
-                if (
-                    str(entry.get("probe", {}).get("country") or "").upper() == "CN"
-                    and probe_matches_carrier(entry.get("probe", {}), carrier)
+        national_entry, national_reused, national_notes = select_national_candidate(
+            target, port, carrier, region
+        )
+        availability_notes.extend(national_notes)
+        if national_entry:
+            candidates = [national_entry]
+            actual_region = actual_region_for_probe(national_entry)
+            if actual_region == region:
+                actual_city = str(
+                    national_entry.get("probe", {}).get("city") or ""
                 )
-            ]
-            if candidates:
-                selection_scope = "NATIONAL_CARRIER_REFERENCE"
-                break
+                selected_city = actual_city
+                selection_scope = (
+                    "CAPITAL_POOL_DISCOVERY"
+                    if normalize_city(actual_city) == normalize_city(probe_city)
+                    else "PROVINCE_POOL_DISCOVERY"
+                )
+            else:
+                selection_scope = (
+                    "NATIONAL_SHARED_REFERENCE"
+                    if national_reused else "NATIONAL_CARRIER_REFERENCE"
+                )
     candidates.sort(key=lambda entry: (
         int(entry.get("probe", {}).get("asn") or 0) != preferred_asn,
         "eyeball-network" not in (entry.get("probe", {}).get("tags") or []),
@@ -880,7 +997,7 @@ def globalping_trace(target: str, port: int, carrier: str,
     source_asn = int(probe.get("asn") or 0)
     actual_city = str(probe.get("city") or "")
     carrier_verified = probe_matches_carrier(probe, carrier)
-    regional_verified = selection_scope != "NATIONAL_CARRIER_REFERENCE"
+    regional_verified = not selection_scope.startswith("NATIONAL_")
     city_verified = (
         normalize_city(actual_city) == normalize_city(selected_city)
         if regional_verified else False
@@ -896,21 +1013,35 @@ def globalping_trace(target: str, port: int, carrier: str,
         metric="TCP traceroute RTT（不作为业务丢包）"
     )
     value = score(rank, result_stats) if verified else 0
-    if selection_scope == "CAPITAL":
+    if selection_scope in {"CAPITAL", "CAPITAL_POOL_DISCOVERY"}:
         health = f"ONLINE-CAPITAL｜省会直测｜AS{source_asn}"
-        scope_note = f"省会 {CAPITALS.get(region, region)} 定向探针命中。"
-    elif selection_scope == "PROVINCE_FALLBACK":
+        scope_note = (
+            f"省会 {CAPITALS.get(region, region)} 探针命中。"
+            + (
+                "该探针由共享全国快照发现并按实际城市核验。"
+                if selection_scope == "CAPITAL_POOL_DISCOVERY" else ""
+            )
+        )
+    elif selection_scope in {"PROVINCE_FALLBACK", "PROVINCE_POOL_DISCOVERY"}:
         health = f"ONLINE-PROVINCE-FALLBACK｜同省 {actual_city}｜AS{source_asn}"
         scope_note = (
             f"省会 {CAPITALS.get(region, region)} 无可用探针，"
-            f"按规则退到同省 {actual_city}；未跨省。"
+            f"按实际城市核验退到同省 {actual_city}；未跨省。"
         )
     else:
-        health = f"ONLINE-NATIONAL-REFERENCE｜全国同运营商 {actual_city}｜AS{source_asn}"
+        health = (
+            f"ONLINE-NATIONAL-SHARED-REFERENCE｜复用全国参考 {actual_city}｜AS{source_asn}"
+            if national_reused
+            else f"ONLINE-NATIONAL-REFERENCE｜全国同运营商 {actual_city}｜AS{source_asn}"
+        )
         scope_note = (
             f"{CAPITALS.get(region, region)}及同省无在线探针；"
             f"退到中国境内{CARRIER_NAME[carrier]} {actual_city} 作为全国参考。"
             "该结果只证明同运营商网络到入口的线路与可达性，不代表请求省份。"
+            + (
+                "当前共享池唯一探针已用于其他地区，本项为复用参考，不重复计入参考覆盖。"
+                if national_reused else ""
+            )
         )
     evidence = scope_note + evidence
     if source_asn != preferred_asn:
@@ -921,6 +1052,8 @@ def globalping_trace(target: str, port: int, carrier: str,
     return {
         "carrier": carrier, "region": region, "requestedCity": probe_city,
         "actualProbeCity": actual_city, "selectionScope": selection_scope,
+        "sourceAsn": source_asn, "nationalProbeReused": national_reused,
+        "probeFingerprint": probe_fingerprint(entry),
         "regionalVerified": regional_verified,
         "access": access, "probeHealth": health, "verified": verified,
         "route": route, "class": route_class, "rank": rank,
@@ -1465,6 +1598,61 @@ def self_test_regressions() -> None:
         raise AssertionError("全国同运营商参考不得触发精品双程 PASS")
     if reference_grade["forwardReference"] != len(FORWARD_REGIONS):
         raise AssertionError("全国同运营商参考计数回归失败")
+    if not national_reference({"selectionScope": "NATIONAL_SHARED_REFERENCE"}):
+        raise AssertionError("共享全国参考范围识别回归失败")
+
+    one_reference_many_rows: list[dict[str, Any]] = []
+    for index, (region, probe_city) in enumerate(FORWARD_REGIONS):
+        item = self_test_forward("CU", region, probe_city)
+        item["selectionScope"] = (
+            "NATIONAL_CARRIER_REFERENCE"
+            if index == 0 else "NATIONAL_SHARED_REFERENCE"
+        )
+        item["regionalVerified"] = False
+        item["nationalProbeReused"] = index > 0
+        item["probeFingerprint"] = "same-national-probe"
+        one_reference_many_rows.append(item)
+    no_duplicate_grade = grade("CU", one_reference_many_rows, [
+        self_test_return("CU", region, f"reference-{region}")
+        for region, _ in FORWARD_REGIONS
+    ])
+    if no_duplicate_grade["forwardReference"] != 1:
+        raise AssertionError("同一全国探针不得重复计入独立参考")
+    if no_duplicate_grade["forwardSharedReference"] != len(FORWARD_REGIONS) - 1:
+        raise AssertionError("复用全国探针计数回归失败")
+    if no_duplicate_grade["forwardValid"] != f"1/{len(FORWARD_REGIONS)}":
+        raise AssertionError("复用全国探针不得拉高去程有效覆盖")
+
+    synthetic_pool = [
+        {"probe": {"country": "CN", "city": city, "asn": asn,
+                   "network": f"China Unicom {city}", "tags": ["eyeball-network"]}}
+        for city, asn in (
+            ("Beijing", 4808), ("Shanghai", 17621), ("Guangzhou", 17622),
+            ("Hefei", 4837), ("Nanjing", 4837), ("Hangzhou", 17623),
+        )
+    ]
+    if [actual_region_for_probe(x) for x in synthetic_pool] != [
+        "北京", "上海", "广东", "安徽", "江苏", "浙江"
+    ]:
+        raise AssertionError("联通北上广共享探针池地区识别回归失败")
+    if len({probe_fingerprint(x) for x in synthetic_pool}) != 6:
+        raise AssertionError("共享探针池去重回归失败")
+    default_used: set[str] = set()
+    default_selected = [
+        choose_national_candidate(synthetic_pool, "CU", region, default_used)[0]
+        for region, _ in ALL_FORWARD_REGIONS[:3]
+    ]
+    extended_used: set[str] = set()
+    extended_selected = [
+        choose_national_candidate(synthetic_pool, "CU", region, extended_used)[0]
+        for region, _ in ALL_FORWARD_REGIONS
+    ]
+    default_fingerprints = [probe_fingerprint(x or {}) for x in default_selected]
+    extended_fingerprints = [probe_fingerprint(x or {}) for x in extended_selected[:3]]
+    if default_fingerprints != extended_fingerprints:
+        raise AssertionError("18／36 组共享探针池北上广分配一致性回归失败")
+    if len(set(probe_fingerprint(x or {}) for x in extended_selected)) != 6:
+        raise AssertionError("36 组共享探针池不得重复分配可用探针")
 
 
 def format_stats(data: dict[str, Any]) -> str:
@@ -1482,10 +1670,22 @@ def format_stats(data: dict[str, Any]) -> str:
 
 def dedicated_line_assessment(target: str, port: int, exit_ip: str,
                               forward: list[dict[str, Any]]) -> dict[str, Any]:
-    tested = [
+    tested_all = [
         x for x in forward
         if x.get("verified") and x.get("selectionScope") != "NO_PROBE"
     ]
+    tested: list[dict[str, Any]] = []
+    seen_reference_probes: set[str] = set()
+    for item in tested_all:
+        if str(item.get("selectionScope", "")).startswith("NATIONAL_"):
+            fingerprint = str(item.get("probeFingerprint") or "")
+            if item.get("nationalProbeReused") or (
+                fingerprint and fingerprint in seen_reference_probes
+            ):
+                continue
+            if fingerprint:
+                seen_reference_probes.add(fingerprint)
+        tested.append(item)
     reached_samples = [
         f"{x['carrier']}-{x.get('region', '中国')}"
         for x in tested if x.get("targetReached")
@@ -1496,7 +1696,7 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
     if reached_samples:
         port_status = (
             f"PASS｜已取得探针中 {len(reached_samples)}/{len(tested)} 组到达入口"
-            f"｜完整矩阵覆盖 {len(tested)}/{len(forward)}"
+            f"｜独立证据覆盖 {len(tested)}/{len(forward)}"
         )
     elif tested:
         port_status = (
@@ -1541,22 +1741,32 @@ def premium_route(carrier: str, item: dict[str, Any]) -> bool:
     return route_class == "CMIN2（CMI2）"
 
 
+def national_reference(item: dict[str, Any]) -> bool:
+    return str(item.get("selectionScope", "")).startswith("NATIONAL_")
+
+
 def grade(carrier: str, forwards: list[dict[str, Any]],
           returns: list[dict[str, Any]]) -> dict[str, Any]:
     forward_items = [x for x in forwards if x["carrier"] == carrier]
     return_items = [x for x in returns if x["carrier"] == carrier]
-    valid_forwards = [
+    reached_forwards = [
         x for x in forward_items
         if int(x.get("rank", 0)) > 0 and x.get("verified") and x.get("targetReached")
     ]
     regional_forwards = [
-        x for x in valid_forwards
-        if x.get("selectionScope") != "NATIONAL_CARRIER_REFERENCE"
+        x for x in reached_forwards if not national_reference(x)
     ]
     reference_forwards = [
-        x for x in valid_forwards
-        if x.get("selectionScope") == "NATIONAL_CARRIER_REFERENCE"
+        x for x in reached_forwards
+        if national_reference(x) and not x.get("nationalProbeReused")
     ]
+    shared_reference_forwards = [
+        x for x in reached_forwards
+        if national_reference(x) and x.get("nationalProbeReused")
+    ]
+    # 同一个全国探针复用到多个请求地区时，只能算一份线路证据，避免重复
+    # 拉高得分、覆盖率或成功数。
+    valid_forwards = regional_forwards + reference_forwards
     valid_returns = [x for x in return_items if int(x.get("rank", 0)) > 0]
     forward_score = round(statistics.mean(x["score"] for x in valid_forwards)) if valid_forwards else 0
     return_score = round(statistics.mean(x["score"] for x in valid_returns)) if valid_returns else 0
@@ -1596,6 +1806,8 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         "forwardValid": f"{len(valid_forwards)}/{len(forward_items)}",
         "forwardRegional": f"{len(regional_forwards)}/{len(forward_items)}",
         "forwardReference": len(reference_forwards),
+        "forwardSharedReference": len(shared_reference_forwards),
+        "forwardReached": f"{len(reached_forwards)}/{len(forward_items)}",
         "returnValid": f"{len(valid_returns)}/{len(return_items)}",
         "forwardPremium": f"{forward_premium}/{len(valid_forwards)}",
         "returnPremium": f"{return_premium}/{len(valid_returns)}",
@@ -1672,7 +1884,7 @@ document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2
 <tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部入口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
-document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>评分依据：${{E(g.scoreBasis)}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
+document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>评分依据：${{E(g.scoreBasis)}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；指定地区 ${{E(g.forwardRegional)}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
 document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} ${{E(R.matrixLabel||'多地区')}}双程证据</h2><table><thead><tr><th>方向／地区</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
@@ -1682,7 +1894,7 @@ function nodeSeek(){{
     const returns=R.returns.filter(x=>x.carrier===c);
     const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
     const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
-    return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜依据 ${{g.scoreBasis}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%｜去程有效 ${{g.forwardValid}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
+    return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜依据 ${{g.scoreBasis}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%｜去程指定地区 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
 }}
@@ -1707,6 +1919,13 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "label": f"{item.get('region', '中国')}远端实测 → VPS",
             "access": item["access"], "publicIp": "",
             "verified": item["verified"],
+            "requestedCity": item.get("requestedCity", ""),
+            "actualProbeCity": item.get("actualProbeCity", ""),
+            "selectionScope": item.get("selectionScope", ""),
+            "regionalVerified": bool(item.get("regionalVerified")),
+            "sourceAsn": item.get("sourceAsn", 0),
+            "nationalProbeReused": bool(item.get("nationalProbeReused")),
+            "probeFingerprint": item.get("probeFingerprint", ""),
             "route": item["class"], "evidence": item["evidence"],
             "score": item["score"], "stars": item["stars"],
             "avg": s.get("avg"), "min": s.get("minimum"), "max": s.get("maximum"),
@@ -1724,10 +1943,22 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     carriers: list[dict[str, Any]] = []
     for carrier in ("CT", "CU", "CM"):
         forward_items = [x for x in report["forward"] if x["carrier"] == carrier]
-        valid_forward_items = [
+        reached_forward_items = [
             x for x in forward_items
             if int(x.get("rank", 0)) > 0 and x.get("verified") and x.get("targetReached")
         ]
+        regional_forward_items = [
+            x for x in reached_forward_items if not national_reference(x)
+        ]
+        reference_forward_items = [
+            x for x in reached_forward_items
+            if national_reference(x) and not x.get("nationalProbeReused")
+        ]
+        shared_reference_items = [
+            x for x in reached_forward_items
+            if national_reference(x) and x.get("nationalProbeReused")
+        ]
+        valid_forward_items = regional_forward_items + reference_forward_items
         forward_probes = [flatten_forward(x) for x in forward_items]
         grade_item = next(x for x in report["grades"] if x["carrier"] == carrier)
         return_items = [x for x in report["returns"] if x["carrier"] == carrier]
@@ -1757,7 +1988,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "region": f"{MATRIX_LABEL}汇总",
             "label": f"{MATRIX_LABEL}远端实测 → VPS",
             "access": MATRIX_CITIES,
-            "publicIp": "", "verified": len(valid_forward_items) == len(forward_items),
+            "publicIp": "",
+            "verified": len(regional_forward_items) == len(forward_items),
             "route": grade_item["forwardRoute"],
             "evidence": f"{MATRIX_LABEL}去程共 {len(forward_items)} 组",
             "score": grade_item["forwardScore"],
@@ -1768,7 +2000,10 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "p95": average([x["stats"].get("p95") for x in valid_forward_items]),
             "jitter": average([x["stats"].get("jitter") for x in valid_forward_items]),
             "stddev": None, "loss": None,
-            "success": f"{len(valid_forward_items)}/{len(forward_items)}",
+            "success": f"{len(regional_forward_items)}/{len(forward_items)}",
+            "regionalSuccess": f"{len(regional_forward_items)}/{len(forward_items)}",
+            "nationalReference": len(reference_forward_items),
+            "sharedReference": len(shared_reference_items),
             "routeHops": 0, "timeoutHops": 0,
             "backboneTags": sorted({
                 tag for x in valid_forward_items for tag in x.get("backboneTags", [])
@@ -1778,9 +2013,9 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "全国同运营商参考不会冒充指定地区证据。"
             ),
             "reachability": (
-                f"PASS｜{len(valid_forward_items)}/{len(forward_items)} 组指定地区探针到达入口"
-                if valid_forward_items
-                else "INCONCLUSIVE｜无指定地区有效探针"
+                f"指定地区 {len(regional_forward_items)}/{len(forward_items)}"
+                f"｜全国独立参考 {len(reference_forward_items)}"
+                f"｜复用参考 {len(shared_reference_items)}"
             ),
         }
         carriers.append({
@@ -1798,19 +2033,21 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "evidenceCoverage": grade_item["evidenceCoverage"],
             "forwardRegional": grade_item["forwardRegional"],
             "forwardReference": grade_item["forwardReference"],
+            "forwardSharedReference": grade_item["forwardSharedReference"],
+            "forwardReached": grade_item["forwardReached"],
             "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
         })
     final_score = round(statistics.mean(x["score"] for x in report["grades"]))
-    forward_valid_total = sum(
-        int(str(x["forwardValid"]).split("/", 1)[0])
+    forward_regional_total = sum(
+        int(str(x["forwardRegional"]).split("/", 1)[0])
         for x in report["grades"]
     )
     final_title = (
         "三网双程综合判定"
-        if forward_valid_total == EXPECTED_PER_DIRECTION
+        if forward_regional_total == EXPECTED_PER_DIRECTION
         else (
-            f"回程为主参考｜去程有效 "
-            f"{forward_valid_total}/{EXPECTED_PER_DIRECTION}"
+            f"回程为主参考｜指定地区去程 "
+            f"{forward_regional_total}/{EXPECTED_PER_DIRECTION}"
         )
     )
     return {
@@ -1958,8 +2195,9 @@ def main() -> int:
         premium_text = "精品双程 PASS" if item["bidirectionalPremium"] else "精品双程未证实"
         field(
             CARRIER_NAME[item["carrier"]],
-            f"去程 {item['forwardRoute']}〔有效 {item['forwardValid']}｜"
-            f"地区 {item['forwardRegional']}｜全国参考 {item['forwardReference']}〕｜"
+            f"去程 {item['forwardRoute']}〔地区 {item['forwardRegional']}｜"
+            f"全国独立参考 {item['forwardReference']}｜"
+            f"复用参考 {item['forwardSharedReference']}〕｜"
             f"回程 {item['returnRoute']}〔有效 {item['returnValid']}〕｜"
             f"依据 {item['scoreBasis']}｜覆盖 {round(item['evidenceCoverage'] * 100)}%｜"
             f"{premium_text}｜{item['score']} 分｜{item['stars']}",
@@ -1982,7 +2220,7 @@ def main() -> int:
             "clientActive": true_forward_count,
             "total": len(forward),
         },
-        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，按运营商 ASN 退到中国境内同运营商探针，仅标记 NATIONAL_CARRIER_REFERENCE／全国参考，只证明该运营商网络到入口的线路与可达性，不冒充指定省份，也不能单独满足精品双程的地区覆盖要求。Globalping 的 ISP 名称与 ASN 备选条件逐项独立请求，命中即停止。仍无探针时标记 NOT-TESTED，不得写成入口不通。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
+        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，一次收集中国境内同运营商名称及各省网 ASN 的多探针共享快照；北上广与扩展模式使用相同池规则，按实际城市和地区 ASN 优先分配并避免重复。全国参考只证明该运营商网络到入口的线路与可达性，不冒充指定省份；复用同一全国探针不重复计入覆盖、评分或成功数，也不能满足精品双程的地区覆盖要求。仍无探针时标记 NOT-TESTED，不得写成入口不通。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
