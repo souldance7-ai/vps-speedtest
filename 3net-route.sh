@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.9 SEQUENTIAL-PROBE-FIX"
+VERSION="v0.9 RC4.2.10 BSG-PRIMARY-NATIONAL-FALLBACK"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.9 去程测点顺序回退修正版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.10 北上广主矩阵＋全国同运营商参考
 
 用法：
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh --self-test
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh --target 203.55.99.88 --port 443
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh --target 203.55.99.88 --port 443 --forward-evidence /root/forward_evidence.json
+  bash 3net-route.sh
+  bash 3net-route.sh --extended
+  bash 3net-route.sh --self-test
+  bash 3net-route.sh --target 203.55.99.88 --port 443
+  bash 3net-route.sh --target 203.55.99.88 --port 443 --forward-evidence /root/forward_evidence.json
 
 说明：
   本脚本直接在出口 VPS 上运行，不使用 SSH 密码或私钥。
   目标 IP 示例：203.55.99.88
   业务端口示例：443（Trojan／AnyTLS 等协议实际监听端口，不是 SSH 22）
+  默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
+  --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   去程：优先读取中国本地端主动实测证据；缺项才使用 Globalping 同省远端探针。
-  回程：当前出口 VPS → 北京市／上海市／广州市／合肥市／南京市／杭州市三网十八组目标。
+  同省无探针时：退到中国境内同运营商探针，只标“全国参考”，不冒充指定省份。
+  回程：当前出口 VPS → 对应地区三网固定／动态目标。
   net.sh／TcpQuality 的节点均是 VPS→中国回程目标，不会被冒充为中国→VPS 去程。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
   traceroute 跳点不回应只计为“路由回覆率”，不会伪装成业务丢包。
@@ -32,12 +36,14 @@ TARGET=""
 TARGET_PORT=""
 NO_INSTALL=0
 FORWARD_EVIDENCE=""
+EXTENDED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) SELF_TEST=1; shift ;;
     --target) TARGET="${2:-}"; shift 2 ;;
     --port) TARGET_PORT="${2:-}"; shift 2 ;;
     --forward-evidence) FORWARD_EVIDENCE="${2:-}"; shift 2 ;;
+    --extended) EXTENDED=1; shift ;;
     --no-install) NO_INSTALL=1; shift ;;
     *) echo "[ERROR] 未知参数：$1"; exit 2 ;;
   esac
@@ -76,6 +82,7 @@ export THREE_NET_SELF_TEST="$SELF_TEST"
 export THREE_NET_TARGET="$TARGET"
 export THREE_NET_TARGET_PORT="$TARGET_PORT"
 export THREE_NET_FORWARD_EVIDENCE="$FORWARD_EVIDENCE"
+export THREE_NET_EXTENDED="$EXTENDED"
 
 # 将 Python 源码放到独立文件描述符 3，保留标准输入给 input() 读取终端。
 # 这样直接运行、curl 进程替换、管道输入三种方式都不会在交互提示处 EOF。
@@ -104,8 +111,9 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.9 SEQUENTIAL-PROBE-FIX")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.10 BSG-PRIMARY-NATIONAL-FALLBACK")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
+EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
@@ -162,7 +170,7 @@ PROBES = {
         ("浙江", "112.13.113.199"),
     ],
 }
-FORWARD_REGIONS = [
+ALL_FORWARD_REGIONS = [
     ("北京", "Beijing"),
     ("上海", "Shanghai"),
     ("广东", "Guangzhou"),
@@ -170,6 +178,22 @@ FORWARD_REGIONS = [
     ("江苏", "Nanjing"),
     ("浙江", "Hangzhou"),
 ]
+FORWARD_REGIONS = ALL_FORWARD_REGIONS if EXTENDED else ALL_FORWARD_REGIONS[:3]
+ACTIVE_REGION_NAMES = {region for region, _ in FORWARD_REGIONS}
+ACTIVE_PROBES = {
+    carrier: [
+        (city, host) for city, host in entries if city in ACTIVE_REGION_NAMES
+    ]
+    for carrier, entries in PROBES.items()
+}
+EXPECTED_PER_DIRECTION = len(FORWARD_REGIONS) * 3
+TOTAL_MATRIX_GROUPS = EXPECTED_PER_DIRECTION * 2
+MATRIX_CITIES = "／".join(
+    CAPITAL for CAPITAL in (
+        "北京市", "上海市", "广州市", "合肥市", "南京市", "杭州市"
+    )[:len(FORWARD_REGIONS)]
+)
+MATRIX_LABEL = "六地区扩展" if EXTENDED else "北上广主矩阵"
 FORWARD_ASN = {"CT": 4134, "CU": 4837, "CM": 9808}
 # 省会接入网不一定直接使用三大运营商的骨干 ASN。只锁 AS4134／AS4837／
 # AS9808 会漏掉上海联通 AS4808、广州联通 AS17622、北京移动 AS56048 等
@@ -223,6 +247,11 @@ FORWARD_REGION_ASNS = {
         "北京": (56048, 9808), "上海": (9808,), "广东": (9808,),
         "安徽": (9808,), "江苏": (9808,), "浙江": (9808,),
     },
+}
+FORWARD_NATIONAL_ASNS = {
+    "CT": (4134, 4812, 4816),
+    "CU": (4837, 4808, 17622),
+    "CM": (9808, 56048),
 }
 
 
@@ -398,7 +427,7 @@ def ask_target() -> tuple[str, int]:
 
 def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int = 25) -> Any:
     data = None
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.9", "Accept": "application/json"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.10", "Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -411,7 +440,7 @@ ASN_CACHE: dict[str, str] = {}
 
 
 def http_text(url: str, timeout: int = 25) -> str:
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.9", "Accept": "text/plain,*/*"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.10", "Accept": "text/plain,*/*"}
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read().decode("utf-8-sig", "replace")
@@ -776,6 +805,27 @@ def globalping_trace(target: str, port: int, carrier: str,
                 break
         if candidates:
             break
+    # Globalping 在中国大陆的指定城市探针很稀疏。RC4.2.3 起完全禁止
+    # 跨省后，北上广也会被大量显示为 NOT-TESTED。这里恢复早期版本稳定的
+    # “中国境内同运营商”兜底，但明确降级为全国参考，绝不冒充请求省份。
+    if not candidates:
+        for asn in FORWARD_NATIONAL_ASNS[carrier]:
+            magic_value = f"China+AS{asn}"
+            attempted.append(magic_value)
+            entries, availability = globalping_directed_results(
+                target, port, magic_value
+            )
+            availability_notes.append(f"{magic_value}：{availability}")
+            candidates = [
+                entry for entry in entries
+                if (
+                    str(entry.get("probe", {}).get("country") or "").upper() == "CN"
+                    and probe_matches_carrier(entry.get("probe", {}), carrier)
+                )
+            ]
+            if candidates:
+                selection_scope = "NATIONAL_CARRIER_REFERENCE"
+                break
     candidates.sort(key=lambda entry: (
         int(entry.get("probe", {}).get("asn") or 0) != preferred_asn,
         "eyeball-network" not in (entry.get("probe", {}).get("tags") or []),
@@ -789,13 +839,14 @@ def globalping_trace(target: str, port: int, carrier: str,
             "actualProbeCity": "",
             "selectionScope": "NO_PROBE",
             "probeHealth": "NOT-AVAILABLE｜省会及同省当前无该运营商在线测点",
-            "verified": False, "route": "", "class": "省会测点不可用", "rank": 0,
+            "verified": False, "regionalVerified": False,
+            "route": "", "class": "省会测点不可用", "rank": 0,
             "evidence": (
                 f"已先定向查找 {CAPITALS.get(region, region)}，再查同省候选城市；"
-                f"未找到{CARRIER_NAME[carrier]}接入网。"
+                f"并尝试中国境内同运营商全国参考；仍未找到{CARRIER_NAME[carrier]}接入网。"
                 f"尝试条件：{'、'.join(attempted)}。"
                 f"返回摘要：{'；'.join(availability_notes)}。"
-                "本组绝不跨省替代、不参与评分。"
+                "本组没有可用证据，不参与评分。"
             ),
             "targetReached": False,
             "reachability": "NOT-TESTED｜无探针，不代表入口不通",
@@ -828,9 +879,13 @@ def globalping_trace(target: str, port: int, carrier: str,
     route_class, rank, evidence = classify(carrier, route, "Forward")
     source_asn = int(probe.get("asn") or 0)
     actual_city = str(probe.get("city") or "")
-    city_verified = normalize_city(actual_city) == normalize_city(selected_city)
     carrier_verified = probe_matches_carrier(probe, carrier)
-    verified = city_verified and carrier_verified
+    regional_verified = selection_scope != "NATIONAL_CARRIER_REFERENCE"
+    city_verified = (
+        normalize_city(actual_city) == normalize_city(selected_city)
+        if regional_verified else False
+    )
+    verified = carrier_verified and (city_verified or not regional_verified)
     access = (
         f"{actual_city}, {probe.get('country', '')}｜"
         f"{probe.get('network', '')}｜AS{source_asn}"
@@ -841,19 +896,22 @@ def globalping_trace(target: str, port: int, carrier: str,
         metric="TCP traceroute RTT（不作为业务丢包）"
     )
     value = score(rank, result_stats) if verified else 0
-    health = (
-        f"ONLINE-CAPITAL｜省会直测｜AS{source_asn}"
-        if selection_scope == "CAPITAL"
-        else f"ONLINE-PROVINCE-FALLBACK｜同省 {actual_city}｜AS{source_asn}"
-    )
-    scope_note = (
-        f"省会 {CAPITALS.get(region, region)} 定向探针命中。"
-        if selection_scope == "CAPITAL"
-        else (
+    if selection_scope == "CAPITAL":
+        health = f"ONLINE-CAPITAL｜省会直测｜AS{source_asn}"
+        scope_note = f"省会 {CAPITALS.get(region, region)} 定向探针命中。"
+    elif selection_scope == "PROVINCE_FALLBACK":
+        health = f"ONLINE-PROVINCE-FALLBACK｜同省 {actual_city}｜AS{source_asn}"
+        scope_note = (
             f"省会 {CAPITALS.get(region, region)} 无可用探针，"
             f"按规则退到同省 {actual_city}；未跨省。"
         )
-    )
+    else:
+        health = f"ONLINE-NATIONAL-REFERENCE｜全国同运营商 {actual_city}｜AS{source_asn}"
+        scope_note = (
+            f"{CAPITALS.get(region, region)}及同省无在线探针；"
+            f"退到中国境内{CARRIER_NAME[carrier]} {actual_city} 作为全国参考。"
+            "该结果只证明同运营商网络到入口的线路与可达性，不代表请求省份。"
+        )
     evidence = scope_note + evidence
     if source_asn != preferred_asn:
         evidence = (
@@ -863,11 +921,19 @@ def globalping_trace(target: str, port: int, carrier: str,
     return {
         "carrier": carrier, "region": region, "requestedCity": probe_city,
         "actualProbeCity": actual_city, "selectionScope": selection_scope,
+        "regionalVerified": regional_verified,
         "access": access, "probeHealth": health, "verified": verified,
         "route": route, "class": route_class, "rank": rank,
         "evidence": evidence, "targetReached": target_reached,
-        "reachability": "PASS｜外部 TCP traceroute 到达入口" if target_reached
-                        else "INCONCLUSIVE｜未显示终点，不等于端口关闭",
+        "reachability": (
+            (
+                "PASS｜指定地区外部 TCP traceroute 到达入口"
+                if regional_verified
+                else "REFERENCE-PASS｜全国同运营商 TCP traceroute 到达入口"
+            )
+            if target_reached
+            else "INCONCLUSIVE｜未显示终点，不等于端口关闭"
+        ),
         "stats": asdict(result_stats), "score": value, "stars": stars(value),
     }
 
@@ -900,7 +966,7 @@ def load_client_forward_evidence(
     for raw in data.get("samples") or []:
         carrier = str(raw.get("carrier") or "").upper()
         region = normalized_province(str(raw.get("region") or ""))
-        if carrier not in CARRIER_NAME or region not in CAPITALS:
+        if carrier not in CARRIER_NAME or region not in ACTIVE_REGION_NAMES:
             rejected += 1
             continue
         route = str(raw.get("route") or "").strip()
@@ -934,6 +1000,7 @@ def load_client_forward_evidence(
             "requestedCity": CAPITALS[region],
             "actualProbeCity": actual_city,
             "selectionScope": "CLIENT_ACTIVE",
+            "regionalVerified": True,
             "access": f"{actual_city}｜{source_network}｜{source_asn}",
             "probeHealth": (
                 f"ONLINE-CLIENT-ACTIVE｜TCP {len(tcp_values)}/{attempts}"
@@ -958,7 +1025,7 @@ def load_client_forward_evidence(
             "generated": str(raw.get("generated") or data.get("generated") or ""),
         }
         loaded[(carrier, region)] = item
-    status = f"已载入真实去程 {len(loaded)}/18 组"
+    status = f"已载入真实去程 {len(loaded)}/{EXPECTED_PER_DIRECTION} 组"
     if rejected:
         status += f"｜拒绝无效记录 {rejected} 组"
     return loaded, status
@@ -980,7 +1047,7 @@ def static_return_probe_pool() -> dict[str, list[dict[str, Any]]]:
              "nodeSource": "STATIC+NETQUALITY_FALLBACK"}
             for city, host in entries
         ]
-        for carrier, entries in PROBES.items()
+        for carrier, entries in ACTIVE_PROBES.items()
     }
 
 
@@ -1024,7 +1091,7 @@ def load_icmp_alternatives() -> tuple[dict[tuple[str, str], list[str]], str]:
             carrier = carrier_from_node_isp(
                 str(row.get("isp_code") or row.get("isp") or "")
             )
-            if city not in CAPITALS or carrier not in PROBES:
+            if city not in ACTIVE_REGION_NAMES or carrier not in ACTIVE_PROBES:
                 continue
             values = [
                 value.strip() for value in str(row.get("ips") or "").split(",")
@@ -1032,7 +1099,9 @@ def load_icmp_alternatives() -> tuple[dict[tuple[str, str], list[str]], str]:
             ][:3]
             if values:
                 alternatives[(carrier, city)] = values
-        return alternatives, f"oneclickvirt ICMP 备用 {len(alternatives)}/18 组"
+        return alternatives, (
+            f"oneclickvirt ICMP 备用 {len(alternatives)}/{EXPECTED_PER_DIRECTION} 组"
+        )
     except Exception as exc:
         return {}, f"oneclickvirt ICMP 备用不可用｜{type(exc).__name__}"
 
@@ -1052,7 +1121,9 @@ def load_return_probe_pool() -> tuple[dict[str, list[dict[str, Any]]], str]:
         body = http_text(TCPQUALITY_NODES_API, timeout=20)
         reader = csv.DictReader(io.StringIO(body), delimiter="\t")
         candidates: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        wanted = {city for entries in PROBES.values() for city, _ in entries}
+        wanted = {
+            city for entries in ACTIVE_PROBES.values() for city, _ in entries
+        }
         for row in reader:
             if str(row.get("type") or "").strip().lower() != "cdn":
                 continue
@@ -1061,7 +1132,10 @@ def load_return_probe_pool() -> tuple[dict[str, list[dict[str, Any]]], str]:
             city = normalized_province(str(row.get("prov") or ""))
             carrier = carrier_from_node_isp(str(row.get("isp") or ""))
             fixed_ip = str(row.get("ip") or "").strip()
-            if city not in wanted or carrier not in PROBES or not valid_public_ipv4(fixed_ip):
+            if (
+                city not in wanted or carrier not in ACTIVE_PROBES
+                or not valid_public_ipv4(fixed_ip)
+            ):
                 continue
             spec = {
                 "city": city, "host": str(row.get("host") or fixed_ip).strip(),
@@ -1075,7 +1149,7 @@ def load_return_probe_pool() -> tuple[dict[str, list[dict[str, Any]]], str]:
             candidates.setdefault((carrier, city), []).append(spec)
         dynamic_count = 0
         missing: list[str] = []
-        for carrier, static_entries in PROBES.items():
+        for carrier, static_entries in ACTIVE_PROBES.items():
             resolved: list[dict[str, Any]] = []
             for city, static_host in static_entries:
                 items = candidates.get((carrier, city), [])
@@ -1086,13 +1160,16 @@ def load_return_probe_pool() -> tuple[dict[str, list[dict[str, Any]]], str]:
                     resolved.append(pool[carrier][len(resolved)])
                     missing.append(f"{carrier}-{city}")
             pool[carrier] = resolved
-        status = f"ONLINE｜动态节点 {dynamic_count}/18｜{alternative_status}"
+        status = (
+            f"ONLINE｜动态节点 {dynamic_count}/{EXPECTED_PER_DIRECTION}｜"
+            f"{alternative_status}"
+        )
         if missing:
             status += f"｜静态回退 {len(missing)} 组"
         return pool, status
     except Exception as exc:
         return pool, (
-            f"DEGRADED｜动态节点池不可用，18 组使用静态回退｜"
+            f"DEGRADED｜动态节点池不可用，{EXPECTED_PER_DIRECTION} 组使用静态回退｜"
             f"{alternative_status}｜{type(exc).__name__}: {exc}"
         )
 
@@ -1373,6 +1450,22 @@ def self_test_regressions() -> None:
     if normalize_city("Nanjing") != normalize_city("nanjing"):
         raise AssertionError("省会城市标准化回归失败")
 
+    reference_forwards = []
+    reference_returns = []
+    for region, probe_city in FORWARD_REGIONS:
+        item = self_test_forward("CT", region, probe_city)
+        item["selectionScope"] = "NATIONAL_CARRIER_REFERENCE"
+        item["regionalVerified"] = False
+        reference_forwards.append(item)
+        reference_returns.append(
+            self_test_return("CT", region, f"reference-{region}")
+        )
+    reference_grade = grade("CT", reference_forwards, reference_returns)
+    if reference_grade["bidirectionalPremium"]:
+        raise AssertionError("全国同运营商参考不得触发精品双程 PASS")
+    if reference_grade["forwardReference"] != len(FORWARD_REGIONS):
+        raise AssertionError("全国同运营商参考计数回归失败")
+
 
 def format_stats(data: dict[str, Any]) -> str:
     avg = data.get("avg")
@@ -1436,7 +1529,7 @@ def representative_route(items: list[dict[str, Any]], direction: str) -> str:
     unique = sorted({str(x["class"]) for x in valid_items})
     if len(unique) == 1:
         return unique[0]
-    return f"六省会混合（{len(unique)} 类）"
+    return f"多地区混合（{len(unique)} 类）"
 
 
 def premium_route(carrier: str, item: dict[str, Any]) -> bool:
@@ -1455,6 +1548,14 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
     valid_forwards = [
         x for x in forward_items
         if int(x.get("rank", 0)) > 0 and x.get("verified") and x.get("targetReached")
+    ]
+    regional_forwards = [
+        x for x in valid_forwards
+        if x.get("selectionScope") != "NATIONAL_CARRIER_REFERENCE"
+    ]
+    reference_forwards = [
+        x for x in valid_forwards
+        if x.get("selectionScope") == "NATIONAL_CARRIER_REFERENCE"
     ]
     valid_returns = [x for x in return_items if int(x.get("rank", 0)) > 0]
     forward_score = round(statistics.mean(x["score"] for x in valid_forwards)) if valid_forwards else 0
@@ -1477,10 +1578,14 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         3,
     )
     forward_premium = sum(1 for x in valid_forwards if premium_route(carrier, x))
+    regional_forward_premium = sum(
+        1 for x in regional_forwards if premium_route(carrier, x)
+    )
     return_premium = sum(1 for x in valid_returns if premium_route(carrier, x))
     bidirectional_premium = (
-        len(valid_forwards) >= 3 and len(valid_returns) >= 3
-        and forward_premium == len(valid_forwards)
+        len(regional_forwards) == len(forward_items)
+        and len(valid_returns) == len(return_items)
+        and regional_forward_premium == len(regional_forwards)
         and return_premium == len(valid_returns)
     )
     return {
@@ -1489,6 +1594,8 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         "returnRoute": representative_route(valid_returns, "回程"),
         "forwardScore": forward_score, "returnScore": return_score,
         "forwardValid": f"{len(valid_forwards)}/{len(forward_items)}",
+        "forwardRegional": f"{len(regional_forwards)}/{len(forward_items)}",
+        "forwardReference": len(reference_forwards),
         "returnValid": f"{len(valid_returns)}/{len(return_items)}",
         "forwardPremium": f"{forward_premium}/{len(valid_forwards)}",
         "returnPremium": f"{return_premium}/{len(valid_returns)}",
@@ -1566,7 +1673,7 @@ document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
 document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>评分依据：${{E(g.scoreBasis)}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
-document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六省会双程证据</h2><table><thead><tr><th>方向／省会</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
+document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} ${{E(R.matrixLabel||'多地区')}}双程证据</h2><table><thead><tr><th>方向／地区</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
   const tabs=':::: tabs\\n'+['CT','CU','CM'].map(c=>{{
@@ -1647,11 +1754,12 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "reachability": item.get("reachability", "INCONCLUSIVE"),
             })
         forward_flat = {
-            "region": "六省会汇总", "label": "六省会远端实测 → VPS",
-            "access": "北京市／上海市／广州市／合肥市／南京市／杭州市",
+            "region": f"{MATRIX_LABEL}汇总",
+            "label": f"{MATRIX_LABEL}远端实测 → VPS",
+            "access": MATRIX_CITIES,
             "publicIp": "", "verified": len(valid_forward_items) == len(forward_items),
             "route": grade_item["forwardRoute"],
-            "evidence": f"六省会去程共 {len(forward_items)} 组",
+            "evidence": f"{MATRIX_LABEL}去程共 {len(forward_items)} 组",
             "score": grade_item["forwardScore"],
             "stars": stars(grade_item["forwardScore"]),
             "avg": average([x["stats"].get("avg") for x in valid_forward_items]),
@@ -1665,7 +1773,10 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "backboneTags": sorted({
                 tag for x in valid_forward_items for tag in x.get("backboneTags", [])
             }),
-            "routeNote": "六个省会分别列示骨干标签与中文路由注释；汇总不覆盖单省证据。",
+            "routeNote": (
+                "各地区分别列示骨干标签与中文路由注释；"
+                "全国同运营商参考不会冒充指定地区证据。"
+            ),
             "reachability": (
                 f"PASS｜{len(valid_forward_items)}/{len(forward_items)} 组指定地区探针到达入口"
                 if valid_forward_items
@@ -1685,6 +1796,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "returnScore": grade_item["returnScore"],
             "scoreBasis": grade_item["scoreBasis"],
             "evidenceCoverage": grade_item["evidenceCoverage"],
+            "forwardRegional": grade_item["forwardRegional"],
+            "forwardReference": grade_item["forwardReference"],
             "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
         })
     final_score = round(statistics.mean(x["score"] for x in report["grades"]))
@@ -1694,15 +1807,20 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     )
     final_title = (
         "三网双程综合判定"
-        if forward_valid_total == 18
-        else f"回程为主参考｜去程有效 {forward_valid_total}/18"
+        if forward_valid_total == EXPECTED_PER_DIRECTION
+        else (
+            f"回程为主参考｜去程有效 "
+            f"{forward_valid_total}/{EXPECTED_PER_DIRECTION}"
+        )
     )
     return {
         "version": report["version"], "generated": report["generated"],
         "target": report["target"]["host"], "targetPort": report["target"]["port"],
         "returnSshHost": report["exit"]["host"], "selfTest": report["selfTest"],
         "mode": report["mode"],
-        "matrix": "北京市／上海市／广州市／合肥市／南京市／杭州市 × 三网去程＋回程（36 组）",
+        "matrix": (
+            f"{MATRIX_CITIES} × 三网去程＋回程（{TOTAL_MATRIX_GROUPS} 组）"
+        ),
         "methodology": report["methodology"],
         "bgp": {"asn": report["dedicatedLine"]["exitAsn"],
                 "provider": report["exit"]["identity"], "location": ""},
@@ -1744,7 +1862,7 @@ def main() -> int:
     field("当前出口 VPS", f"{mask_ip(exit_ip)}｜{exit_identity or '本机原生执行'}", GREEN)
     field("认证方式", "VPS 本机原生执行｜不使用 SSH／密码／私钥", GREEN)
     field("入口核对方式", "中国本地端主动证据优先；缺项才使用 Globalping，不以回程反推", CYAN)
-    field("测试地区", "北京市／上海市／广州市／合肥市／南京市／杭州市", MAGENTA)
+    field("测试矩阵", f"{MATRIX_LABEL}｜{MATRIX_CITIES}", MAGENTA)
 
     client_forward, client_forward_status = load_client_forward_evidence(
         FORWARD_EVIDENCE_PATH, target, port
@@ -1782,7 +1900,11 @@ def main() -> int:
     )
     if not SELF_TEST and true_forward_count < len(forward):
         banner("TRUE FORWARD / 中国本地端补测提示", MAGENTA)
-        field("已导入真去程", f"{true_forward_count}/18 组", GREEN if true_forward_count else YELLOW)
+        field(
+            "已导入真去程",
+            f"{true_forward_count}/{EXPECTED_PER_DIRECTION} 组",
+            GREEN if true_forward_count else YELLOW,
+        )
         field(
             "Windows 客户端",
             "运行 cn3_client_probe.ps1，按当前网络填写 CT／CU／CM 与所在省份，生成 forward_evidence.json",
@@ -1806,7 +1928,11 @@ def main() -> int:
 
     return_pool, return_pool_status = load_return_probe_pool()
     return_total = sum(len(items) for items in return_pool.values())
-    banner("RETURN PROBE / 出口 VPS 原生三网十八组回程", CYAN)
+    banner(
+        f"RETURN PROBE / 出口 VPS 原生三网"
+        f"{EXPECTED_PER_DIRECTION}组回程",
+        CYAN,
+    )
     field("执行位置", mask_ip(exit_ip), GREEN)
     field("动态测点池", return_pool_status, GREEN if return_pool_status.startswith("ONLINE") else YELLOW)
     field("执行方式", "真实 TCP 端口＋TCP／ICMP／UDP 交叉识别；证据不足再切 oneclickvirt 同省三网 ICMP 备用", GRAY)
@@ -1832,7 +1958,8 @@ def main() -> int:
         premium_text = "精品双程 PASS" if item["bidirectionalPremium"] else "精品双程未证实"
         field(
             CARRIER_NAME[item["carrier"]],
-            f"去程 {item['forwardRoute']}〔有效 {item['forwardValid']}〕｜"
+            f"去程 {item['forwardRoute']}〔有效 {item['forwardValid']}｜"
+            f"地区 {item['forwardRegional']}｜全国参考 {item['forwardReference']}〕｜"
             f"回程 {item['returnRoute']}〔有效 {item['returnValid']}〕｜"
             f"依据 {item['scoreBasis']}｜覆盖 {round(item['evidenceCoverage'] * 100)}%｜"
             f"{premium_text}｜{item['score']} 分｜{item['stars']}",
@@ -1843,6 +1970,10 @@ def main() -> int:
         "version": VERSION,
         "generated": dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
         "mode": "VPS_NATIVE_DUAL_ENDPOINT",
+        "matrixLabel": MATRIX_LABEL,
+        "matrix": (
+            f"{MATRIX_CITIES} × 三网去程＋回程（{TOTAL_MATRIX_GROUPS} 组）"
+        ),
         "selfTest": SELF_TEST,
         "target": {"host": mask_ip(target), "port": port, "role": "国内入口"},
         "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "出口 VPS 本机"},
@@ -1851,7 +1982,7 @@ def main() -> int:
             "clientActive": true_forward_count,
             "total": len(forward),
         },
-        "methodology": "去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖的地区和运营商才由 Globalping 请求同省真实外部探针。Globalping 的 ISP 名称与 ASN 是备选条件，必须逐项独立请求，命中即停止；不能放进同一 locations 数组，否则任一无探针条件都可能使整笔测量失败。仍无探针时标记 NOT-TESTED，不得写成入口不通。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
+        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，按运营商 ASN 退到中国境内同运营商探针，仅标记 NATIONAL_CARRIER_REFERENCE／全国参考，只证明该运营商网络到入口的线路与可达性，不冒充指定省份，也不能单独满足精品双程的地区覆盖要求。Globalping 的 ISP 名称与 ASN 备选条件逐项独立请求，命中即停止。仍无探针时标记 NOT-TESTED，不得写成入口不通。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
