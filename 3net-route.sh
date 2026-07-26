@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.2 SIX-REGION FULL"
+VERSION="v0.9 RC4.2.3 SIX-REGION VERIFIED"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.2 六地区完整版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.3 六地区核验版
 
 用法：
   bash 中国三网VPS双程质量检测_v0.9_RC4.2_六地区完整版.sh
@@ -97,7 +97,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.2 SIX-REGION FULL")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.3 SIX-REGION VERIFIED")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
@@ -314,6 +314,15 @@ def pattern_count(text: str, patterns: list[str]) -> int:
     return len({(m.start(), m.group(0)) for p in patterns for m in re.finditer(p, text, re.I)})
 
 
+def matching_hop_count(text: str, patterns: list[str]) -> int:
+    """Count matching route hops, not duplicate ASN/IP tags on one hop."""
+    return sum(
+        1 for line in text.splitlines()
+        if re.search(r"^\s*\d+\s+", line)
+        and any(re.search(pattern, line, re.I) for pattern in patterns)
+    )
+
+
 def classify(carrier: str, route: str, direction: str) -> tuple[str, int, str]:
     plain = route.replace("\r", "")
     if carrier == "CT":
@@ -334,8 +343,15 @@ def classify(carrier: str, route: str, direction: str) -> tuple[str, int, str]:
         if first_index(plain, [r"AS23764", r"CTGNet", r"69\.194\."]) >= 0:
             return "CTG GIA", 4, "检测到 AS23764／CTGNet 特征"
         if ni >= 0:
+            if direction == "Return" and matching_hop_count(plain, normal) <= 1:
+                return "INCONCLUSIVE｜仅见电信目的网", 0, (
+                    "仅一个回程跳点命中 AS4134／202.97，可能只是目的网交付，"
+                    "不足以证明全程走电信 163"
+                )
             return "电信 163", 2, "仅检测到 AS4134／202.97 普通骨干"
-        return "国际 BGP／未见电信骨干", 1, "ASN 已补查，未命中 AS4809、AS4134 或 AS23764，不伪判 CN2"
+        return "INCONCLUSIVE｜未见电信骨干", 0, (
+            "ASN 已补查，仍未命中 AS4809、AS4134 或 AS23764；本组证据不足，不参与评分"
+        )
 
     if carrier == "CU":
         ai = first_index(plain, [r"AS9929", r"CUII", r"218\.105\.", r"210\.(51|52|53|78)\."])
@@ -350,8 +366,17 @@ def classify(carrier: str, route: str, direction: str) -> tuple[str, int, str]:
         if ui >= 0:
             return "CUG／非 AS9929", 3, "检测到 AS10099／CUG，但未确认 AS9929"
         if ni >= 0:
+            if direction == "Return" and matching_hop_count(
+                plain, [r"AS4837", r"219\.158\."]
+            ) <= 1:
+                return "INCONCLUSIVE｜仅见联通目的网", 0, (
+                    "仅一个回程跳点命中 AS4837／219.158，可能只是目的网交付，"
+                    "不足以证明全程走普通联通"
+                )
             return "AS4837 普通联通", 2, "仅检测到 AS4837／219.158 普通骨干"
-        return "国际 BGP／未见联通骨干", 1, "ASN 已补查，未命中 AS9929、AS10099 或 AS4837"
+        return "INCONCLUSIVE｜未见联通骨干", 0, (
+            "ASN 已补查，仍未命中 AS9929、AS10099 或 AS4837；本组证据不足，不参与评分"
+        )
 
     cmin2 = first_index(plain, [
         r"AS58807", r"CMIN2", r"223\.118\.32\.",
@@ -373,7 +398,9 @@ def classify(carrier: str, route: str, direction: str) -> tuple[str, int, str]:
         return "CMI 普通国际", 2, "检测到 AS58453／普通 223.119 或 223.120"
     if cmnet >= 0:
         return "CMNET 普通移动", 2, "仅检测到 AS9808／221.183 国内骨干"
-    return "国际 BGP／未见移动骨干", 1, "ASN 已补查，未命中 AS58807、AS58453 或 AS9808"
+    return "INCONCLUSIVE｜未见移动骨干", 0, (
+        "ASN 已补查，仍未命中 AS58807、AS58453 或 AS9808；本组证据不足，不参与评分"
+    )
 
 
 @dataclass
@@ -408,6 +435,8 @@ def stats(values: list[float], expected: int, loss_valid: bool = True,
 
 
 def score(rank: int, s: Stats) -> int:
+    if rank <= 0:
+        return 0
     route_score = {5: 60, 4: 54, 3: 42, 2: 28}.get(rank, 12)
     latency = 0
     if s.avg is not None:
@@ -417,7 +446,7 @@ def score(rank: int, s: Stats) -> int:
 
 
 def stars(value: int) -> str:
-    count = 5 if value >= 90 else 4 if value >= 75 else 3 if value >= 60 else 2 if value >= 40 else 1
+    count = 5 if value >= 90 else 4 if value >= 75 else 3 if value >= 60 else 2 if value >= 40 else 1 if value > 0 else 0
     return "★" * count + "☆" * (5 - count)
 
 
@@ -554,7 +583,14 @@ def globalping_trace(target: str, port: int, carrier: str,
                 metric="TCP traceroute RTT（不作为业务丢包）"
             )
             value = score(rank, result_stats)
-            verified = source_asn == asn
+            asn_verified = source_asn == asn
+            region_verified = mode != "中国+ASN 备用"
+            verified = asn_verified and region_verified
+            if not region_verified:
+                evidence = (
+                    f"指定地区无可用探针，实际降级到 {probe.get('city', '中国')} AS{source_asn}；"
+                    "本结果仅作同运营商参考，不纳入指定地区评分。"
+                ) + evidence
             if not verified:
                 value = max(0, value - 15)
             return {
@@ -669,6 +705,35 @@ def self_test_return(carrier: str, city: str, host: str) -> dict[str, Any]:
     }
 
 
+def self_test_regressions() -> None:
+    cases = [
+        ("CT", "1 8.8.8.8 AS15169", "Forward", 0, "电信无骨干证据"),
+        ("CU", "1 8.8.8.8 AS15169", "Return", 0, "联通无骨干证据"),
+        ("CT", "1 202.97.10.1 AS4134", "Return", 0, "电信仅目的网投递"),
+        ("CU", "1 219.158.10.1 AS4837", "Return", 0, "联通仅目的网投递"),
+        (
+            "CT",
+            "1 59.43.181.145 AS4809\n2 59.43.80.141 AS4809\n3 202.97.10.1 AS4134",
+            "Return",
+            5,
+            "电信 CN2 GIA",
+        ),
+        (
+            "CU",
+            "1 218.105.2.205 AS9929\n2 210.51.16.9 AS9929\n3 219.158.10.1 AS4837",
+            "Return",
+            5,
+            "联通 AS9929",
+        ),
+    ]
+    for carrier, route, direction, expected_rank, label in cases:
+        _, actual_rank, _ = classify(carrier, route, direction)
+        if actual_rank != expected_rank:
+            raise AssertionError(
+                f"{label} 回归失败：期望 rank={expected_rank}，实际 rank={actual_rank}"
+            )
+
+
 def format_stats(data: dict[str, Any]) -> str:
     avg = data.get("avg")
     p95 = data.get("p95")
@@ -724,11 +789,23 @@ def representative_route(items: list[dict[str, Any]], direction: str) -> str:
     return f"六地区混合（{len(unique)} 类）"
 
 
+def premium_route(carrier: str, item: dict[str, Any]) -> bool:
+    route_class = str(item.get("class", ""))
+    if carrier == "CT":
+        return route_class in {"CN2 GIA", "CTG GIA"}
+    if carrier == "CU":
+        return route_class == "AS9929（CUII）"
+    return route_class == "CMIN2（CMI2）"
+
+
 def grade(carrier: str, forwards: list[dict[str, Any]],
           returns: list[dict[str, Any]]) -> dict[str, Any]:
     forward_items = [x for x in forwards if x["carrier"] == carrier]
     return_items = [x for x in returns if x["carrier"] == carrier]
-    valid_forwards = [x for x in forward_items if int(x.get("rank", 0)) > 0]
+    valid_forwards = [
+        x for x in forward_items
+        if int(x.get("rank", 0)) > 0 and x.get("verified") and x.get("targetReached")
+    ]
     valid_returns = [x for x in return_items if int(x.get("rank", 0)) > 0]
     forward_score = round(statistics.mean(x["score"] for x in valid_forwards)) if valid_forwards else 0
     return_score = round(statistics.mean(x["score"] for x in valid_returns)) if valid_returns else 0
@@ -740,13 +817,23 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         overall = forward_score
     else:
         overall = 0
+    forward_premium = sum(1 for x in valid_forwards if premium_route(carrier, x))
+    return_premium = sum(1 for x in valid_returns if premium_route(carrier, x))
+    bidirectional_premium = (
+        len(valid_forwards) >= 3 and len(valid_returns) >= 3
+        and forward_premium == len(valid_forwards)
+        and return_premium == len(valid_returns)
+    )
     return {
         "carrier": carrier,
-        "forwardRoute": representative_route(forward_items, "去程"),
-        "returnRoute": representative_route(return_items, "回程"),
+        "forwardRoute": representative_route(valid_forwards, "去程"),
+        "returnRoute": representative_route(valid_returns, "回程"),
         "forwardScore": forward_score, "returnScore": return_score,
         "forwardValid": f"{len(valid_forwards)}/{len(forward_items)}",
         "returnValid": f"{len(valid_returns)}/{len(return_items)}",
+        "forwardPremium": f"{forward_premium}/{len(valid_forwards)}",
+        "returnPremium": f"{return_premium}/{len(valid_returns)}",
+        "bidirectionalPremium": bidirectional_premium,
         "score": overall, "stars": stars(overall),
     }
 
@@ -805,7 +892,7 @@ document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2
 <tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部入口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
-document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}）</div></section>`).join('');
+document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
 document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六地区双程证据</h2><table><thead><tr><th>方向／地区</th><th>线路</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.class)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{x.city}}</td><td>${{E(x.class)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
@@ -815,7 +902,7 @@ function nodeSeek(){{
     const returns=R.returns.filter(x=>x.carrier===c);
     const forwardRows=forwards.map(x=>`- 去程（${{x.region}}→VPS）：${{x.class}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
     const returnRows=returns.map(x=>`- 回程（VPS→${{x.city}}）：${{x.class}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
-    return `::: tab-item ${{names[c]}}\n双程：${{g.score}} 分 ${{g.stars}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
+    return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜去程有效 ${{g.forwardValid}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
 }}
@@ -853,10 +940,15 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     carriers: list[dict[str, Any]] = []
     for carrier in ("CT", "CU", "CM"):
         forward_items = [x for x in report["forward"] if x["carrier"] == carrier]
+        valid_forward_items = [
+            x for x in forward_items
+            if int(x.get("rank", 0)) > 0 and x.get("verified") and x.get("targetReached")
+        ]
         forward_probes = [flatten_forward(x) for x in forward_items]
         grade_item = next(x for x in report["grades"] if x["carrier"] == carrier)
+        return_items = [x for x in report["returns"] if x["carrier"] == carrier]
         probes: list[dict[str, Any]] = []
-        for item in (x for x in report["returns"] if x["carrier"] == carrier):
+        for item in return_items:
             s = item["stats"]
             probes.append({
                 "city": item["city"], "host": item["host"], "ip": item["probeIp"],
@@ -872,31 +964,37 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         forward_flat = {
             "region": "六地区汇总", "label": "六地区远端实测 → VPS",
             "access": "北京／上海／广东／安徽／江苏／浙江",
-            "publicIp": "", "verified": all(x["verified"] for x in forward_items),
+            "publicIp": "", "verified": len(valid_forward_items) == len(forward_items),
             "route": grade_item["forwardRoute"],
             "evidence": f"六地区去程共 {len(forward_items)} 组",
             "score": grade_item["forwardScore"],
             "stars": stars(grade_item["forwardScore"]),
-            "avg": average([x["stats"].get("avg") for x in forward_items]),
-            "min": average([x["stats"].get("minimum") for x in forward_items]),
-            "max": average([x["stats"].get("maximum") for x in forward_items]),
-            "p95": average([x["stats"].get("p95") for x in forward_items]),
-            "jitter": average([x["stats"].get("jitter") for x in forward_items]),
+            "avg": average([x["stats"].get("avg") for x in valid_forward_items]),
+            "min": average([x["stats"].get("minimum") for x in valid_forward_items]),
+            "max": average([x["stats"].get("maximum") for x in valid_forward_items]),
+            "p95": average([x["stats"].get("p95") for x in valid_forward_items]),
+            "jitter": average([x["stats"].get("jitter") for x in valid_forward_items]),
             "stddev": None, "loss": None,
-            "success": f"{sum(1 for x in forward_items if x.get('targetReached'))}/{len(forward_items)}",
+            "success": f"{len(valid_forward_items)}/{len(forward_items)}",
             "routeHops": 0, "timeoutHops": 0, "backboneTags": [],
-            "reachability": report["dedicatedLine"]["portStatus"],
+            "reachability": (
+                f"PASS｜{len(valid_forward_items)}/{len(forward_items)} 组指定地区探针到达入口"
+                if valid_forward_items
+                else "INCONCLUSIVE｜无指定地区有效探针"
+            ),
         }
         carriers.append({
             "id": carrier, "name": carrier_names[carrier],
             "route": grade_item["returnRoute"], "score": grade_item["score"],
             "stars": grade_item["stars"], "probeCount": len(probes),
-            "routeTypes": len({x["route"] for x in probes}),
+            "routeTypes": len({
+                x["class"] for x in return_items if int(x.get("rank", 0)) > 0
+            }),
             "forward": forward_flat, "forwardRoute": grade_item["forwardRoute"],
             "forwardProbes": forward_probes,
             "forwardScore": grade_item["forwardScore"],
             "returnScore": grade_item["returnScore"],
-            "bidirectional": True, "probes": probes,
+            "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
         })
     final_score = round(statistics.mean(x["score"] for x in report["grades"]))
     return {
@@ -991,10 +1089,21 @@ def main() -> int:
             show_return(item, index, return_total)
 
     grades = [grade(c, forward, returns) for c in ("CT", "CU", "CM")]
+    if SELF_TEST:
+        self_test_regressions()
+        if not all(item["bidirectionalPremium"] for item in grades):
+            raise AssertionError("离线精品双程样本未通过严格双程判定")
     banner("FINAL VERDICT / 三网双程综合判定", CYAN)
     for item in grades:
         color = CARRIER_COLOR[item["carrier"]]
-        field(CARRIER_NAME[item["carrier"]], f"去程 {item['forwardRoute']}｜回程 {item['returnRoute']}｜双程 {item['score']} 分｜{item['stars']}", color)
+        premium_text = "精品双程 PASS" if item["bidirectionalPremium"] else "精品双程未证实"
+        field(
+            CARRIER_NAME[item["carrier"]],
+            f"去程 {item['forwardRoute']}〔有效 {item['forwardValid']}〕｜"
+            f"回程 {item['returnRoute']}〔有效 {item['returnValid']}〕｜"
+            f"{premium_text}｜{item['score']} 分｜{item['stars']}",
+            color,
+        )
 
     report = {
         "version": VERSION,
