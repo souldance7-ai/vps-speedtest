@@ -23,13 +23,15 @@
 
 ---
 
-## RC4.2.7 动态回程测点池版
+## RC4.2.8 真去程闭环版
 
 适用于在 VPS 内检测中国电信、联通、移动的去程与回程质量，覆盖北京、上海、广东、安徽、江苏、浙江六省三网，并生成 CMD、HTML、JSON、公共报告及 NodeSeek 格式。
 
-RC4.2.7 将两个方向严格分开：去程仍使用 Globalping 的中国外部探针，有真实探针才纳入判断；无在线探针时显示 `INCONCLUSIVE`，不以回程反推去程。回程改为运行时取得“省份＋运营商＋固定 IP＋真实 TCP 端口＋备用 IP/端口”的动态节点资料，主节点健康检查失败才切换同省同运营商备用节点；动态池缺项或整体不可用时才使用内置静态目标。
+RC4.2.8 将多个开源工具按真实方向应用：`runTcpQuality.sh` 只是入口，核心动态节点池、`net.sh` 的 `*.ip.zstaticcdn.com`、[zhanghanyun/backtrace](https://github.com/zhanghanyun/backtrace) 与 [oneclickvirt/backtrace](https://github.com/oneclickvirt/backtrace) 均由 VPS 主动访问中国目标，所以都属于回程，不能作为中国→VPS 去程。新版保留 TcpQuality 动态回程池，并把 NetQuality 六省三网域名作为静态目标的第二级备用。
 
-回程质量用实际节点端口的 TCP connect 计算，并以 TCP traceroute、ICMP、UDP 三种路由交叉取证；CN2 GIA、AS9929、CMIN2 等等级仍只依实际跳点判断。CMD、HTML、JSON 与 NodeSeek 同步显示节点来源、实际端口、主备切换、骨干标签和中文路由注释。动态节点池设计参考公开项目 [ibsgss/TcpQuality](https://github.com/ibsgss/TcpQuality) 的 `getNodes` 数据格式；可用环境变量 `THREE_NET_RETURN_POOL` 指定兼容 TSV 节点源。
+去程新增 `cn3-forward-evidence/v1`：中国本地 Windows 客户端直接对业务 IP／端口执行 TCP connect 与 tracert，生成证据文件；VPS 端用 `--forward-evidence` 导入后，优先采用该真实去程，未覆盖的省份／运营商才由 Globalping 补测，仍无探针则保持 `INCONCLUSIVE`。证据目标 IP 或端口不一致会整份拒绝，避免把旧结果套到新 VPS。
+
+回程质量用实际节点端口的 TCP connect 计算，并以 TCP traceroute、ICMP、UDP 三种路由交叉取证。三种协议仍无骨干证据时，再使用 oneclickvirt 采用的 [spiritLHLS/icmp_targets](https://github.com/spiritLHLS/icmp_targets) 同省同运营商备用地址，每组最多尝试三个；若不同协议同时观察到精品与普通路由，保守标记为动态混合，不再只挑最好的一条。CN2 GIA、AS9929、CMIN2 等等级仍只依实际跳点判断。CMD、HTML、JSON 与 NodeSeek 同步显示节点来源、实际端口、主备切换、多协议路径、骨干标签和中文路由注释。
 
 [AntPing](https://antping.com/) 继续仅用于人工交叉复核，不调用其未公开网页接口。
 
@@ -56,7 +58,22 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.7 动态回程测点池版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+### Windows 中国本地端生成真实去程证据
+
+先把电脑切到要测试的网络（例如合肥电信、联通 CPE 或移动 CPE），在 Windows CMD 执行：
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/cn3_client_probe.ps1 -OutFile cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的业务入口IP -Ports 你的业务端口 -Carrier CT -Region 安徽 -City 合肥市 -EvidenceOut .\forward_evidence.json"
+```
+
+`CT`／`CU`／`CM` 分别表示电信／联通／移动。同一目标与端口重复执行会保留其他运营商记录，并更新当前运营商＋地区记录。随后将文件传到 VPS：
+
+```cmd
+scp .\forward_evidence.json root@你的VPS_IP:/root/forward_evidence.json
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh --target 你的业务入口IP --port 你的业务端口 --forward-evidence /root/forward_evidence.json'"
+```
+
+> 当前版本：RC4.2.8 真去程闭环版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
 
 ---
 
