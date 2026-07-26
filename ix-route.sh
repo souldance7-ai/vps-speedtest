@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.8 RC1"
+VERSION="v0.9 RC1"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,7 +14,7 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.8 RC1
+沪日专线／IX-style 四层质量检测 v0.9 RC1
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -108,7 +108,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.8 RC1")
+VERSION = os.environ.get("IX_VERSION", "v0.9 RC1")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -230,7 +230,8 @@ CARRIER_NAME_RE = {
     ),
 }
 REGION_BOUNDS = {
-    # Approximate bounding boxes used only to reject same-name cities in another province.
+    # Bounding boxes are only a last-resort hint. They overlap and must never override
+    # Globalping's state field or the explicit city→province map.
     "北京": (39.3, 41.2, 115.3, 117.7),
     "上海": (30.6, 31.9, 120.8, 122.2),
     "广东": (20.0, 25.7, 109.4, 117.4),
@@ -238,6 +239,25 @@ REGION_BOUNDS = {
     "江苏": (30.6, 35.3, 116.2, 122.0),
     "浙江": (27.0, 31.6, 118.0, 123.1),
 }
+REGION_STATE_ALIASES = {
+    "北京": {"beijing", "beijingmunicipality", "cn11", "cnbj", "bj", "北京市"},
+    "上海": {"shanghai", "shanghaimunicipality", "cn31", "cnsh", "sh", "上海市"},
+    "广东": {"guangdong", "guangdongsheng", "cn44", "cngd", "gd", "广东", "广东省"},
+    "安徽": {"anhui", "anhuisheng", "cn34", "cnah", "ah", "安徽", "安徽省"},
+    "江苏": {"jiangsu", "jiangsusheng", "cn32", "cnjs", "js", "江苏", "江苏省"},
+    "浙江": {"zhejiang", "zhejiangsheng", "cn33", "cnzj", "zj", "浙江", "浙江省"},
+}
+CROSS_REGION_ORDER = {
+    "北京": ["上海", "江苏", "浙江", "安徽", "广东"],
+    "上海": ["江苏", "浙江", "安徽", "北京", "广东"],
+    "广东": ["浙江", "上海", "江苏", "安徽", "北京"],
+    "安徽": ["江苏", "浙江", "上海", "北京", "广东"],
+    "江苏": ["上海", "浙江", "安徽", "北京", "广东"],
+    "浙江": ["上海", "江苏", "安徽", "广东", "北京"],
+}
+MAX_PROVINCE_CARRIER_ATTEMPTS = 5
+MAX_PROVINCE_REFERENCE_ATTEMPTS = 1
+MAX_CROSS_PROVINCE_ATTEMPTS = 2
 PROBE_INVENTORY: list[dict[str, Any]] | None = None
 PROBE_INVENTORY_ERROR = ""
 ICMP_TARGETS_CACHE: list[dict[str, Any]] | None = None
@@ -543,14 +563,78 @@ def normalized_city(value: str) -> str:
     return re.sub(r"[^a-z]", "", value.lower())
 
 
-def coordinates_match_region(region: str, latitude: Any, longitude: Any) -> bool:
+def normalized_place(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", str(value or "").lower())
+
+
+def city_regions(value: str) -> set[str]:
+    key = normalized_city(value)
+    if not key:
+        return set()
+    return {
+        region
+        for region, cities in CITY_CANDIDATES.items()
+        if any(normalized_city(city) == key for city in cities)
+    }
+
+
+def coordinate_regions(latitude: Any, longitude: Any) -> list[str]:
     try:
         lat = float(latitude)
         lon = float(longitude)
     except (TypeError, ValueError):
-        return True
-    south, north, west, east = REGION_BOUNDS[region]
-    return south <= lat <= north and west <= lon <= east
+        return []
+    return [
+        region
+        for region, (south, north, west, east) in REGION_BOUNDS.items()
+        if south <= lat <= north and west <= lon <= east
+    ]
+
+
+def infer_probe_region(location: dict[str, Any]) -> tuple[str, str]:
+    """Resolve a Chinese probe to one target province without overlapping boxes.
+
+    Globalping exposes `state`; use it first. An explicit city map is second.
+    Coordinates are accepted only when exactly one of our six regions matches.
+    """
+    state_key = normalized_place(location.get("state"))
+    state_matches = [
+        region
+        for region, aliases in REGION_STATE_ALIASES.items()
+        if state_key and state_key in aliases
+    ]
+    city_matches = city_regions(str(location.get("city") or ""))
+    if len(state_matches) == 1:
+        state_region = state_matches[0]
+        if city_matches and state_region not in city_matches:
+            return "", "STATE_CITY_CONFLICT"
+        return state_region, "STATE"
+    if len(city_matches) == 1:
+        return next(iter(city_matches)), "CITY_MAP"
+    coordinate_matches = coordinate_regions(
+        location.get("latitude"), location.get("longitude")
+    )
+    if len(coordinate_matches) == 1:
+        return coordinate_matches[0], "UNIQUE_COORDINATE"
+    return "", "AMBIGUOUS_OR_UNKNOWN"
+
+
+def coordinates_match_region(region: str, latitude: Any, longitude: Any) -> bool:
+    # Kept for report compatibility; strict inference is used for selection.
+    matches = coordinate_regions(latitude, longitude)
+    return len(matches) == 1 and matches[0] == region
+
+
+def probe_tags(item: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for tag in item.get("tags") or []:
+        if isinstance(tag, dict):
+            value = tag.get("value")
+        else:
+            value = tag
+        if value:
+            values.add(str(value).lower())
+    return values
 
 
 def load_probe_inventory() -> list[dict[str, Any]]:
@@ -578,7 +662,7 @@ def load_probe_inventory() -> list[dict[str, Any]]:
 
 def inventory_attempts(
     carrier: str, region: str, capital_city: str
-) -> list[tuple[dict[str, Any], str, str, bool, str]]:
+) -> list[tuple[dict[str, Any], str, str, bool, str, str]]:
     """Select every real online probe inside the province, ordered by carrier fidelity."""
     inventory = load_probe_inventory()
     if not inventory:
@@ -588,25 +672,20 @@ def inventory_attempts(
     rows: list[dict[str, Any]] = []
     for item in inventory:
         location = item.get("location") or {}
+        probe_region, province_method = infer_probe_region(location)
+        if probe_region != region:
+            continue
         actual_city = str(location.get("city") or "")
         key = normalized_city(actual_city)
         listed_city = key in city_rank
-        coordinates_known = (
-            location.get("latitude") is not None
-            and location.get("longitude") is not None
-        )
-        # Hand-written city names only control priority. They are no longer a whitelist:
-        # an unlisted city is valid when the live inventory coordinates place it in province.
-        if not coordinates_match_region(
-            region, location.get("latitude"), location.get("longitude")
-        ) or (not listed_city and not coordinates_known):
+        if not actual_city:
             continue
         try:
             asn = int(location.get("asn") or 0)
         except (TypeError, ValueError):
             asn = 0
         network = str(location.get("network") or "")
-        tags = {str(tag).lower() for tag in (item.get("tags") or [])}
+        tags = probe_tags(item)
         is_carrier = (
             asn in CARRIER_ASNS[carrier]
             or bool(CARRIER_NAME_RE[carrier].search(network))
@@ -618,12 +697,16 @@ def inventory_attempts(
             "asn": asn,
             "network": network,
             "tags": tags,
+            "province": probe_region,
+            "provinceMethod": province_method,
+            "state": str(location.get("state") or ""),
             "carrier": is_carrier,
             "eyeball": "eyeball-network" in tags,
             "datacenter": "datacenter-network" in tags,
         })
 
-    attempts: list[tuple[dict[str, Any], str, str, bool, str]] = []
+    carrier_attempts: list[tuple[dict[str, Any], str, str, bool, str, str]] = []
+    reference_attempts: list[tuple[dict[str, Any], str, str, bool, str, str]] = []
     seen: set[tuple[str, int, str]] = set()
 
     def add(row: dict[str, Any], tier: str, tag: str = "") -> None:
@@ -645,12 +728,14 @@ def inventory_attempts(
                 tag or "online",
             ]
         )
-        attempts.append((
+        target = reference_attempts if tier.endswith("_REFERENCE") else carrier_attempts
+        target.append((
             location,
             label,
             row["city"],
             row["cityRank"] == 0,
             tier,
+            row["province"],
         ))
 
     ordered = sorted(rows, key=lambda x: (x["cityRank"], x["asn"], x["network"]))
@@ -678,6 +763,111 @@ def inventory_attempts(
     for row in ordered:
         if row["datacenter"]:
             add(row, "PROVINCE_DATACENTER_REFERENCE", "datacenter-network")
+    return (
+        carrier_attempts[:MAX_PROVINCE_CARRIER_ATTEMPTS]
+        + reference_attempts[:MAX_PROVINCE_REFERENCE_ATTEMPTS]
+    )
+
+
+def cross_region_carrier_attempts(
+    carrier: str, requested_region: str
+) -> list[tuple[dict[str, Any], str, str, bool, str, str]]:
+    """Last-resort same-carrier probes outside the requested province.
+
+    These samples are always REFERENCE and never count as the requested
+    province's carrier PASS.
+    """
+    inventory = load_probe_inventory()
+    order = {
+        region: index
+        for index, region in enumerate(CROSS_REGION_ORDER[requested_region])
+    }
+    rows: list[dict[str, Any]] = []
+    for item in inventory:
+        location = item.get("location") or {}
+        probe_region, province_method = infer_probe_region(location)
+        if not probe_region or probe_region == requested_region or probe_region not in order:
+            continue
+        actual_city = str(location.get("city") or "")
+        if not actual_city:
+            continue
+        try:
+            asn = int(location.get("asn") or 0)
+        except (TypeError, ValueError):
+            asn = 0
+        network = str(location.get("network") or "")
+        if not (
+            asn in CARRIER_ASNS[carrier]
+            or bool(CARRIER_NAME_RE[carrier].search(network))
+        ):
+            continue
+        tags = probe_tags(item)
+        source_cities = CITY_CANDIDATES.get(probe_region, [])
+        city_key = normalized_city(actual_city)
+        city_rank = next(
+            (
+                index
+                for index, name in enumerate(source_cities)
+                if normalized_city(name) == city_key
+            ),
+            len(source_cities) + 1,
+        )
+        rows.append({
+            "city": actual_city,
+            "cityRank": city_rank,
+            "asn": asn,
+            "network": network,
+            "tags": tags,
+            "province": probe_region,
+            "provinceMethod": province_method,
+        })
+    rows.sort(key=lambda row: (
+        order[row["province"]],
+        0 if "eyeball-network" in row["tags"] else 1,
+        row["cityRank"],
+        row["asn"],
+    ))
+    attempts: list[tuple[dict[str, Any], str, str, bool, str, str]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        key = (normalized_city(row["city"]), row["asn"])
+        if key in seen:
+            continue
+        seen.add(key)
+        tag = (
+            "eyeball-network"
+            if "eyeball-network" in row["tags"]
+            else "datacenter-network"
+            if "datacenter-network" in row["tags"]
+            else ""
+        )
+        source_kind = (
+            "EYEBALL" if tag == "eyeball-network"
+            else "DATACENTER" if tag == "datacenter-network"
+            else "NETWORK"
+        )
+        location: dict[str, Any] = {"country": "CN", "city": row["city"]}
+        if row["asn"]:
+            location["asn"] = row["asn"]
+        elif row["network"]:
+            location["network"] = row["network"]
+        if tag:
+            location["tags"] = [tag]
+        label = "+".join([
+            row["city"],
+            f"AS{row['asn']}" if row["asn"] else row["network"],
+            tag or "online",
+        ])
+        attempts.append((
+            location,
+            label,
+            row["city"],
+            False,
+            f"CROSS_PROVINCE_CARRIER_{source_kind}",
+            row["province"],
+        ))
+        if len(attempts) >= MAX_CROSS_PROVINCE_ATTEMPTS:
+            break
     return attempts
 
 
@@ -778,17 +968,89 @@ def ping_peer(peer: str, count: int = 20) -> dict[str, Any]:
     }
 
 
+def await_globalping(measurement_id: str, polls: int = 35) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for _ in range(polls):
+        time.sleep(0.8)
+        result = http_json(f"{GLOBALPING_API}/{measurement_id}")
+        if result.get("status") == "finished":
+            return result
+        if result.get("status") != "in-progress":
+            raise RuntimeError(f"API 状态 {result.get('status')}")
+    raise TimeoutError("等待远端结果超时")
+
+
+def same_probe_tcp_check(entry: str, port: int, measurement_id: str) -> dict[str, Any]:
+    """Confirm the business TCP port from the exact traceroute probe.
+
+    Globalping officially supports reusing a previous measurement ID as the
+    location selector. This prevents a silent final traceroute hop from being
+    mislabeled as unreachable.
+    """
+    try:
+        created = http_json(
+            GLOBALPING_API,
+            "POST",
+            {
+                "target": entry,
+                "type": "ping",
+                "locations": measurement_id,
+                "measurementOptions": {
+                    "protocol": "TCP",
+                    "port": port,
+                    "packets": 3,
+                },
+            },
+        )
+        check_id = str(created.get("id") or "")
+        if not check_id:
+            raise RuntimeError("TCP 复核未返回 measurement id")
+        result = await_globalping(check_id, 25)
+        rtts: list[float] = []
+        for item in result.get("results") or []:
+            detail = item.get("result") or {}
+            if detail.get("status") != "finished":
+                continue
+            for timing in detail.get("timings") or []:
+                if timing.get("rtt") is not None:
+                    rtts.append(float(timing["rtt"]))
+        stats = summarize(rtts, 3)
+        return {
+            "status": "PASS" if rtts else "INCONCLUSIVE",
+            "latency": stats,
+            "received": len(rtts),
+            "measurementId": check_id,
+            "reason": (
+                f"同一探针 TCP 业务端口复核 {len(rtts)}/3 响应"
+                if rtts
+                else "同一探针 TCP 业务端口复核未取得响应"
+            ),
+        }
+    except Exception as exc:
+        return {
+            "status": "N/A",
+            "latency": summarize([], 3),
+            "received": 0,
+            "measurementId": "",
+            "reason": f"TCP 业务端口复核异常 {type(exc).__name__}: {exc}",
+        }
+
+
 def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str) -> dict[str, Any]:
     name, asn, _ = CARRIERS[carrier]
-    # v0.8 reads /v1/probes and scans every coordinate-verified city in the province.
-    # City names control priority only; they no longer discard valid unlisted province probes.
+    # v0.9 uses Globalping state → explicit city map → unique coordinates. Overlapping
+    # bounding boxes can no longer mislabel Xuzhou/Nanjing as Anhui.
     inventory_available = bool(load_probe_inventory())
     attempts = inventory_attempts(carrier, region, city)
     inventory_used = inventory_available
-    if not attempts and not inventory_available:
+    if inventory_available:
+        # Cross-province same-carrier probes are appended only as a clearly labeled
+        # last resort. They can never count as the requested province's PASS.
+        attempts += cross_region_carrier_attempts(carrier, region)
+    elif not attempts:
         # Inventory failure fallback: preserve the old magic path without claiming it was prechecked.
-        carrier_attempts: list[tuple[dict[str, Any], str, str, bool, str]] = []
-        reference_attempts: list[tuple[dict[str, Any], str, str, bool, str]] = []
+        carrier_attempts: list[tuple[dict[str, Any], str, str, bool, str, str]] = []
+        reference_attempts: list[tuple[dict[str, Any], str, str, bool, str, str]] = []
         for candidate_city in CITY_CANDIDATES.get(region, [city]):
             is_capital = candidate_city == city
             for selector in CARRIER_SELECTORS[carrier]:
@@ -802,6 +1064,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                         if is_capital
                         else "PROVINCE_CARRIER_EYEBALL"
                     ),
+                    region,
                 ))
             reference_attempts.append((
                 {"magic": f"{candidate_city}+datacenter"},
@@ -809,13 +1072,38 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 candidate_city,
                 is_capital,
                 "PROVINCE_DATACENTER_REFERENCE",
+                region,
             ))
-        attempts = carrier_attempts + reference_attempts
+        cross_attempts: list[tuple[dict[str, Any], str, str, bool, str, str]] = []
+        as_selector = f"AS{asn}"
+        for fallback_region in CROSS_REGION_ORDER[region][:MAX_CROSS_PROVINCE_ATTEMPTS]:
+            fallback_city = CITY_CANDIDATES[fallback_region][0]
+            cross_attempts.append((
+                {"magic": f"{fallback_city}+{as_selector}+eyeball"},
+                f"{fallback_city}+{as_selector}+eyeball",
+                fallback_city,
+                False,
+                "CROSS_PROVINCE_CARRIER_EYEBALL",
+                fallback_region,
+            ))
+        attempts = (
+            carrier_attempts
+            + reference_attempts[:MAX_PROVINCE_REFERENCE_ATTEMPTS]
+            + cross_attempts
+        )
     errors: list[str] = []
     no_probe_count = 0
     api_error_count = 0
     best_result: dict[str, Any] | None = None
-    for location, mode, requested_city, is_capital, selection_tier in attempts:
+    same_province_reference: dict[str, Any] | None = None
+    for (
+        location,
+        mode,
+        requested_city,
+        is_capital,
+        selection_tier,
+        selection_region,
+    ) in attempts:
         try:
             created = http_json(
                 GLOBALPING_API,
@@ -831,16 +1119,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             measurement_id = created.get("id")
             if not measurement_id:
                 raise RuntimeError("API 未返回 measurement id")
-            result = None
-            for _ in range(35):
-                time.sleep(0.8)
-                result = http_json(f"{GLOBALPING_API}/{measurement_id}")
-                if result.get("status") == "finished":
-                    break
-                if result.get("status") != "in-progress":
-                    raise RuntimeError(f"API 状态 {result.get('status')}")
-            if not result or result.get("status") != "finished":
-                raise TimeoutError("等待远端结果超时")
+            result = await_globalping(str(measurement_id))
             item = next(
                 (x for x in result.get("results", []) if x.get("result", {}).get("status") == "finished"),
                 None,
@@ -850,15 +1129,21 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             probe = item.get("probe") or {}
             source_asn = int(probe.get("asn") or 0)
             actual_city = str(probe.get("city") or "")
+            actual_state = str(probe.get("state") or "")
             actual_network = str(
                 probe.get("network")
                 or probe.get("networkName")
                 or probe.get("isp")
                 or ""
             )
-            province_verified = coordinates_match_region(
-                region, probe.get("latitude"), probe.get("longitude")
-            )
+            actual_probe_region, province_match_method = infer_probe_region({
+                "state": actual_state,
+                "city": actual_city,
+                "latitude": probe.get("latitude"),
+                "longitude": probe.get("longitude"),
+            })
+            selection_province_verified = actual_probe_region == selection_region
+            province_verified = actual_probe_region == region
             city_verified = re.sub(r"[^a-z]", "", actual_city.lower()) == re.sub(
                 r"[^a-z]", "", requested_city.lower()
             )
@@ -883,12 +1168,35 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                     target_rtts = rtts
                 shown = " ".join(f"{x:.1f}ms" for x in rtts) if rtts else "* * *"
                 route_lines.append(f"{index:02d} {address or '*':<16} {shown}")
+            trace_reached = reached
+            tcp_check = {
+                "status": "NOT_NEEDED",
+                "latency": summarize([], 3),
+                "received": 0,
+                "measurementId": "",
+                "reason": "TCP traceroute 已显示终点",
+            }
+            if not reached:
+                tcp_check = same_probe_tcp_check(
+                    entry, port, str(measurement_id)
+                )
+                reached = tcp_check["status"] == "PASS"
             rtts = target_rtts or last_rtts
+            if reached and not trace_reached:
+                checked_latency = tcp_check.get("latency") or {}
+                if checked_latency.get("avg") is not None:
+                    rtts = [float(checked_latency["avg"])]
             latency = summarize(rtts, len(rtts)) if rtts else summarize([], 0)
             latency["loss"] = None
-            is_reference = selection_tier.endswith("_REFERENCE")
+            is_cross_province = selection_tier.startswith("CROSS_PROVINCE_")
+            is_reference = (
+                selection_tier.endswith("_REFERENCE") or is_cross_province
+            )
             carrier_representative = bool(asn_verified and not is_reference)
             source_class = (
+                "CROSS_PROVINCE_CARRIER_REFERENCE"
+                if is_cross_province
+                else
                 "GENERIC_DATACENTER_REFERENCE"
                 if is_reference
                 else "CARRIER_DATACENTER"
@@ -898,8 +1206,10 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 else "CARRIER_NETWORK"
             )
             status = (
-                "REFERENCE" if reached and city_verified and province_verified and is_reference
-                else "PASS" if reached and city_verified and province_verified and carrier_representative
+                "REFERENCE"
+                if reached and city_verified and selection_province_verified and is_reference
+                else "PASS"
+                if reached and city_verified and province_verified and carrier_representative
                 else "INCONCLUSIVE"
             )
             reasons: list[str] = []
@@ -907,16 +1217,23 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 reasons.append(
                     f"城市核对失败：请求 {requested_city}，实际 {actual_city or '未知城市'}"
                 )
-            if not province_verified:
+            if not selection_province_verified:
                 reasons.append(
-                    f"省份坐标核对失败：实际探针不在{region}范围内"
+                    f"省份核对失败：选点期望 {selection_region}，实际 "
+                    f"{actual_probe_region or '无法确认'}（{province_match_method}）"
                 )
             if not asn_verified and not is_reference:
                 reasons.append(
                     f"运营商核对失败：预期 {name}，实际 AS{source_asn or 'N/A'}"
                     f" {actual_network or '未知网络'}"
                 )
-            if is_reference:
+            if is_cross_province:
+                reasons.append(
+                    f"{region}本省未取得{name}有效探针；最后降级到"
+                    f"{selection_region} {requested_city} 的同运营商测点；"
+                    f"仅作跨省运营商参考，不代表{region}{name}"
+                )
+            elif is_reference:
                 reasons.append(
                     f"{region}省级数据中心参考点；只证明该省到入口可达，不冒充{name}家宽"
                 )
@@ -929,8 +1246,15 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                     f"{region}省内{name}运营商网络测点；探针未标家宽／机房类型"
                 )
             if not reached:
-                reasons.append("TCP traceroute 未显示终点；不等于真实业务 100% 丢包")
-            if not is_capital:
+                reasons.append(
+                    "TCP traceroute 未显示终点；"
+                    f"{tcp_check['reason']}；不等于真实业务 100% 丢包"
+                )
+            elif not trace_reached:
+                reasons.append(
+                    f"TCP traceroute 末跳未显示，但{tcp_check['reason']}，判定业务端口可达"
+                )
+            if not is_capital and not is_cross_province:
                 reasons.append(
                     f"省会 {city} 无可用探针，已退到{region}省内 {requested_city}"
                 )
@@ -941,29 +1265,44 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 "displayRegion": region,
                 "mode": mode,
                 "probeCity": actual_city,
+                "probeState": actual_state,
+                "probeRegion": actual_probe_region,
                 "probeAsn": source_asn,
                 "probeNetwork": actual_network,
                 "capitalPreferred": is_capital,
                 "selectorCity": requested_city,
+                "selectionRegion": selection_region,
                 "selectionTier": selection_tier,
                 "sourceClass": source_class,
                 "inventoryPrechecked": inventory_used,
                 "carrierRepresentative": carrier_representative,
+                "carrierIdentityVerified": asn_verified,
                 "asnVerified": asn_verified,
                 "cityVerified": city_verified,
                 "provinceVerified": province_verified,
+                "selectionProvinceVerified": selection_province_verified,
+                "provinceMatchMethod": province_match_method,
                 "status": status,
                 "targetReached": reached,
+                "traceTargetReached": trace_reached,
+                "tcpPortCheck": tcp_check,
                 "latency": latency,
                 "route": "\n".join(route_lines),
                 "reason": "；".join(reasons),
             }
             if status == "PASS":
                 return candidate_result
-            if best_result is None or (
-                status == "REFERENCE"
-                and best_result.get("status") != "REFERENCE"
-            ):
+            if status == "REFERENCE" and not is_cross_province:
+                same_province_reference = candidate_result
+            candidate_rank = (
+                30 if status == "REFERENCE" and is_cross_province
+                else 20 if status == "REFERENCE"
+                else 10 if asn_verified and selection_province_verified
+                else 0
+            )
+            best_rank = int((best_result or {}).get("_selectionRank", -1))
+            candidate_result["_selectionRank"] = candidate_rank
+            if best_result is None or candidate_rank > best_rank:
                 best_result = candidate_result
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:1000]
@@ -981,6 +1320,21 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             api_error_count += 1
             errors.append(f"{mode}: {type(exc).__name__}: {exc}")
     if best_result is not None:
+        best_result.pop("_selectionRank", None)
+        if (
+            best_result.get("sourceClass") == "CROSS_PROVINCE_CARRIER_REFERENCE"
+            and same_province_reference is not None
+        ):
+            best_result["sameProvinceReference"] = {
+                "city": same_province_reference.get("probeCity") or "",
+                "asn": same_province_reference.get("probeAsn") or 0,
+                "network": same_province_reference.get("probeNetwork") or "",
+                "targetReached": same_province_reference.get("targetReached", False),
+            }
+            best_result["reason"] += (
+                f"；同时已确认{region}省内第三方机房 "
+                f"{same_province_reference.get('probeCity') or '未知城市'} 到入口可达"
+            )
         return best_result
     all_unavailable = no_probe_count == len(attempts) and api_error_count == 0
     return {
@@ -990,24 +1344,37 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
         "displayRegion": region,
         "mode": "NO_PROBE" if all_unavailable else "N/A",
         "probeCity": "",
+        "probeState": "",
+        "probeRegion": "",
         "probeAsn": 0,
         "probeNetwork": "",
         "capitalPreferred": True,
         "selectorCity": city,
+        "selectionRegion": region,
         "selectionTier": "NONE",
         "sourceClass": "NONE",
         "inventoryPrechecked": inventory_used,
         "carrierRepresentative": False,
+        "carrierIdentityVerified": False,
         "asnVerified": False,
         "cityVerified": False,
         "provinceVerified": False,
+        "selectionProvinceVerified": False,
+        "provinceMatchMethod": "NONE",
         "status": "NO_PROBE" if all_unavailable else "N/A",
         "targetReached": False,
+        "traceTargetReached": False,
+        "tcpPortCheck": {
+            "status": "N/A",
+            "received": 0,
+            "reason": "未取得可复核探针",
+        },
         "latency": summarize([], 0),
         "route": "",
         "reason": (
-            f"已按在线清单执行省会→全省坐标扫描→运营商网络→省内数据中心"
-            f"筛选 {len(attempts)} 组候选；{region}当前没有在线可用探针"
+            f"已按在线清单执行省会→全省行政区扫描→运营商网络→省内数据中心"
+            f"→跨省同运营商最后备援，筛选 {len(attempts)} 组候选；"
+            f"{region}当前没有在线可用探针"
             if all_unavailable
             else (
                 f"在线探针清单读取失败 {PROBE_INVENTORY_ERROR}；"
@@ -1029,10 +1396,13 @@ def self_test_probe(carrier: str, region: str, city: str, index: int) -> dict[st
         "displayRegion": region,
         "mode": f"{region}+AS{asn}",
         "probeCity": city,
+        "probeState": region,
+        "probeRegion": region,
         "probeAsn": asn,
         "probeNetwork": name,
         "capitalPreferred": index % 5 != 0,
         "selectorCity": city,
+        "selectionRegion": region,
         "selectionTier": (
             "CAPITAL_CARRIER_EYEBALL"
             if index % 5
@@ -1040,11 +1410,20 @@ def self_test_probe(carrier: str, region: str, city: str, index: int) -> dict[st
         ),
         "sourceClass": "CARRIER_EYEBALL",
         "carrierRepresentative": True,
+        "carrierIdentityVerified": True,
         "asnVerified": True,
         "cityVerified": True,
         "provinceVerified": True,
+        "selectionProvinceVerified": True,
+        "provinceMatchMethod": "SELF_TEST",
         "status": "PASS" if reached else "INCONCLUSIVE",
         "targetReached": reached,
+        "traceTargetReached": reached,
+        "tcpPortCheck": {
+            "status": "NOT_NEEDED" if reached else "INCONCLUSIVE",
+            "received": 0,
+            "reason": "SELF-TEST",
+        },
         "latency": {
             "status": "PASS", "avg": round(18.0 + index * 1.7, 1),
             "p95": round(20.0 + index * 1.7, 1), "jitter": 1.2,
@@ -1056,7 +1435,7 @@ def self_test_probe(carrier: str, region: str, city: str, index: int) -> dict[st
 
 
 def selection_self_test() -> None:
-    """Regression: an unlisted city inside province must not be discarded."""
+    """Regression: state wins; overlapping boxes can never cross-label provinces."""
     global PROBE_INVENTORY, PROBE_INVENTORY_ERROR
     saved_inventory = PROBE_INVENTORY
     saved_error = PROBE_INVENTORY_ERROR
@@ -1067,6 +1446,7 @@ def selection_self_test() -> None:
                 "location": {
                     "country": "CN",
                     "city": "Tongcheng",
+                    "state": "Anhui",
                     "latitude": 31.05,
                     "longitude": 116.95,
                     "asn": 4134,
@@ -1078,12 +1458,37 @@ def selection_self_test() -> None:
                 "location": {
                     "country": "CN",
                     "city": "Hefei",
+                    "state": "Anhui",
                     "latitude": 31.82,
                     "longitude": 117.23,
                     "asn": 37963,
                     "network": "Third-party IDC",
                 },
                 "tags": ["datacenter-network"],
+            },
+            {
+                "location": {
+                    "country": "CN",
+                    "city": "Xuzhou",
+                    "state": "Jiangsu",
+                    "latitude": 34.26,
+                    "longitude": 117.18,
+                    "asn": 4134,
+                    "network": "China Telecom",
+                },
+                "tags": ["eyeball-network"],
+            },
+            {
+                "location": {
+                    "country": "CN",
+                    "city": "Nanjing",
+                    "state": "Jiangsu",
+                    "latitude": 32.06,
+                    "longitude": 118.79,
+                    "asn": 4837,
+                    "network": "China Unicom",
+                },
+                "tags": ["eyeball-network"],
             },
         ]
         attempts = inventory_attempts("CT", "安徽", "Hefei")
@@ -1095,6 +1500,18 @@ def selection_self_test() -> None:
             raise AssertionError("同省运营商机房分类错误")
         if not any(x[4] == "PROVINCE_DATACENTER_REFERENCE" for x in attempts):
             raise AssertionError("第三方省级参考回退缺失")
+        if any(x[2] in {"Xuzhou", "Nanjing"} for x in attempts):
+            raise AssertionError("江苏城市被错误纳入安徽省内候选")
+        cross_attempts = cross_region_carrier_attempts("CT", "安徽")
+        if not any(x[2] == "Xuzhou" and x[5] == "江苏" for x in cross_attempts):
+            raise AssertionError("跨省同运营商最后备援缺失")
+        if infer_probe_region({
+            "city": "Nanjing",
+            "state": "Jiangsu",
+            "latitude": 32.06,
+            "longitude": 118.79,
+        })[0] != "江苏":
+            raise AssertionError("南京行政区判定错误")
     finally:
         PROBE_INVENTORY = saved_inventory
         PROBE_INVENTORY_ERROR = saved_error
@@ -1288,7 +1705,9 @@ def quality_label(internal: dict[str, Any]) -> str:
 
 
 def mapping_chain(access: dict[str, Any], listener: dict[str, Any], local_status: str) -> dict[str, str]:
-    reachable = access.get("reachable", access.get("pass", 0))
+    reachable = access.get(
+        "endpointReachable", access.get("reachable", access.get("pass", 0))
+    )
     if reachable > 0 and listener.get("status") == "PASS" and local_status == "PASS":
         return {
             "status": "PASS",
@@ -1330,7 +1749,8 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"- 上海入口端到端 TCP：{access['status']}（运营商精确 "
             f"{access['pass']}/{access['total']}，省级可达 "
             f"{access.get('reachable', access['pass'])}/{access['total']}，"
-            f"第三方机房参考 {access.get('reference', 0)}，"
+            f"省内第三方机房参考 {access.get('provinceReference', 0)}，"
+            f"跨省同运营商参考 {access.get('crossProvinceReference', 0)}，"
             f"INCONCLUSIVE {access['inconclusive']}，"
             f"NO_PROBE {access.get('noProbe', 0)}，N/A {access['na']}）"
         ),
@@ -1352,18 +1772,18 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 中国侧入口探针",
         "",
-        "| 省级任务 | 运营商 | 实际城市 | 来源类型 | 选点层级 | 运营商代表性 | 终点 | RTT | 状态 |",
-        "|---|---|---|---|---|---:|---:|---:|---|",
+        "| 省级任务 | 运营商 | 实际省／城市 | 来源类型 | 选点层级 | 代表性 | 终点 | RTT | 状态 |",
+        "|---|---|---|---|---|---|---:|---:|---|",
     ]
     for item in report["probes"]:
         latency = item.get("latency") or {}
         rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
         lines.append(
             f"| {item['requestedRegion']} | {item['carrierName']} | "
-            f"{item.get('probeCity') or 'N/A'} | "
+            f"{item.get('probeRegion') or 'N/A'}／{item.get('probeCity') or 'N/A'} | "
             f"{item.get('sourceClass') or 'N/A'} | "
             f"{item.get('selectionTier') or 'N/A'} | "
-            f"{'是' if item.get('carrierRepresentative') else '否，仅省级参考'} | "
+            f"{'本省运营商有效' if item.get('carrierRepresentative') else '跨省同运营商参考' if item.get('sourceClass') == 'CROSS_PROVINCE_CARRIER_REFERENCE' else '省内第三方参考'} | "
             f"{'到达' if item.get('targetReached') else '未确认'} | {rtt} | {item['status']} |"
         )
     lines.extend([
@@ -1424,7 +1844,7 @@ table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(-
 <section class="panel"><h2>TOPOLOGY / 实际业务拓扑</h2><div class="topology" id="topology"></div></section>
 <div class="grid" id="cards"></div>
 <section class="panel"><h2>MIERU / 日本端服务证据</h2><table id="mieru"></table></section>
-<section class="panel"><h2>FORWARD / 省级任务三网去程</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际城市</th><th>来源类型</th><th>选点层级</th><th>实际网络／ASN</th><th>代表性</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">省会无探针时会扫描省内全部在线城市；运营商机房／未分类运营商网络可作为该运营商去程证据，但会明确标注非家宽。REFERENCE 仍只是第三方省级机房连通参考，不冒充三网。NO_PROBE 不代表线路中断或 100% 丢包。</p></section>
+<section class="panel"><h2>FORWARD / 省级任务三网去程</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际省／城市</th><th>来源类型</th><th>选点层级</th><th>实际网络／ASN</th><th>代表性</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">省会无探针时先扫描同省全部在线城市；同省运营商机房／未分类运营商网络可作为运营商去程证据并明确标注非家宽。全省仍无指定运营商时，才使用跨省同运营商测点，并固定标为 CROSS_PROVINCE_REFERENCE，不计入原省 PASS 或省级可达率。NO_PROBE 不代表线路中断或 100% 丢包。</p></section>
 <section class="panel"><h2>RETURN / 日本出口至北上广固定三网回程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>目标</th><th>跳点</th><th>RTT</th><th>路由标签</th><th>骨干证据</th><th>状态</th></tr></thead><tbody id="returnRows"></tbody></table></div></section>
 <section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
 </main><script>
@@ -1439,13 +1859,13 @@ document.getElementById('topology').innerHTML=[
 `<div class="node">日本 Mita<br><code>${{E(R.localPrivate.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
 `<div class="node">日本出口<br><code>${{E(R.exitIdentity.ipMasked)}}</code></div>`].join('');
 document.getElementById('cards').innerHTML=[
-badge('上海入口接入',{{status:R.access.status,reason:`运营商精确 ${{R.access.pass}}/${{R.access.total}} · 省级可达 ${{R.access.reachable??R.access.pass}}/${{R.access.total}}`}}),
+badge('上海入口接入',{{status:R.access.status,reason:`运营商精确 ${{R.access.pass}}/${{R.access.total}} · 省级可达 ${{R.access.reachable??R.access.pass}}/${{R.access.total}} · 跨省运营商参考 ${{R.access.crossProvinceReference??0}}`}}),
 badge('上海→日本映射链',R.mappingChain),badge('Mieru 真实握手',R.protocolHandshake),badge('日本出口一致性',R.exitMatch)].join('');
 const M=R.mieruService;
 document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="${{E(M.status)}}">${{E(M.status)}}</td><th>版本</th><td>${{E(M.version)}}</td></tr>
 <tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
 <tr><th>NTP</th><td>${{E(M.ntp)}}</td><th>端口监听</th><td class="${{E(R.listener.status)}}">${{E(R.listener.status)}} · ${{E(R.listener.evidence)}}</td></tr>`;
-document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.displayRegion||p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeCity||'N/A')}}${{p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{E(p.sourceClass||'N/A')}}</td><td>${{E(p.selectionTier||'N/A')}}</td><td>${{E(p.probeNetwork||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td>${{p.carrierRepresentative?'三网有效':'仅省级参考'}}</td><td>${{p.targetReached?'到达':'未确认'}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
+document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.displayRegion||p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}${{p.sourceClass==='CROSS_PROVINCE_CARRIER_REFERENCE'?'<br><small>跨省最后备援</small>':p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{E(p.sourceClass||'N/A')}}</td><td>${{E(p.selectionTier||'N/A')}}</td><td>${{E(p.probeNetwork||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td>${{p.carrierRepresentative?'本省运营商有效':p.sourceClass==='CROSS_PROVINCE_CARRIER_REFERENCE'?'跨省同运营商参考':'省内第三方参考'}}</td><td>${{p.targetReached?'到达':'未确认'}}${{p.traceTargetReached===false&&p.targetReached?'<br><small>同探针 TCP 复核</small>':''}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
 document.getElementById('returnRows').innerHTML=R.returns.map(p=>`<tr><td>${{E(p.capital)}}</td><td>${{E(p.carrierName)}}</td><td><code>${{E(p.host)}}</code><br><small>${{p.primaryHost&&p.host!==p.primaryHost?'省级动态备援':'固定主测点'}}</small></td><td>${{p.routeHops?E(p.routeHops):'N/A'}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td>${{E(p.routeClass)}}</td><td>${{E((p.backboneTags||[]).join(' → '))}}<br><small>${{E(p.routeNote)}}</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td></tr>`).join('');
 document.getElementById('method').textContent=R.methodology;
 document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='ix-route-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
@@ -1471,12 +1891,16 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "verified": bool(
                     item.get("carrierRepresentative")
                     and item.get("cityVerified")
+                    and item.get("provinceVerified")
                     and item.get("targetReached")
                 ),
                 "route": "Mieru TCP 上海入口接入",
                 "evidence": (
-                    f"实际城市 {item.get('probeCity') or 'N/A'}；"
+                    f"实际省市 {item.get('probeRegion') or 'N/A'}／"
+                    f"{item.get('probeCity') or 'N/A'}；"
+                    f"行政区核对 {item.get('provinceMatchMethod') or 'N/A'}；"
                     f"选点 {item.get('selectionTier') or 'N/A'}；"
+                    f"TCP路由终点 {'到达' if item.get('traceTargetReached') else '未显示'}；"
                     f"{item.get('reason') or 'TCP traceroute 终点到达'}"
                 ),
                 "score": 100 if item["status"] == "PASS" else 0,
@@ -1484,16 +1908,28 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "avg": latency.get("avg"), "min": None, "max": None,
                 "p95": latency.get("p95"), "jitter": latency.get("jitter"),
                 "stddev": None, "loss": None,
-                "success": "1/1" if item["status"] == "PASS" else "0/1",
+                "success": "1/1" if item.get("targetReached") else "0/1",
                 "routeHops": len(item.get("route", "").splitlines()),
-                "timeoutHops": 0, "backboneTags": ["Mieru TCP", "上海映射入口"],
+                "timeoutHops": 0,
+                "backboneTags": (
+                    ["Mieru TCP", "上海映射入口"]
+                    + (
+                        ["同探针 TCP 业务端口复核"]
+                        if item.get("targetReached")
+                        and not item.get("traceTargetReached")
+                        else []
+                    )
+                ),
                 "reachability": item["status"],
             })
         summary = {
             "region": "入口接入汇总", "label": "中国三网 → 上海 Mieru 入口",
             "access": report["matrix"], "publicIp": "",
             "verified": all(
-                x.get("asnVerified") and x.get("cityVerified") for x in items
+                x.get("carrierRepresentative")
+                and x.get("cityVerified")
+                and x.get("provinceVerified")
+                for x in items
             ) if items else False,
             "route": "Mieru TCP 上海入口接入",
             "evidence": f"PASS {len(passed)}/{len(items)}；仅为入口接入，不作为普通回程",
@@ -1743,10 +2179,21 @@ def main() -> int:
         "pass": sum(x["status"] == "PASS" for x in probes),
         "inconclusive": sum(x["status"] == "INCONCLUSIVE" for x in probes),
         "reference": sum(x["status"] == "REFERENCE" for x in probes),
+        "provinceReference": sum(
+            x["status"] == "REFERENCE"
+            and x.get("sourceClass") != "CROSS_PROVINCE_CARRIER_REFERENCE"
+            for x in probes
+        ),
+        "crossProvinceReference": sum(
+            x["status"] == "REFERENCE"
+            and x.get("sourceClass") == "CROSS_PROVINCE_CARRIER_REFERENCE"
+            for x in probes
+        ),
         "na": sum(x["status"] == "N/A" for x in probes),
         "noProbe": sum(x["status"] == "NO_PROBE" for x in probes),
     }
-    access["reachable"] = access["pass"] + access["reference"]
+    access["endpointReachable"] = access["pass"] + access["reference"]
+    access["reachable"] = access["pass"] + access["provinceReference"]
     access["coverage"] = round(access["pass"] * 100 / total, 1) if total else 0.0
     access["provinceCoverage"] = (
         round(access["reachable"] * 100 / total, 1) if total else 0.0
@@ -1830,9 +2277,14 @@ def main() -> int:
             "MTR／traceroute 增测专线纯内段。"
             "去程先读取 Globalping 在线探针清单，再按省会运营商家宽、省内任意城市运营商家宽、"
             "省内运营商数据中心、省内运营商未分类网络、省内其他数据中心五级筛选；"
-            "手写城市名只控制优先级，所有坐标核对落在省内的在线城市均可参选。"
+            "行政区核对严格按 Globalping state、省市映射、唯一坐标范围依次判定；"
+            "重叠经纬度矩形不得把徐州／南京等江苏城市误标为安徽。"
             "运营商数据中心／未分类网络必须通过 ASN 或网络名称核对，并明确标注非家宽；"
-            "第三方省内数据中心只标 REFERENCE，不冒充三网。Globalping magic 请求的 limit 位于请求最外层；"
+            "第三方省内数据中心只标 REFERENCE，不冒充三网。全省没有指定运营商探针时，"
+            "才按相邻优先顺序改用其他省份的同运营商探针，固定标为 CROSS_PROVINCE_REFERENCE，"
+            "不计入原省 PASS 或省级可达率。TCP traceroute 末跳沉默时，使用原 measurement ID "
+            "锁定同一探针，对业务端口追加三次 TCP ping；端口有响应可确认去程可达，"
+            "同时保留“完整末跳未显示”的事实。Globalping magic 请求的 limit 位于请求最外层；"
             "测量使用严格 country+city+ASN+tag 参数；只有确认所有合法候选均无在线探针才记 NO_PROBE，"
             "结构化 no_probes_found 与其他 API 422 分开处理。"
             "回程参考 oneclickvirt/backtrace 的备援策略：每省每运营商保留固定主测点，"
@@ -1867,7 +2319,8 @@ def main() -> int:
         (
             f"{access['status']}｜运营商精确 {access['pass']}/{access['total']} "
             f"({access['coverage']}%)｜省级可达 {access['reachable']}/{access['total']} "
-            f"({access['provinceCoverage']}%)｜第三方参考 {access['reference']}｜"
+            f"({access['provinceCoverage']}%)｜省内第三方参考 {access['provinceReference']}｜"
+            f"跨省同运营商参考 {access['crossProvinceReference']}｜"
             f"NO_PROBE {access['noProbe']}"
         ),
         GREEN if access["status"] == "PASS" else YELLOW,
