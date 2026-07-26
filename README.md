@@ -23,11 +23,11 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 ---
 
-## RC4.2.2 六地区三网双程质量检测
+## RC4.2.3 六地区三网双程质量检测
 
 适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京、上海、广东、安徽、江苏、浙江六地区，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
 
-RC4.2.2 修复六地区回程探针：改用明确的运营商目标 IP；DNS 失败、目标解析失败或 traceroute 无有效跳点时标记为 `INCONCLUSIVE` 并排除评分，不再误报为 100% 丢包或普通国际 BGP。
+RC4.2.3 继续修正电信、联通去回程判定：指定省市探针不可用时，同 ASN 全国备用结果只作参考，不再冒充该省有效样本；没有运营商骨干证据、或回程只见单个目的网交付跳点时标记为 `INCONCLUSIVE` 并排除评分；公开报告的“双程精品”改为依据有效去回程样本计算，不再固定显示为成立。
 
 ### VPS / Linux 一键执行（推荐）
 
@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.2 六地区回程修正版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.3 六地区去回程核验版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
 
 ---
 
