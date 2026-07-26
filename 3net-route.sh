@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.1 SIX-REGION FULL"
+VERSION="v0.9 RC4.2.2 SIX-REGION FULL"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.1 六地区完整版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.2 六地区完整版
 
 用法：
   bash 中国三网VPS双程质量检测_v0.9_RC4.2_六地区完整版.sh
@@ -97,7 +97,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.1 SIX-REGION FULL")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.2 SIX-REGION FULL")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
@@ -117,30 +117,33 @@ MAGENTA = "\033[95m"
 CARRIER_COLOR = {"CT": CYAN, "CU": RED, "CM": GREEN}
 CARRIER_NAME = {"CT": "中国电信", "CU": "中国联通", "CM": "中国移动"}
 
+# 回程目标使用公开、明确的运营商 IP，避免第三方测试域名失效时把 DNS
+# 故障误报成线路质量问题。北京／上海／广东沿用成熟目标；安徽／江苏／浙江
+# 使用各省运营商 DNS 或公开路由测试目标。
 PROBES = {
     "CT": [
-        ("北京", "v4-bj-ct.oojj.de"),
-        ("上海", "v4-sh-ct.oojj.de"),
-        ("广东", "v4-gd-ct.oojj.de"),
-        ("安徽", "v4-ah-ct.oojj.de"),
-        ("江苏", "v4-js-ct.oojj.de"),
-        ("浙江", "v4-zj-ct.oojj.de"),
+        ("北京", "219.141.136.10"),
+        ("上海", "202.96.209.133"),
+        ("广东", "202.96.128.86"),
+        ("安徽", "61.132.163.68"),
+        ("江苏", "218.2.2.2"),
+        ("浙江", "202.101.172.35"),
     ],
     "CU": [
-        ("北京", "v4-bj-cu.oojj.de"),
-        ("上海", "v4-sh-cu.oojj.de"),
-        ("广东", "v4-gd-cu.oojj.de"),
-        ("安徽", "v4-ah-cu.oojj.de"),
-        ("江苏", "v4-js-cu.oojj.de"),
-        ("浙江", "v4-zj-cu.oojj.de"),
+        ("北京", "202.106.50.1"),
+        ("上海", "210.22.70.3"),
+        ("广东", "210.21.196.6"),
+        ("安徽", "218.104.78.2"),
+        ("江苏", "58.240.53.78"),
+        ("浙江", "221.12.1.227"),
     ],
     "CM": [
-        ("北京", "v4-bj-cm.oojj.de"),
-        ("上海", "v4-sh-cm.oojj.de"),
-        ("广东", "v4-gd-cm.oojj.de"),
-        ("安徽", "v4-ah-cm.oojj.de"),
-        ("江苏", "v4-js-cm.oojj.de"),
-        ("浙江", "v4-zj-cm.oojj.de"),
+        ("北京", "221.179.155.161"),
+        ("上海", "211.136.112.200"),
+        ("广东", "211.139.129.222"),
+        ("安徽", "211.138.180.2"),
+        ("江苏", "221.131.143.69"),
+        ("浙江", "112.13.113.199"),
     ],
 }
 FORWARD_REGIONS = [
@@ -432,6 +435,23 @@ def resolve_ipv4(host: str) -> str:
         return ""
 
 
+def route_hop_count(route: str) -> int:
+    """Count responding traceroute hop lines, excluding the command header."""
+    return sum(
+        1 for line in route.splitlines()
+        if re.search(r"^\s*\d+\s+(?:\d{1,3}\.){3}\d{1,3}(?:\s|$)", line)
+    )
+
+
+def traceroute_rtts(route: str) -> list[float]:
+    values: list[float] = []
+    for line in route.splitlines():
+        if not re.search(r"^\s*\d+\s+", line):
+            continue
+        values.extend(float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*ms", line))
+    return values
+
+
 def tcp_samples(host: str, port: int = 80, count: int = 5, timeout: float = 4.0) -> list[float]:
     values: list[float] = []
     for _ in range(count):
@@ -561,19 +581,47 @@ def globalping_trace(target: str, port: int, carrier: str,
 
 def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
     ip = resolve_ipv4(host)
+    if not ip:
+        result_stats = stats([], 0, loss_valid=False, metric="回程探针不可用（DNS／目标解析失败）")
+        return {
+            "carrier": carrier, "city": city, "host": host, "probeIp": "",
+            "route": "", "routeHops": 0,
+            "class": "回程探针不可用", "rank": 0,
+            "evidence": "目标无法解析；本组不参与线路类型与综合分数判定",
+            "reachability": "INCONCLUSIVE｜DNS／目标解析失败",
+            "stats": asdict(result_stats), "score": 0, "stars": "☆☆☆☆☆",
+        }
+
     if shutil.which("traceroute"):
-        route = run(["traceroute", "-n", "-T", "-p", "80", "-q", "1", "-w", "1", "-m", "25", host], 35)
+        route = run(["traceroute", "-n", "-T", "-p", "80", "-q", "1", "-w", "1", "-m", "25", ip], 35)
     elif shutil.which("tracepath"):
-        route = run(["tracepath", "-n", "-m", "25", host], 35)
+        route = run(["tracepath", "-n", "-m", "25", ip], 35)
     else:
         route = "TRACEROUTE_UNAVAILABLE"
+
+    hop_count = route_hop_count(route)
+    if hop_count == 0:
+        result_stats = stats([], 0, loss_valid=False, metric="回程 traceroute 无有效跳点")
+        return {
+            "carrier": carrier, "city": city, "host": host, "probeIp": ip,
+            "route": route, "routeHops": 0,
+            "class": "回程探针无有效路由", "rank": 0,
+            "evidence": "traceroute 未取得任何有效回覆跳点；不等同 100% 业务丢包，本组不参与评分",
+            "reachability": "INCONCLUSIVE｜无有效 traceroute 跳点",
+            "stats": asdict(result_stats), "score": 0, "stars": "☆☆☆☆☆",
+        }
+
+    rtts = traceroute_rtts(route)
     route = enrich_route(route)
     route_class, rank, evidence = classify(carrier, route, "Return")
-    result_stats = stats(tcp_samples(host), 5, metric="TCP connect")
+    sample = rtts[-3:]
+    result_stats = stats(sample, len(sample), loss_valid=False, metric="TCP traceroute RTT（不作为业务丢包）")
     value = score(rank, result_stats)
     return {
-        "carrier": carrier, "city": city, "host": host, "probeIp": ip, "route": route,
+        "carrier": carrier, "city": city, "host": host, "probeIp": ip,
+        "route": route, "routeHops": hop_count,
         "class": route_class, "rank": rank, "evidence": evidence,
+        "reachability": f"PASS｜取得 {hop_count} 个有效回程跳点",
         "stats": asdict(result_stats), "score": value, "stars": stars(value),
     }
 
@@ -614,7 +662,9 @@ def self_test_return(carrier: str, city: str, host: str) -> dict[str, Any]:
     value = score(rank, result_stats)
     return {
         "carrier": carrier, "city": city, "host": host, "probeIp": "SELF-TEST",
-        "route": routes[carrier], "class": route_class, "rank": rank, "evidence": evidence,
+        "route": routes[carrier], "routeHops": 3,
+        "class": route_class, "rank": rank, "evidence": evidence,
+        "reachability": "PASS｜离线样本取得有效回程跳点",
         "stats": asdict(result_stats), "score": value, "stars": stars(value),
     }
 
@@ -665,9 +715,10 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
 
 
 def representative_route(items: list[dict[str, Any]], direction: str) -> str:
-    if not items:
-        return f"{direction}未测"
-    unique = sorted({str(x["class"]) for x in items})
+    valid_items = [x for x in items if int(x.get("rank", 0)) > 0]
+    if not valid_items:
+        return f"{direction}探针不可用（不参与判定）"
+    unique = sorted({str(x["class"]) for x in valid_items})
     if len(unique) == 1:
         return unique[0]
     return f"六地区混合（{len(unique)} 类）"
@@ -676,18 +727,26 @@ def representative_route(items: list[dict[str, Any]], direction: str) -> str:
 def grade(carrier: str, forwards: list[dict[str, Any]],
           returns: list[dict[str, Any]]) -> dict[str, Any]:
     forward_items = [x for x in forwards if x["carrier"] == carrier]
-    items = [x for x in returns if x["carrier"] == carrier]
-    forward_score = (
-        round(statistics.mean(x["score"] for x in forward_items))
-        if forward_items else 0
-    )
-    return_score = round(statistics.mean(x["score"] for x in items)) if items else 0
-    overall = round(forward_score * 0.4 + return_score * 0.6)
+    return_items = [x for x in returns if x["carrier"] == carrier]
+    valid_forwards = [x for x in forward_items if int(x.get("rank", 0)) > 0]
+    valid_returns = [x for x in return_items if int(x.get("rank", 0)) > 0]
+    forward_score = round(statistics.mean(x["score"] for x in valid_forwards)) if valid_forwards else 0
+    return_score = round(statistics.mean(x["score"] for x in valid_returns)) if valid_returns else 0
+    if valid_forwards and valid_returns:
+        overall = round(forward_score * 0.4 + return_score * 0.6)
+    elif valid_returns:
+        overall = return_score
+    elif valid_forwards:
+        overall = forward_score
+    else:
+        overall = 0
     return {
         "carrier": carrier,
         "forwardRoute": representative_route(forward_items, "去程"),
-        "returnRoute": representative_route(items, "回程"),
+        "returnRoute": representative_route(return_items, "回程"),
         "forwardScore": forward_score, "returnScore": return_score,
+        "forwardValid": f"{len(valid_forwards)}/{len(forward_items)}",
+        "returnValid": f"{len(valid_returns)}/{len(return_items)}",
         "score": overall, "stars": stars(overall),
     }
 
@@ -710,7 +769,13 @@ def show_forward(item: dict[str, Any], index: int, total: int) -> None:
 def show_return(item: dict[str, Any], index: int, total: int) -> None:
     carrier = item["carrier"]
     color = CARRIER_COLOR[carrier]
-    field(f"[{index}/{total}] {carrier} {item['city']}", f"{item['class']}｜{format_stats(item['stats'])}｜{item['score']} 分", color)
+    valid = int(item.get("rank", 0)) > 0
+    status = item.get("reachability", "INCONCLUSIVE")
+    field(
+        f"[{index}/{total}] {carrier} {item['city']}",
+        f"{item['class']}｜{format_stats(item['stats'])}｜{item['score']} 分｜{status}",
+        color if valid else YELLOW,
+    )
 
 
 def write_report(report: dict[str, Any]) -> tuple[Path, Path]:
@@ -800,7 +865,9 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "avg": s.get("avg"), "min": s.get("minimum"), "max": s.get("maximum"),
                 "p95": s.get("p95"), "jitter": s.get("jitter"), "stddev": None,
                 "loss": s.get("loss"), "success": f"{s.get('success', 0)}/{s.get('expected', 0)}",
-                "routeHops": 0, "timeoutHops": 0, "backboneTags": [],
+                "routeHops": item.get("routeHops", 0),
+                "timeoutHops": 0, "backboneTags": [],
+                "reachability": item.get("reachability", "INCONCLUSIVE"),
             })
         forward_flat = {
             "region": "六地区汇总", "label": "六地区远端实测 → VPS",
@@ -913,7 +980,7 @@ def main() -> int:
     return_total = sum(len(items) for items in PROBES.values())
     banner("RETURN PROBE / 出口 VPS 原生三网十八组回程", CYAN)
     field("执行位置", mask_ip(exit_ip), GREEN)
-    field("执行方式", "traceroute TCP/80＋五次 TCP connect；本机直接执行", GRAY)
+    field("执行方式", "traceroute TCP/80；仅有效路由跳点参与判定，目标端口不响应不计业务丢包", GRAY)
     returns: list[dict[str, Any]] = []
     index = 0
     for carrier in ("CT", "CU", "CM"):
@@ -936,7 +1003,7 @@ def main() -> int:
         "selfTest": SELF_TEST,
         "target": {"host": mask_ip(target), "port": port, "role": "国内入口"},
         "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "出口 VPS 本机"},
-        "methodology": "Globalping 在北京／上海／广东／安徽／江苏／浙江调用中国电信 AS4134／联通 AS4837／移动 AS9808 远端探针，对国内入口协议业务端口执行十八组 TCP traceroute；无法取得地区探针时明确降级为同 ASN 中国探针，不把降级样本伪装成指定地区。出口 VPS 本机对相同六地区三网十八组目标执行原生 traceroute 与五次 TCP connect；traceroute 跳点不回应不计算为业务丢包，Cymru DNS 补查可见 IP Origin ASN。NAT／端口映射隐藏的入口至出口专线内段单列为不可见，不强判线路等级。",
+        "methodology": "Globalping 在北京／上海／广东／安徽／江苏／浙江调用中国电信 AS4134／联通 AS4837／移动 AS9808 远端探针，对国内入口协议业务端口执行十八组 TCP traceroute；无法取得地区探针时明确降级为同 ASN 中国探针，不把降级样本伪装成指定地区。出口 VPS 本机对相同六地区三网十八组明确运营商 IP 执行原生 traceroute；DNS 失败或无有效跳点标记为 INCONCLUSIVE 并排除评分，不伪报 100% 业务丢包，Cymru DNS 补查可见 IP Origin ASN。NAT／端口映射隐藏的入口至出口专线内段单列为不可见，不强判线路等级。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
