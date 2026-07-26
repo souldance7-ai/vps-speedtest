@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.1 RC1"
+VERSION="v0.2 RC2"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -12,7 +12,7 @@ SELF_TEST=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 三层质量检测 v0.1 RC1
+沪日专线／IX-style 三层质量检测 v0.2 RC2
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -22,11 +22,11 @@ usage() {
   bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/ix-route.sh)
 
 非交互示例：
-  bash ix-route.sh --entry 211.136.162.184 --port 10101 \
-    --expected-exit 114.111.176.37 --local-private 172.16.2.101
+  bash ix-route.sh --entry 211.136.162.184 --port 10103 \
+    --expected-exit 87.86.87.231 --local-private 172.16.2.101
 
 完整六地区三网：
-  bash ix-route.sh --entry 211.136.162.184 --port 10101 --full
+  bash ix-route.sh --entry 211.136.162.184 --port 10103 --full
 
 可选参数：
   --entry IP             上海／中国侧公网入口
@@ -40,7 +40,8 @@ usage() {
 
 判定边界：
   入口 TCP traceroute 到达，只证明入口端口经映射后的 TCP 路径可达。
-  只有提供上海内网对端 IP，才会测量专线纯内段 RTT／抖动／丢包。
+  不要求供应商未交付的上海内网对端 IP；入口可达、本机监听、私网地址与路由会形成映射链证据。
+  只有确实知道上海内网对端 IP 时，才额外测量专线纯内段 RTT／抖动／丢包。
   没有协议凭据时不会伪装成 AnyTLS／Trojan／Mieru 真实握手成功。
   DNS、探针或权限失败一律显示 N/A，不会换算成 100% LOSS。
 EOF
@@ -93,7 +94,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.1 RC1")
+VERSION = os.environ.get("IX_VERSION", "v0.2 RC2")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -177,14 +178,14 @@ def mask_ip(value: str) -> str:
 def ask_inputs() -> tuple[str, int, str, str, str]:
     global ENTRY_IP, PORT_TEXT, EXPECTED_EXIT, LOCAL_PRIVATE, REMOTE_PEER
     if SELF_TEST:
-        return "211.136.162.184", 10101, "114.111.176.37", "172.16.2.101", ""
+        return "211.136.162.184", 10103, "87.86.87.231", "172.16.2.101", ""
 
     section("INPUT GUIDE / 沪日专线目标输入", MAGENTA)
-    field("架构示例", "中国用户 → 211.136.162.184:10101 → 隐藏专线 → 172.16.2.101 → 日本公网")
+    field("本线架构", "中国用户 → 211.136.162.184:10103 → 隐藏专线 → 172.16.2.101 → 87.86.87.231")
     field("入口 IP 示例", "211.136.162.184", CYAN)
-    field("协议端口示例", "10101 AnyTLS／10102 Trojan", GREEN)
+    field("协议端口示例", "10103 Mieru TCP（10100 是 SSH 管理端口）", GREEN)
     field("重要提醒", "填写业务端口；不要填 SSH 22，也不要把管理端口 10100 当业务端口", YELLOW)
-    field("日本出口示例", "114.111.176.37", GREEN)
+    field("日本出口示例", "87.86.87.231（114.111.176.37 是供应商外部／NAT 地址）", GREEN)
     field("日本内网示例", "172.16.2.101；上海内网对端未知可直接回车", CYAN)
 
     while not valid_ipv4(ENTRY_IP, public=True):
@@ -193,7 +194,7 @@ def ask_inputs() -> tuple[str, int, str, str, str]:
             print(RED + "  IPv4 无效，请重新输入。" + RESET)
     while True:
         if not PORT_TEXT:
-            PORT_TEXT = input("请输入协议业务端口〔例 10101；不是 SSH 22／10100〕：").strip()
+            PORT_TEXT = input("请输入协议业务端口〔本线 10103；不是 SSH 22／10100〕：").strip()
         try:
             port = int(PORT_TEXT)
             if 1 <= port <= 65535:
@@ -203,7 +204,7 @@ def ask_inputs() -> tuple[str, int, str, str, str]:
         print(RED + "  端口无效，请输入 1～65535。" + RESET)
         PORT_TEXT = ""
     if not EXPECTED_EXIT:
-        EXPECTED_EXIT = input("请输入预期日本公网出口 IP〔例 114.111.176.37；未知可回车〕：").strip()
+        EXPECTED_EXIT = input("请输入预期日本公网出口 IP〔本线 87.86.87.231；未知可回车〕：").strip()
     if EXPECTED_EXIT and not valid_ipv4(EXPECTED_EXIT, public=True):
         print(YELLOW + "  预期出口格式无效，本项按 N/A 处理。" + RESET)
         EXPECTED_EXIT = ""
@@ -212,8 +213,6 @@ def ask_inputs() -> tuple[str, int, str, str, str]:
     if LOCAL_PRIVATE and not valid_ipv4(LOCAL_PRIVATE):
         print(YELLOW + "  日本端内网 IP 格式无效，本项按 N/A 处理。" + RESET)
         LOCAL_PRIVATE = ""
-    if not REMOTE_PEER:
-        REMOTE_PEER = input("请输入上海端专线内网对端 IP〔未知可直接回车〕：").strip()
     if REMOTE_PEER and not valid_ipv4(REMOTE_PEER):
         print(YELLOW + "  上海内网对端格式无效，纯内段测试按 N/A 处理。" + RESET)
         REMOTE_PEER = ""
@@ -232,6 +231,7 @@ def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int =
 
 
 def public_identity() -> dict[str, str]:
+    identity = {"ip": "", "asn": "", "org": "", "country": "", "city": ""}
     for url in ("https://ipwho.is/", "https://api.ipify.org?format=json"):
         try:
             data = http_json(url, timeout=10)
@@ -239,16 +239,53 @@ def public_identity() -> dict[str, str]:
             if not valid_ipv4(ip, public=True):
                 continue
             connection = data.get("connection") or {}
-            return {
+            identity.update({
                 "ip": ip,
-                "asn": str(connection.get("asn") or ""),
-                "org": str(connection.get("org") or connection.get("isp") or ""),
+                "asn": str(connection.get("asn") or data.get("asn") or ""),
+                "org": str(connection.get("org") or connection.get("isp") or data.get("isp") or ""),
                 "country": str(data.get("country") or ""),
                 "city": str(data.get("city") or ""),
-            }
+            })
+            if identity["asn"] and identity["org"]:
+                return identity
+            break
         except Exception:
             pass
-    return {"ip": "", "asn": "", "org": "", "country": "", "city": ""}
+    if not identity["ip"]:
+        return identity
+    lookup_urls = (
+        f"https://ipwho.is/{identity['ip']}",
+        f"https://api.ip.sb/geoip/{identity['ip']}",
+        f"https://ipapi.co/{identity['ip']}/json/",
+    )
+    for url in lookup_urls:
+        try:
+            data = http_json(url, timeout=10)
+            connection = data.get("connection") or {}
+            raw_asn = (
+                connection.get("asn") or data.get("asn") or data.get("asn_number")
+                or data.get("autonomous_system_number") or ""
+            )
+            raw_org = (
+                connection.get("org") or connection.get("isp") or data.get("isp")
+                or data.get("organization") or data.get("org")
+                or data.get("autonomous_system_organization") or ""
+            )
+            if raw_asn and not identity["asn"]:
+                identity["asn"] = str(raw_asn)
+            if raw_org and not identity["org"]:
+                identity["org"] = str(raw_org)
+            identity["country"] = identity["country"] or str(
+                data.get("country") or data.get("country_name") or ""
+            )
+            identity["city"] = identity["city"] or str(data.get("city") or "")
+            if identity["asn"] and identity["org"]:
+                break
+        except Exception:
+            pass
+    if identity["asn"] and not identity["asn"].upper().startswith("AS"):
+        identity["asn"] = "AS" + re.sub(r"\D", "", identity["asn"])
+    return identity
 
 
 def run(command: list[str], timeout: int = 30) -> str:
@@ -262,6 +299,17 @@ def run(command: list[str], timeout: int = 30) -> str:
 def local_addresses() -> list[str]:
     output = run(["ip", "-4", "-o", "addr", "show"], 5) if shutil.which("ip") else ""
     return re.findall(r"\binet\s+((?:\d{1,3}\.){3}\d{1,3})/", output)
+
+
+def network_context(entry: str) -> dict[str, str]:
+    if not shutil.which("ip"):
+        return {"defaultRoute": "N/A｜系统无 ip", "entryRoute": "N/A｜系统无 ip"}
+    default_route = run(["ip", "-4", "route", "show", "default"], 5)
+    entry_route = run(["ip", "-4", "route", "get", entry], 5)
+    return {
+        "defaultRoute": default_route.splitlines()[0] if default_route else "N/A",
+        "entryRoute": entry_route.splitlines()[0] if entry_route else "N/A",
+    }
 
 
 def listener_status(port: int) -> dict[str, Any]:
@@ -470,6 +518,28 @@ def quality_label(internal: dict[str, Any]) -> str:
     return "较差｜需检查内段拥塞、限速或路由"
 
 
+def mapping_chain(access: dict[str, Any], listener: dict[str, Any], local_status: str) -> dict[str, str]:
+    if access.get("pass", 0) > 0 and listener.get("status") == "PASS" and local_status == "PASS":
+        return {
+            "status": "PASS",
+            "reason": "中国探针可达入口业务端口＋日本私网主机同端口监听＋本机私网地址吻合",
+        }
+    if access.get("pass", 0) > 0 and listener.get("status") == "PASS":
+        return {
+            "status": "PARTIAL",
+            "reason": "入口端口可达且日本端监听，但日本私网地址未核对",
+        }
+    if access.get("pass", 0) > 0:
+        return {
+            "status": "INCONCLUSIVE",
+            "reason": "入口端口可达，但日本端未确认同端口监听",
+        }
+    return {
+        "status": "N/A",
+        "reason": "缺少足够的入口与日本端关联证据",
+    }
+
+
 def markdown_report(report: dict[str, Any]) -> str:
     access = report["access"]
     internal = report["internal"]
@@ -488,16 +558,18 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         f"- 上海入口端到端 TCP：{access['status']}（PASS {access['pass']}/{access['total']}，INCONCLUSIVE {access['inconclusive']}，N/A {access['na']}）",
         f"- 日本端业务监听：{listener['status']} — {listener['evidence']}",
-        f"- 滬日专线纯内段：{internal['status']} — {quality_label(internal)}",
+        f"- 上海→日本端口映射链：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
+        f"- 专线纯内段（可选）：{internal['status']} — {quality_label(internal)}",
         f"- 日本出口一致性：{report['exitMatch']['status']} — {report['exitMatch']['reason']}",
         "",
         "## 三层判定边界",
         "",
         "1. 中国探针到入口业务端口的 TCP traceroute 到达，表示入口映射后的 TCP 路径可达。",
-        "2. 只有提供上海端内网对端，才统计专线纯内段 Ping RTT／P95／抖动／丢包。",
-        "3. 未提供协议种类与凭据时，AnyTLS／Trojan／Mieru 真实应用握手为 N/A。",
-        "4. traceroute 中间跳点不回应、DNS 或探针失败不记作 100% 业务丢包。",
-        "5. “IX-style”是工具名称，不等于已证明经过某个 IXP。",
+        "2. 入口端口可达、日本端同端口监听及私网地址吻合，作为端口映射链证据，但不冒充协议认证成功。",
+        "3. 只有供应商确实提供上海内网对端时，才额外统计纯内段 Ping RTT／P95／抖动／丢包。",
+        "4. 未提供协议种类与凭据时，AnyTLS／Trojan／Mieru 真实应用握手为 N/A。",
+        "5. traceroute 中间跳点不回应、DNS 或探针失败不记作 100% 业务丢包。",
+        "6. “IX-style”是工具名称，不等于已证明经过某个 IXP。",
         "",
         "## 中国侧入口探针",
         "",
@@ -516,10 +588,13 @@ def markdown_report(report: dict[str, Any]) -> str:
     stats = internal.get("stats") or {}
     lines.extend([
         "",
-        "## 专线纯内段",
+        "## 映射链与专线纯内段",
         "",
         f"- 日本端内网：`{report['localPrivate']['masked']}`；本机存在：{report['localPrivate']['status']}",
         f"- 上海端内网对端：`{report['remotePeer']['masked']}`",
+        f"- 映射链证据：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
+        f"- 默认路由：`{report['networkContext']['defaultRoute']}`",
+        f"- 到上海入口路由：`{report['networkContext']['entryRoute']}`",
         f"- 平均 RTT：{stats.get('avg') if stats.get('avg') is not None else 'N/A'} ms",
         f"- P95：{stats.get('p95') if stats.get('p95') is not None else 'N/A'} ms",
         f"- 抖动：{stats.get('jitter') if stats.get('jitter') is not None else 'N/A'} ms",
@@ -544,10 +619,10 @@ def main() -> int:
     field("日本预期出口", mask_ip(expected_exit), GREEN)
     field("日本端内网", mask_ip(local_private), CYAN)
     field("上海内网对端", mask_ip(remote_peer), MAGENTA)
-    field("测试边界", "入口接入、专线纯内段、日本出口三层独立判定", YELLOW)
+    field("测试边界", "入口接入、上海→日本映射链、日本出口；纯内段为可选附加项", YELLOW)
 
     identity = (
-        {"ip": "114.111.176.37", "asn": "AS9999", "org": "SELF-TEST JP", "country": "Japan", "city": "Tokyo"}
+        {"ip": "87.86.87.231", "asn": "AS9999", "org": "SELF-TEST JP", "country": "Japan", "city": "Tokyo"}
         if SELF_TEST else public_identity()
     )
     addresses = ["172.16.2.101", "127.0.0.1"] if SELF_TEST else local_addresses()
@@ -559,6 +634,10 @@ def main() -> int:
     listener = (
         {"status": "PASS", "evidence": f"SELF-TEST TCP {port} LISTEN"}
         if SELF_TEST else listener_status(port)
+    )
+    net_context = (
+        {"defaultRoute": "default via 172.16.2.1 dev eth0", "entryRoute": "211.136.162.184 via 172.16.2.1 dev eth0"}
+        if SELF_TEST else network_context(entry)
     )
     if not expected_exit:
         exit_match = {"status": "N/A", "reason": "未提供预期日本出口"}
@@ -599,16 +678,21 @@ def main() -> int:
         "inconclusive": sum(x["status"] == "INCONCLUSIVE" for x in probes),
         "na": sum(x["status"] == "N/A" for x in probes),
     }
+    access["coverage"] = round(access["pass"] * 100 / total, 1) if total else 0.0
     access["status"] = (
-        "PASS" if access["pass"] == total
-        else "DEGRADED" if access["pass"] > 0
+        "PASS" if access["pass"] / total >= 0.8
+        else "PARTIAL" if access["pass"] > 0
         else "N/A" if access["na"] == total
         else "INCONCLUSIVE"
     )
 
-    section("LAYER 2 / 滬日专线纯内段", MAGENTA)
+    section("LAYER 2 / 上海→日本映射链与可选纯内段", MAGENTA)
     field("日本内网本机核对", local_status, GREEN if local_status == "PASS" else YELLOW)
     field("日本业务端口监听", listener["status"], GREEN if listener["status"] == "PASS" else YELLOW)
+    chain = mapping_chain(access, listener, local_status)
+    field("端口映射链证据", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
+    field("本机默认路由", net_context["defaultRoute"], CYAN)
+    field("到上海入口路由", net_context["entryRoute"], CYAN)
     internal = (
         {
             "status": "N/A",
@@ -618,8 +702,8 @@ def main() -> int:
         }
         if SELF_TEST else ping_peer(remote_peer)
     )
-    field("内段测试", internal["status"], GREEN if internal["status"] == "PASS" else YELLOW)
-    field("内段评级", quality_label(internal), CYAN)
+    field("纯内段附加测试", internal["status"], GREEN if internal["status"] == "PASS" else YELLOW)
+    field("纯内段附加评级", quality_label(internal), CYAN)
     field("协议握手", "N/A｜未提供协议类型与凭据，不伪判 AnyTLS／Trojan／Mieru", YELLOW)
 
     section("LAYER 3 / 日本出口公网", GREEN)
@@ -639,8 +723,10 @@ def main() -> int:
         "exitMatch": exit_match,
         "localPrivate": {"masked": mask_ip(local_private), "status": local_status},
         "remotePeer": {"masked": mask_ip(remote_peer)},
+        "networkContext": net_context,
         "listener": listener,
         "access": access,
+        "mappingChain": chain,
         "internal": internal,
         "probes": probes,
         "protocolHandshake": {
@@ -650,8 +736,10 @@ def main() -> int:
         "methodology": (
             "中国侧使用 Globalping 指定中国电信 AS4134、联通 AS4837、移动 AS9808，"
             "对上海入口业务端口执行 TCP traceroute；默认聚焦上海、安徽、江苏、浙江，"
-            "--full 扩展北京与广东。日本出口本机核对公网 IP、业务监听及本机内网地址；"
-            "提供上海内网对端时，用 20 次 ICMP 与 MTR／traceroute 测专线纯内段。"
+            "--full 扩展北京与广东。日本出口本机核对公网 IP、业务监听、本机内网地址、"
+            "默认路由及到上海入口的路由；入口可达且日本端同端口监听、私网地址吻合时，"
+            "给出端口映射链证据。供应商确实提供上海内网对端时，才用 20 次 ICMP 与 "
+            "MTR／traceroute 增测专线纯内段。"
             "探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
             "不会换算为 100% 业务丢包。"
         ),
@@ -671,8 +759,9 @@ def main() -> int:
     md_path.write_text(markdown_report(report), encoding="utf-8")
 
     section("FINAL / 三层独立结论", CYAN)
-    field("上海入口接入", f"{access['status']}｜PASS {access['pass']}/{access['total']}", GREEN if access["status"] == "PASS" else YELLOW)
-    field("滬日专线纯内段", f"{internal['status']}｜{quality_label(internal)}", GREEN if internal["status"] == "PASS" else YELLOW)
+    field("上海入口接入", f"{access['status']}｜PASS {access['pass']}/{access['total']}｜覆盖 {access['coverage']}%", GREEN if access["status"] == "PASS" else YELLOW)
+    field("上海→日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
+    field("专线纯内段附加项", f"{internal['status']}｜{quality_label(internal)}", GREEN if internal["status"] == "PASS" else YELLOW)
     field("日本出口公网", f"{exit_match['status']}｜{mask_ip(identity.get('ip', ''))}", GREEN if exit_match["status"] == "PASS" else YELLOW)
     field("协议真实握手", "N/A｜需协议类型与测试凭据", YELLOW)
     field("Markdown 报告", str(md_path), GREEN)
