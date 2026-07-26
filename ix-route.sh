@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.7 RC1"
+VERSION="v0.7 RC2"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,7 +14,7 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.7 RC1
+沪日专线／IX-style 四层质量检测 v0.7 RC2
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -108,7 +108,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.7 RC1")
+VERSION = os.environ.get("IX_VERSION", "v0.7 RC2")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -1048,9 +1048,16 @@ def return_route_label(carrier: str, route: str) -> tuple[str, list[str], str]:
 
 
 def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
+    """Trace VPS→China return paths with protocol fallback and province target fallback.
+
+    Inspired by oneclickvirt/backtrace: use repeated hop probes and alternate ICMP
+    targets. Unlike backtrace, targets remain return-path evidence only.
+    """
     name, _, _ = CARRIERS[carrier]
     candidates, target_source = dynamic_return_targets(carrier, region, host)
     selected_host = host
+    selected_protocol = "SELF_TEST"
+    protocol_attempts: list[dict[str, Any]] = []
     if SELF_TEST:
         routes = {
             "CT": "1 87.86.87.1 1.2 ms\n2 59.43.181.1 32.0 ms\n3 219.141.136.10 38.1 ms",
@@ -1058,37 +1065,67 @@ def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
             "CM": "1 87.86.87.1 1.0 ms\n2 223.118.32.1 35.0 ms\n3 221.179.155.161 39.4 ms",
         }
         route = routes[carrier]
+        protocol_attempts.append({"host": host, "protocol": "SELF_TEST", "hops": 3, "identified": True})
     elif shutil.which("traceroute") or shutil.which("tracepath"):
-        best: tuple[int, int, str, str] | None = None
+        best: tuple[int, int, int, str, str, str] | None = None
         for candidate in candidates:
+            methods: list[tuple[str, list[str]]] = []
             if shutil.which("traceroute"):
-                candidate_route = run(
-                    [
-                        "traceroute", "-n", "-T", "-p", "80",
-                        "-q", "1", "-w", "1", "-m", "25", candidate,
-                    ],
-                    40,
-                )
+                # -q 3 follows backtrace's multi-sample idea without spawning three
+                # full traces for every one of the 36 matrix entries.
+                base = ["traceroute", "-n", "-q", "3", "-w", "2", "-m", "30"]
+                methods = [
+                    ("TCP", base + ["-T", "-p", "80", candidate]),
+                    ("ICMP", base + ["-I", candidate]),
+                    ("UDP", base + ["-U", "-p", "33434", candidate]),
+                ]
             else:
-                candidate_route = run(["tracepath", "-n", "-m", "25", candidate], 40)
-            candidate_hops = route_hop_count(candidate_route)
-            candidate_class, _, _ = return_route_label(carrier, candidate_route)
-            identified = not candidate_class.startswith("INCONCLUSIVE")
-            rank = (1 if identified else 0, candidate_hops)
-            if best is None or rank > (best[0], best[1]):
-                best = (rank[0], rank[1], candidate, candidate_route)
-            if identified and candidate_hops:
+                methods = [("TRACEPATH", ["tracepath", "-n", "-m", "30", candidate])]
+            for protocol, command in methods:
+                candidate_route = run(command, 70)
+                candidate_hops = route_hop_count(candidate_route)
+                candidate_class, _, _ = return_route_label(carrier, candidate_route)
+                identified = not candidate_class.startswith("INCONCLUSIVE")
+                values = traceroute_rtts(candidate_route)
+                rtt_samples = len(values)
+                protocol_attempts.append({
+                    "host": candidate,
+                    "protocol": protocol,
+                    "hops": candidate_hops,
+                    "identified": identified,
+                    "routeClass": candidate_class,
+                    "rttSamples": rtt_samples,
+                })
+                rank = (
+                    1 if identified else 0,
+                    candidate_hops,
+                    rtt_samples,
+                    candidate,
+                    protocol,
+                    candidate_route,
+                )
+                if best is None or rank[:3] > best[:3]:
+                    best = rank
+                # TCP is closest to the Mieru business path. Only fall back when
+                # TCP does not expose a known backbone or enough valid hops.
+                if protocol == "TCP" and identified and candidate_hops >= 3:
+                    break
+                if protocol != "TCP" and identified and candidate_hops >= 3:
+                    break
+            if best is not None and best[0] and best[1] >= 3:
                 break
         if best is None:
             route = ""
         else:
-            selected_host = best[2]
-            route = best[3]
+            selected_host = best[3]
+            selected_protocol = best[4]
+            route = best[5]
     else:
         return {
             "carrier": carrier, "carrierName": name, "region": region,
             "capital": CAPITALS[region], "host": host, "primaryHost": host,
             "targetSource": target_source, "targetCandidates": candidates,
+            "selectedProtocol": "N/A", "protocolAttempts": [],
             "status": "N/A",
             "route": "", "routeHops": 0, "routeClass": "N/A",
             "backboneTags": [], "routeNote": "系统无 traceroute／tracepath",
@@ -1100,24 +1137,33 @@ def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
             "carrier": carrier, "carrierName": name, "region": region,
             "capital": CAPITALS[region], "host": selected_host, "primaryHost": host,
             "targetSource": target_source, "targetCandidates": candidates,
+            "selectedProtocol": selected_protocol,
+            "protocolAttempts": protocol_attempts,
             "status": "INCONCLUSIVE",
             "route": route, "routeHops": 0, "routeClass": "回程无有效跳点",
-            "backboneTags": [], "routeNote": "未取得有效跳点，不等于业务中断",
-            "latency": summarize([], 0), "reason": "traceroute 无有效回覆；不换算为 100% 丢包",
+            "backboneTags": [], "routeNote": "TCP／ICMP／UDP均未取得有效跳点；不等于业务中断",
+            "latency": summarize([], 0), "reason": "多协议 traceroute 无有效回覆；不换算为 100% 丢包",
         }
     values = traceroute_rtts(route)
-    latency = summarize(values[-3:], len(values[-3:])) if values else summarize([], 0)
+    latency = summarize(values[-9:], len(values[-9:])) if values else summarize([], 0)
     latency["loss"] = None
     route_class, tags, note = return_route_label(carrier, route)
+    identified_runs = sum(bool(x.get("identified")) for x in protocol_attempts)
     return {
         "carrier": carrier, "carrierName": name, "region": region,
         "capital": CAPITALS[region], "host": selected_host, "primaryHost": host,
         "targetSource": target_source, "targetCandidates": candidates,
+        "selectedProtocol": selected_protocol,
+        "protocolAttempts": protocol_attempts,
+        "identifiedAttempts": identified_runs,
         "status": "PASS",
         "route": route, "routeHops": hops, "routeClass": route_class,
-        "backboneTags": tags, "routeNote": note, "latency": latency,
+        "backboneTags": tags,
+        "routeNote": note + f" 实际采用 {selected_protocol}；协议冲突时以可见跳点证据为准。",
+        "latency": latency,
         "reason": (
-            f"取得 {hops} 个有效回程跳点；RTT 仅取末段可见样本；"
+            f"取得 {hops} 个有效回程跳点；采用 {selected_protocol}，"
+            f"{identified_runs}/{len(protocol_attempts)} 次协议／目标尝试识别到骨干；"
             f"使用 {'固定主测点' if selected_host == host else '省级三网动态备援点'}"
         ),
     }
@@ -1440,7 +1486,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "host": x["host"], "status": x["status"],
                 "primaryHost": x.get("primaryHost", x["host"]),
                 "targetSource": x.get("targetSource", "STATIC_PRIMARY"),
-                "routeClass": x["routeClass"], "routeHops": x["routeHops"],
+                "routeClass": x["routeClass"], "routeHops": x["routeHops"],\n                "selectedProtocol": x.get("selectedProtocol", "N/A"),
                 "latency": x["latency"],
             } for x in report["returns"]],
             "internal": {
@@ -1569,7 +1615,7 @@ def main() -> int:
             latency = item.get("latency") or {}
             shown_rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
             result_color = GREEN if item["status"] == "PASS" else YELLOW
-            field("结果", f"{item['status']}｜{item['routeClass']}｜RTT {shown_rtt}", result_color)
+            field("结果", f"{item['status']}｜{item.get('selectedProtocol', 'N/A')}｜{item['routeClass']}｜RTT {shown_rtt}", result_color)
 
     access = {
         "total": total,
@@ -1663,7 +1709,7 @@ def main() -> int:
             "测量使用严格 country+city+ASN+tag 参数；只有确认所有合法候选均无在线探针才记 NO_PROBE，"
             "结构化 no_probes_found 与其他 API 422 分开处理。"
             "回程参考 oneclickvirt/backtrace 的备援策略：每省每运营商保留固定主测点，"
-            "主测点骨干证据不足时，从每日更新的省级三网 ICMP 目标池选择最多两个备援地址；"
+            "主测点骨干证据不足时，从每日更新的省级三网 ICMP 目标池选择最多两个备援地址；"\n            "每个目标先以 TCP 三探测追踪，证据不足时依次回退 ICMP 与 UDP，最大 30 跳、单跳等待 2 秒；"
             "备援仅改变日本出口的回程目标，不会冒充中国侧去程来源。"
             "探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
             "不会换算为 100% 业务丢包。"
