@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.11 SHARED-PROBE-POOL"
+VERSION="v0.9 RC4.2.12 FINAL-MATRIX-INTEGRITY"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.11 北上广主矩阵＋共享探针池
+中国三网 VPS 双程质量检测 v0.9 RC4.2.12 FINAL 矩阵完整性封版
 
 用法：
   bash 3net-route.sh
@@ -24,6 +24,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   去程：优先读取中国本地端主动实测证据；缺项才使用 Globalping 同省远端探针。
   同省无探针时：一次收集中国境内同运营商多探针快照，按地区分配并避免重复。
   全国参考与指定地区分开统计，不会把 REFERENCE-PASS 写成指定地区 PASS。
+  NOT-TESTED 与复用探针不计分；矩阵不完整时标记 PARTIAL，不给正式总分／星级。
+  报告分开显示有效样本表现、矩阵覆盖率与正式评分资格。
   回程：当前出口 VPS → 对应地区三网固定／动态目标。
   net.sh／TcpQuality 的节点均是 VPS→中国回程目标，不会被冒充为中国→VPS 去程。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
@@ -112,7 +114,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.11 SHARED-PROBE-POOL")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.12 FINAL-MATRIX-INTEGRITY")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
@@ -430,7 +432,7 @@ def ask_target() -> tuple[str, int]:
 
 def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int = 25) -> Any:
     data = None
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.11", "Accept": "application/json"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.12", "Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -443,7 +445,7 @@ ASN_CACHE: dict[str, str] = {}
 
 
 def http_text(url: str, timeout: int = 25) -> str:
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.11", "Accept": "text/plain,*/*"}
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.12", "Accept": "text/plain,*/*"}
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read().decode("utf-8-sig", "replace")
@@ -849,6 +851,7 @@ def choose_national_candidate(
             int(probe.get("asn") or 0) not in expected_asns,
             "eyeball-network" not in (probe.get("tags") or []),
             str(probe.get("city") or ""),
+            fingerprint,
         )
 
     if not pool:
@@ -1012,7 +1015,9 @@ def globalping_trace(target: str, port: int, carrier: str,
         route_timings, len(route_timings), loss_valid=False,
         metric="TCP traceroute RTT（不作为业务丢包）"
     )
-    value = score(rank, result_stats) if verified else 0
+    # 探针身份正确但没有到达入口时属于一次真实失败，必须以 0 分计入
+    # 已执行样本；不能仅凭沿途骨干标签给出线路质量分。
+    value = score(rank, result_stats) if verified and target_reached else 0
     if selection_scope in {"CAPITAL", "CAPITAL_POOL_DISCOVERY"}:
         health = f"ONLINE-CAPITAL｜省会直测｜AS{source_asn}"
         scope_note = (
@@ -1127,7 +1132,8 @@ def load_client_forward_evidence(
             f"中国本地端主动实测：{actual_city} {source_network} {source_asn} → "
             f"{mask_ip(target)}:{port}。{route_evidence}"
         )
-        value = score(rank, result_stats)
+        # 中国本地端确实执行但业务端口未接通时，保留为失败样本并计 0 分。
+        value = score(rank, result_stats) if target_reached else 0
         item = {
             "carrier": carrier, "region": region,
             "requestedCity": CAPITALS[region],
@@ -1622,6 +1628,60 @@ def self_test_regressions() -> None:
         raise AssertionError("复用全国探针计数回归失败")
     if no_duplicate_grade["forwardValid"] != f"1/{len(FORWARD_REGIONS)}":
         raise AssertionError("复用全国探针不得拉高去程有效覆盖")
+    if no_duplicate_grade["forwardMeasured"] != f"1/{len(FORWARD_REGIONS)}":
+        raise AssertionError("复用全国探针不得拉高去程测量覆盖")
+    if no_duplicate_grade["ratingEligible"]:
+        raise AssertionError("存在复用探针的部分矩阵不得取得正式评分资格")
+    if (
+        no_duplicate_grade["score"] is not None
+        or no_duplicate_grade["stars"] != "未评级"
+        or no_duplicate_grade["matrixStatus"] != "PARTIAL"
+    ):
+        raise AssertionError("部分矩阵必须显示 PARTIAL、无正式分数及星级")
+    if no_duplicate_grade["sampleScore"] <= 0:
+        raise AssertionError("部分矩阵仍应保留有效样本表现")
+
+    # NOT-TESTED 完全排除；独立探针实际执行但未接通则计为 0 分失败。
+    partial_forwards = [
+        self_test_forward("CT", region, probe_city)
+        for region, probe_city in FORWARD_REGIONS
+    ]
+    partial_forwards[-1] = {
+        **partial_forwards[-1],
+        "selectionScope": "NO_PROBE",
+        "verified": False,
+        "targetReached": False,
+        "rank": 0,
+        "score": 0,
+    }
+    full_returns = [
+        self_test_return("CT", region, f"complete-{region}")
+        for region, _ in FORWARD_REGIONS
+    ]
+    partial_grade = grade("CT", partial_forwards, full_returns)
+    if partial_grade["forwardMeasured"] != f"{len(FORWARD_REGIONS) - 1}/{len(FORWARD_REGIONS)}":
+        raise AssertionError("NOT-TESTED 排除测量覆盖回归失败")
+    if partial_grade["ratingEligible"] or partial_grade["score"] is not None:
+        raise AssertionError("NOT-TESTED 存在时不得产生正式评分")
+
+    failed_forwards = [
+        self_test_forward("CT", region, probe_city)
+        for region, probe_city in FORWARD_REGIONS
+    ]
+    failed_forwards[-1] = {
+        **failed_forwards[-1],
+        "targetReached": False,
+        "reachability": "FAIL｜离线失败样本",
+        "score": 0,
+        "stars": "☆☆☆☆☆",
+    }
+    failure_grade = grade("CT", failed_forwards, full_returns)
+    if not failure_grade["ratingEligible"] or failure_grade["matrixStatus"] != "COMPLETE":
+        raise AssertionError("独立探针已执行的失败样本仍应完成矩阵")
+    if failure_grade["forwardFailures"] != 1:
+        raise AssertionError("独立探针未接通必须计为一次真实失败")
+    if failure_grade["forwardScore"] >= reference_grade["forwardScore"]:
+        raise AssertionError("真实失败样本必须以 0 分拉低有效样本表现")
 
     synthetic_pool = [
         {"probe": {"country": "CN", "city": city, "asn": asn,
@@ -1653,6 +1713,22 @@ def self_test_regressions() -> None:
         raise AssertionError("18／36 组共享探针池北上广分配一致性回归失败")
     if len(set(probe_fingerprint(x or {}) for x in extended_selected)) != 6:
         raise AssertionError("36 组共享探针池不得重复分配可用探针")
+    # Globalping 每次返回顺序可能不同；三种顺序必须得到同一分配与计数。
+    baseline = [
+        probe_fingerprint(x or {}) for x in extended_selected
+    ]
+    for drift_pool in (
+        list(reversed(synthetic_pool)),
+        synthetic_pool[2:] + synthetic_pool[:2],
+        synthetic_pool[::2] + synthetic_pool[1::2],
+    ):
+        drift_used: set[str] = set()
+        drift_selected = [
+            choose_national_candidate(drift_pool, "CU", region, drift_used)[0]
+            for region, _ in ALL_FORWARD_REGIONS
+        ]
+        if [probe_fingerprint(x or {}) for x in drift_selected] != baseline:
+            raise AssertionError("共享探针池返回顺序漂移不得改变 36 组分配")
 
 
 def format_stats(data: dict[str, Any]) -> str:
@@ -1749,8 +1825,30 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
           returns: list[dict[str, Any]]) -> dict[str, Any]:
     forward_items = [x for x in forwards if x["carrier"] == carrier]
     return_items = [x for x in returns if x["carrier"] == carrier]
+
+    # “完成矩阵”看的是每一格是否真正由独立探针执行，而不是该格最后
+    # 是否判出精品线路。NO_PROBE 不算执行；全国探针复用只显示一次参考，
+    # 不能重复填高覆盖率。真实执行但未到达／未取得路由则是 0 分失败样本。
+    measured_forwards: list[dict[str, Any]] = []
+    seen_reference_probes: set[str] = set()
+    for item in forward_items:
+        if not item.get("verified") or item.get("selectionScope") == "NO_PROBE":
+            continue
+        if national_reference(item):
+            fingerprint = str(item.get("probeFingerprint") or "")
+            if item.get("nationalProbeReused") or (
+                fingerprint and fingerprint in seen_reference_probes
+            ):
+                continue
+            if fingerprint:
+                seen_reference_probes.add(fingerprint)
+        measured_forwards.append(item)
+    measured_returns = [
+        x for x in return_items if bool(str(x.get("probeIp") or "").strip())
+    ]
+
     reached_forwards = [
-        x for x in forward_items
+        x for x in measured_forwards
         if int(x.get("rank", 0)) > 0 and x.get("verified") and x.get("targetReached")
     ]
     regional_forwards = [
@@ -1761,31 +1859,64 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         if national_reference(x) and not x.get("nationalProbeReused")
     ]
     shared_reference_forwards = [
-        x for x in reached_forwards
-        if national_reference(x) and x.get("nationalProbeReused")
+        x for x in forward_items
+        if (
+            national_reference(x)
+            and x.get("nationalProbeReused")
+            and x.get("verified")
+        )
     ]
-    # 同一个全国探针复用到多个请求地区时，只能算一份线路证据，避免重复
-    # 拉高得分、覆盖率或成功数。
+    # valid_* 只用于路线类别与“可判定证据”统计；样本分数的分母使用所有
+    # 已执行独立测量，因此真正执行但失败的格子会以 0 分进入平均值。
     valid_forwards = regional_forwards + reference_forwards
     valid_returns = [x for x in return_items if int(x.get("rank", 0)) > 0]
-    forward_score = round(statistics.mean(x["score"] for x in valid_forwards)) if valid_forwards else 0
-    return_score = round(statistics.mean(x["score"] for x in valid_returns)) if valid_returns else 0
-    if valid_forwards and valid_returns:
-        overall = round(forward_score * 0.4 + return_score * 0.6)
-        score_basis = "BIDIRECTIONAL"
-    elif valid_returns:
-        overall = return_score
-        score_basis = "RETURN_ONLY"
-    elif valid_forwards:
-        overall = forward_score
-        score_basis = "FORWARD_ONLY"
+    forward_score = (
+        round(statistics.mean(
+            int(x.get("score", 0))
+            if x.get("targetReached") and int(x.get("rank", 0)) > 0 else 0
+            for x in measured_forwards
+        ))
+        if measured_forwards else 0
+    )
+    return_score = (
+        round(statistics.mean(
+            int(x.get("score", 0)) if int(x.get("rank", 0)) > 0 else 0
+            for x in measured_returns
+        ))
+        if measured_returns else 0
+    )
+    if measured_forwards and measured_returns:
+        sample_score = round(forward_score * 0.4 + return_score * 0.6)
+    elif measured_returns:
+        sample_score = return_score
+    elif measured_forwards:
+        sample_score = forward_score
     else:
-        overall = 0
-        score_basis = "NO_EVIDENCE"
-    coverage = round(
+        sample_score = 0
+
+    rating_eligible = (
+        len(measured_forwards) == len(forward_items)
+        and len(measured_returns) == len(return_items)
+    )
+    overall: int | None = sample_score if rating_eligible else None
+    score_basis = "FULL_MATRIX" if rating_eligible else "PARTIAL_NO_RATING"
+    matrix_status = "COMPLETE" if rating_eligible else "PARTIAL"
+    measurement_coverage = round(
+        (len(measured_forwards) + len(measured_returns))
+        / max(1, len(forward_items) + len(return_items)),
+        3,
+    )
+    scorable_coverage = round(
         (len(valid_forwards) + len(valid_returns))
         / max(1, len(forward_items) + len(return_items)),
         3,
+    )
+    forward_failures = sum(
+        1 for x in measured_forwards
+        if not x.get("targetReached") or int(x.get("rank", 0)) <= 0
+    )
+    return_failures = sum(
+        1 for x in measured_returns if int(x.get("rank", 0)) <= 0
     )
     forward_premium = sum(1 for x in valid_forwards if premium_route(carrier, x))
     regional_forward_premium = sum(
@@ -1803,18 +1934,33 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         "forwardRoute": representative_route(valid_forwards, "去程"),
         "returnRoute": representative_route(valid_returns, "回程"),
         "forwardScore": forward_score, "returnScore": return_score,
+        "sampleScore": sample_score,
+        "forwardMeasured": f"{len(measured_forwards)}/{len(forward_items)}",
         "forwardValid": f"{len(valid_forwards)}/{len(forward_items)}",
         "forwardRegional": f"{len(regional_forwards)}/{len(forward_items)}",
         "forwardReference": len(reference_forwards),
         "forwardSharedReference": len(shared_reference_forwards),
         "forwardReached": f"{len(reached_forwards)}/{len(forward_items)}",
+        "forwardFailures": forward_failures,
+        "returnMeasured": f"{len(measured_returns)}/{len(return_items)}",
         "returnValid": f"{len(valid_returns)}/{len(return_items)}",
+        "returnFailures": return_failures,
         "forwardPremium": f"{forward_premium}/{len(valid_forwards)}",
         "returnPremium": f"{return_premium}/{len(valid_returns)}",
         "bidirectionalPremium": bidirectional_premium,
         "scoreBasis": score_basis,
-        "evidenceCoverage": coverage,
-        "score": overall, "stars": stars(overall),
+        "matrixStatus": matrix_status,
+        "ratingEligible": rating_eligible,
+        "ratingReason": (
+            "完整独立矩阵，具备正式评分资格"
+            if rating_eligible else
+            "矩阵存在 NOT-TESTED 或复用探针，仅显示样本表现"
+        ),
+        "evidenceCoverage": measurement_coverage,
+        "measurementCoverage": measurement_coverage,
+        "scorableCoverage": scorable_coverage,
+        "score": overall,
+        "stars": stars(overall) if overall is not None else "未评级",
     }
 
 
@@ -1883,8 +2029,9 @@ const names={{CT:'中国电信',CU:'中国联通',CM:'中国移动'}};
 document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2><table><tbody>
 <tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部入口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
+<tr><th>矩阵状态</th><td>${{E((R.matrixAssessment||{{}}).status||'N/A')}}</td><th>正式评分资格</th><td>${{(R.matrixAssessment||{{}}).ratingEligible?'具备':'不具备｜PARTIAL 不评级'}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
-document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>评分依据：${{E(g.scoreBasis)}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；指定地区 ${{E(g.forwardRegional)}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
+document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.ratingEligible?`${{g.score}} 分 ${{g.stars}}`:`PARTIAL｜未评级`}}</div><div>有效样本表现：${{g.sampleScore}} 分（非正式总分）</div><div>矩阵：${{E(g.matrixStatus)}}｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（样本 ${{g.forwardScore}}；测量 ${{E(g.forwardMeasured)}}｜有效 ${{E(g.forwardValid)}}｜指定地区 ${{E(g.forwardRegional)}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜失败 ${{g.forwardFailures||0}}）</div><div>回程：${{E(g.returnRoute)}}（样本 ${{g.returnScore}}；测量 ${{E(g.returnMeasured)}}｜有效 ${{E(g.returnValid)}}｜失败 ${{g.returnFailures||0}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
 document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} ${{E(R.matrixLabel||'多地区')}}双程证据</h2><table><thead><tr><th>方向／地区</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
@@ -1894,7 +2041,8 @@ function nodeSeek(){{
     const returns=R.returns.filter(x=>x.carrier===c);
     const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
     const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
-    return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜依据 ${{g.scoreBasis}}｜证据覆盖 ${{Math.round((g.evidenceCoverage||0)*100)}}%｜去程指定地区 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
+    const rating=g.ratingEligible?`${{g.score}} 分 ${{g.stars}}`:`PARTIAL｜未评级`;
+    return `::: tab-item ${{names[c]}}\n正式评分：${{rating}}｜有效样本表现 ${{g.sampleScore}} 分｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%｜去程测量 ${{g.forwardMeasured}}／指定地区 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程测量 ${{g.returnMeasured}}／有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
 }}
@@ -1993,7 +2141,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "route": grade_item["forwardRoute"],
             "evidence": f"{MATRIX_LABEL}去程共 {len(forward_items)} 组",
             "score": grade_item["forwardScore"],
-            "stars": stars(grade_item["forwardScore"]),
+            "stars": "仅样本",
             "avg": average([x["stats"].get("avg") for x in valid_forward_items]),
             "min": average([x["stats"].get("minimum") for x in valid_forward_items]),
             "max": average([x["stats"].get("maximum") for x in valid_forward_items]),
@@ -2029,26 +2177,39 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "forwardProbes": forward_probes,
             "forwardScore": grade_item["forwardScore"],
             "returnScore": grade_item["returnScore"],
+            "sampleScore": grade_item["sampleScore"],
             "scoreBasis": grade_item["scoreBasis"],
             "evidenceCoverage": grade_item["evidenceCoverage"],
+            "measurementCoverage": grade_item["measurementCoverage"],
+            "scorableCoverage": grade_item["scorableCoverage"],
+            "matrixStatus": grade_item["matrixStatus"],
+            "ratingEligible": grade_item["ratingEligible"],
+            "ratingReason": grade_item["ratingReason"],
+            "forwardMeasured": grade_item["forwardMeasured"],
             "forwardRegional": grade_item["forwardRegional"],
             "forwardReference": grade_item["forwardReference"],
             "forwardSharedReference": grade_item["forwardSharedReference"],
             "forwardReached": grade_item["forwardReached"],
+            "forwardFailures": grade_item["forwardFailures"],
+            "returnMeasured": grade_item["returnMeasured"],
+            "returnValid": grade_item["returnValid"],
+            "returnFailures": grade_item["returnFailures"],
             "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
         })
-    final_score = round(statistics.mean(x["score"] for x in report["grades"]))
+    rating_eligible = all(x["ratingEligible"] for x in report["grades"])
+    final_sample_score = round(statistics.mean(
+        x["sampleScore"] for x in report["grades"]
+    ))
+    final_score: int | None = final_sample_score if rating_eligible else None
     forward_regional_total = sum(
         int(str(x["forwardRegional"]).split("/", 1)[0])
         for x in report["grades"]
     )
     final_title = (
-        "三网双程综合判定"
-        if forward_regional_total == EXPECTED_PER_DIRECTION
-        else (
-            f"回程为主参考｜指定地区去程 "
-            f"{forward_regional_total}/{EXPECTED_PER_DIRECTION}"
-        )
+        "三网完整矩阵正式判定"
+        if rating_eligible else
+        f"PARTIAL｜部分矩阵不评级｜指定地区去程 "
+        f"{forward_regional_total}/{EXPECTED_PER_DIRECTION}"
     )
     return {
         "version": report["version"], "generated": report["generated"],
@@ -2061,9 +2222,17 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         "methodology": report["methodology"],
         "bgp": {"asn": report["dedicatedLine"]["exitAsn"],
                 "provider": report["exit"]["identity"], "location": ""},
-        "final": {"score": final_score, "stars": stars(final_score),
-                  "title": final_title, "elapsed": "N/A"},
+        "final": {
+            "score": final_score,
+            "stars": stars(final_score) if final_score is not None else "未评级",
+            "sampleScore": final_sample_score,
+            "ratingEligible": rating_eligible,
+            "matrixStatus": "COMPLETE" if rating_eligible else "PARTIAL",
+            "title": final_title,
+            "elapsed": "N/A",
+        },
         "carriers": carriers,
+        "matrixAssessment": report.get("matrixAssessment", {}),
         "dedicatedLine": report["dedicatedLine"],
     }
 
@@ -2185,6 +2354,37 @@ def main() -> int:
             show_return(item, index, return_total)
 
     grades = [grade(c, forward, returns) for c in ("CT", "CU", "CM")]
+    measured_total = sum(
+        int(item["forwardMeasured"].split("/", 1)[0])
+        + int(item["returnMeasured"].split("/", 1)[0])
+        for item in grades
+    )
+    scorable_total = sum(
+        int(item["forwardValid"].split("/", 1)[0])
+        + int(item["returnValid"].split("/", 1)[0])
+        for item in grades
+    )
+    matrix_rating_eligible = (
+        measured_total == TOTAL_MATRIX_GROUPS
+        and all(item["ratingEligible"] for item in grades)
+    )
+    matrix_assessment = {
+        "status": "COMPLETE" if matrix_rating_eligible else "PARTIAL",
+        "completed": f"{measured_total}/{TOTAL_MATRIX_GROUPS}",
+        "scorable": f"{scorable_total}/{TOTAL_MATRIX_GROUPS}",
+        "measurementCoverage": round(
+            measured_total / max(1, TOTAL_MATRIX_GROUPS), 3
+        ),
+        "scorableCoverage": round(
+            scorable_total / max(1, TOTAL_MATRIX_GROUPS), 3
+        ),
+        "ratingEligible": matrix_rating_eligible,
+        "ratingReason": (
+            "全部格子均由独立探针执行，具备正式评分资格"
+            if matrix_rating_eligible else
+            "存在 NOT-TESTED 或复用探针；未完成格不算失败，整份报告不评级"
+        ),
+    }
     if SELF_TEST:
         self_test_regressions()
         if not all(item["bidirectionalPremium"] for item in grades):
@@ -2196,13 +2396,32 @@ def main() -> int:
         field(
             CARRIER_NAME[item["carrier"]],
             f"去程 {item['forwardRoute']}〔地区 {item['forwardRegional']}｜"
+            f"测量 {item['forwardMeasured']}｜有效 {item['forwardValid']}｜"
             f"全国独立参考 {item['forwardReference']}｜"
-            f"复用参考 {item['forwardSharedReference']}〕｜"
-            f"回程 {item['returnRoute']}〔有效 {item['returnValid']}〕｜"
-            f"依据 {item['scoreBasis']}｜覆盖 {round(item['evidenceCoverage'] * 100)}%｜"
-            f"{premium_text}｜{item['score']} 分｜{item['stars']}",
+            f"复用参考 {item['forwardSharedReference']}｜失败 {item['forwardFailures']}〕｜"
+            f"回程 {item['returnRoute']}〔测量 {item['returnMeasured']}｜"
+            f"有效 {item['returnValid']}｜失败 {item['returnFailures']}〕｜"
+            f"样本表现 {item['sampleScore']} 分｜"
+            f"测量覆盖 {round(item['measurementCoverage'] * 100)}%｜"
+            f"{premium_text}｜"
+            + (
+                f"正式评分 {item['score']} 分｜{item['stars']}"
+                if item["ratingEligible"] else
+                "PARTIAL｜正式评分 N/A｜未评级"
+            ),
             color,
         )
+    field(
+        "矩阵完整性",
+        f"{matrix_assessment['status']}｜完成 {matrix_assessment['completed']}｜"
+        f"可判定 {matrix_assessment['scorable']}｜"
+        + (
+            "具备正式评分资格"
+            if matrix_assessment["ratingEligible"] else
+            "不具备正式评分资格"
+        ),
+        GREEN if matrix_assessment["ratingEligible"] else YELLOW,
+    )
 
     report = {
         "version": VERSION,
@@ -2220,10 +2439,11 @@ def main() -> int:
             "clientActive": true_forward_count,
             "total": len(forward),
         },
-        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，一次收集中国境内同运营商名称及各省网 ASN 的多探针共享快照；北上广与扩展模式使用相同池规则，按实际城市和地区 ASN 优先分配并避免重复。全国参考只证明该运营商网络到入口的线路与可达性，不冒充指定省份；复用同一全国探针不重复计入覆盖、评分或成功数，也不能满足精品双程的地区覆盖要求。仍无探针时标记 NOT-TESTED，不得写成入口不通。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
+        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，一次收集中国境内同运营商名称及各省网 ASN 的多探针共享快照；北上广与扩展模式使用相同池规则，按实际城市和地区 ASN 优先分配并避免重复。全国参考只证明该运营商网络到入口的线路与可达性，不冒充指定省份；复用同一全国探针不重复计入覆盖、评分或成功数，也不能满足精品双程的地区覆盖要求。仍无探针时标记 NOT-TESTED，不得写成入口不通。只有独立探针实际执行的格子才进入样本表现；实际执行但未接通／无可判路由的格子以 0 分计为失败。NOT-TESTED 与复用参考完全排除。未完成全部矩阵时统一标记 PARTIAL，仅显示有效样本表现、测量覆盖率与可判定证据覆盖率，不生成正式总分或星级。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
+        "matrixAssessment": matrix_assessment,
         "dedicatedLine": dedicated_line,
         "privacy": "报告中的入口与出口 IPv4 均只保留前两段。",
     }
