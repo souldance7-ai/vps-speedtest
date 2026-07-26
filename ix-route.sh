@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.5 RC2"
+VERSION="v0.6 RC1"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,7 +14,7 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.5 RC2
+沪日专线／IX-style 四层质量检测 v0.6 RC1
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -27,7 +27,7 @@ usage() {
   bash ix-route.sh --entry 211.136.162.184 --port 10103 \
     --expected-exit 87.86.87.231 --local-private 172.16.2.101
 
-默认北上广三网双程；完整六地区三网：
+默认北上广三网接入＋同会话返回验证＋日本公网回国参考；完整六地区三网：
   bash ix-route.sh --entry 211.136.162.184 --port 10103 --full
 
 可选参数：
@@ -50,7 +50,9 @@ usage() {
   自动识别 Mieru mita 服务、版本、运行状态、端口监听与 NTP。
   只有提供中国客户端实测出口且与日本出口一致时，才确认 Mieru 真实握手 PASS。
   DNS、探针或权限失败一律显示 N/A，不会换算成 100% LOSS。
-  北京、上海、广州固定列入三网去程与日本出口回程；--full 再加入合肥、南京、杭州。
+  北京、上海、广州固定列入三网入口接入；--full 再加入合肥、南京、杭州。
+  日本出口到中国三网公网目标仅作“公网回国参考”，不冒充专线会话回程，也不计专线评分。
+  专线返回方向依据同一 Mieru TCP／NAT 会话闭环判定；没有客户端握手证据时保持 INCONCLUSIVE。
   报告保存到“Chain 3Net”目录，并生成 HTML／JSON／Markdown；上传成功必须显示公共网址。
 EOF
 }
@@ -534,6 +536,46 @@ def handshake_verdict(
     }
 
 
+def session_return_verdict(
+    handshake: dict[str, str],
+    chain: dict[str, str],
+    listener: dict[str, Any],
+    local_status: str,
+) -> dict[str, str]:
+    """Judge the reverse leg of the same mapped TCP session, not a new JP→CN flow."""
+    if handshake.get("status") == "FAIL":
+        return {
+            "status": "FAIL",
+            "evidenceLevel": "END_TO_END",
+            "reason": "客户端出口验证失败，不能确认同一 Mieru 会话经映射链返回",
+        }
+    if (
+        handshake.get("status") == "PASS"
+        and chain.get("status") == "PASS"
+        and listener.get("status") == "PASS"
+        and local_status == "PASS"
+    ):
+        return {
+            "status": "PASS",
+            "evidenceLevel": "INDIRECT_END_TO_END",
+            "reason": (
+                "同一 Mieru TCP 会话已完成上海入口映射、日本 Mita 响应及客户端出口核对；"
+                "返回包必须经该会话的 NAT 状态回到客户端。隐藏专线内段未逐跳抓包，故标为端到端间接证据"
+            ),
+        }
+    if handshake.get("status") == "PASS":
+        return {
+            "status": "INCONCLUSIVE",
+            "evidenceLevel": "PARTIAL",
+            "reason": "客户端出口一致，但端口映射链、本机私网地址或监听证据尚未全部闭合",
+        }
+    return {
+        "status": "INCONCLUSIVE",
+        "evidenceLevel": "MISSING_CLIENT_HANDSHAKE",
+        "reason": "未提供中国客户端连接 Mieru 后的出口核对，不能把日本主机主动回国路由当作专线会话回程",
+    }
+
+
 def percentile(values: list[float], ratio: float) -> float | None:
     if not values:
         return None
@@ -890,14 +932,14 @@ def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
             "route": "", "routeHops": 0, "routeClass": "N/A",
             "routeRank": 0, "routeScore": 0, "transport": "N/A",
             "backboneTags": [], "routeNote": "系统无 traceroute／tracepath",
-            "latency": summarize([], 0), "reason": "缺少回程路由工具；不换算为 100% 丢包",
+            "latency": summarize([], 0), "reason": "缺少公网回国参考路由工具；不换算为 100% 丢包",
         }
     hops = route_hop_count(route)
     if not hops:
         return {
             "carrier": carrier, "carrierName": name, "region": region,
             "capital": CAPITALS[region], "host": host, "status": "INCONCLUSIVE",
-            "route": route, "routeHops": 0, "routeClass": "回程无有效跳点",
+            "route": route, "routeHops": 0, "routeClass": "公网回国参考无有效跳点",
             "routeRank": 0, "routeScore": 0, "transport": transport,
             "backboneTags": [], "routeNote": "未取得有效跳点，不等于业务中断",
             "latency": summarize([], 0), "reason": "traceroute 无有效回覆；不换算为 100% 丢包",
@@ -913,7 +955,7 @@ def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
         "routeRank": route_rank, "routeScore": route_score, "transport": transport,
         "backboneTags": tags, "routeNote": note, "latency": latency,
         "reason": (
-            f"{transport} 取得 {hops} 个有效回程跳点；"
+            f"{transport} 取得 {hops} 个公网回国参考跳点；"
             "三种协议先按骨干证据等级选择，等级相同才比较回覆跳数；RTT 仅取末段可见样本"
         ),
     }
@@ -977,6 +1019,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         f"- 日本端业务监听：{listener['status']} — {listener['evidence']}",
         f"- Mieru／Mita 服务：{report['mieruService']['status']} — {report['mieruService']['evidence']}",
         f"- Mieru 真实握手：{report['protocolHandshake']['status']} — {report['protocolHandshake']['reason']}",
+        f"- 专线会话返回：{report['sessionReturn']['status']}（{report['sessionReturn']['evidenceLevel']}）— {report['sessionReturn']['reason']}",
         f"- 上海→日本端口映射链：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
         f"- 专线纯内段（可选）：{internal['status']} — {quality_label(internal)}",
         f"- 日本出口一致性：{report['exitMatch']['status']} — {report['exitMatch']['reason']}",
@@ -985,10 +1028,12 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         "1. 中国探针到入口业务端口的 TCP traceroute 到达，表示入口映射后的 TCP 路径可达。",
         "2. 入口端口可达、日本端同端口监听及私网地址吻合，作为端口映射链证据，但不冒充协议认证成功。",
-        "3. 只有供应商确实提供上海内网对端时，才额外统计纯内段 Ping RTT／P95／抖动／丢包。",
-        "4. 自动识别 mita 服务；只有中国客户端连接后实测出口一致，真实握手才为 PASS。",
-        "5. traceroute 中间跳点不回应、DNS 或探针失败不记作 100% 业务丢包。",
-        "6. “IX-style”是工具名称，不等于已证明经过某个 IXP。",
+        "3. 同一 Mieru TCP 会话完成入口映射、Mita 响应和客户端出口核对时，返回方向按 NAT 会话闭环判定；这是端到端间接证据，不冒充隐藏内段逐跳抓包。",
+        "4. 日本出口主动 traceroute 中国三网公网目标，测到的是日本 BGP 公网回国参考，不是该 Mieru 会话的专线回程，也不计专线评分。",
+        "5. 只有供应商确实提供上海内网对端时，才额外统计纯内段 Ping RTT／P95／抖动／丢包。",
+        "6. 自动识别 mita 服务；只有中国客户端连接后实测出口一致，真实握手才为 PASS。",
+        "7. traceroute 中间跳点不回应、DNS 或探针失败不记作 100% 业务丢包。",
+        "8. “IX-style”是工具名称，不等于已证明经过某个 IXP。",
         "",
         "## 中国侧入口探针",
         "",
@@ -1007,7 +1052,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         )
     lines.extend([
         "",
-        "## 日本出口至北上广／六地三网回程",
+        "## 日本出口公网回国参考（不代表专线会话回程、不计专线评分）",
         "",
         "| 地区 | 运营商 | 公网目标 | 可见跳点 | RTT | 路由标签 | 状态 |",
         "|---|---|---|---:|---:|---|---|",
@@ -1063,22 +1108,23 @@ table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(-
 <section class="panel"><h2>TOPOLOGY / 实际业务拓扑</h2><div class="topology" id="topology"></div></section>
 <div class="grid" id="cards"></div>
 <section class="panel"><h2>MIERU / 日本端服务证据</h2><table id="mieru"></table></section>
-<section class="panel"><h2>FORWARD / 北上广固定三网去程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>实际探针</th><th>城市</th><th>ASN</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div></section>
-<section class="panel"><h2>RETURN / 日本出口至北上广固定三网回程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>目标</th><th>跳点</th><th>RTT</th><th>路由标签</th><th>骨干证据</th><th>状态</th></tr></thead><tbody id="returnRows"></tbody></table></div></section>
+<section class="panel"><h2>ACCESS / 中国三网到上海入口（公网接入段）</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>实际探针</th><th>城市</th><th>ASN</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section class="panel"><h2>PUBLIC REFERENCE / 日本出口公网回国参考（不代表专线会话回程、不计专线评分）</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>目标</th><th>跳点</th><th>RTT</th><th>路由标签</th><th>骨干证据</th><th>状态</th></tr></thead><tbody id="returnRows"></tbody></table></div></section>
 <section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
 </main><script>
 const R={embedded}; const E=s=>String(s??'N/A').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 const badge=(label,obj)=>`<article class="card"><span>${{E(label)}}</span><strong class="${{E(obj.status)}}">${{E(obj.status)}}</strong><small>${{E(obj.reason||obj.evidence||'')}}</small></article>`;
 document.getElementById('meta').textContent=`${{R.generated}} · ${{R.version}} · ${{R.matrix}}`;
 document.getElementById('topology').innerHTML=[
-`<div class="node">中国 Mieru 客户端</div>`,`<b class="arrow">→</b>`,
-`<div class="node">上海入口<br><code>${{E(R.entry.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
-`<div class="node">隐藏专线／映射链</div>`,`<b class="arrow">→</b>`,
+`<div class="node">中国 Mieru 客户端</div>`,`<b class="arrow">↔</b>`,
+`<div class="node">上海入口<br><code>${{E(R.entry.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">↔</b>`,
+`<div class="node">隐藏专线／NAT 会话</div>`,`<b class="arrow">↔</b>`,
 `<div class="node">日本 Mita<br><code>${{E(R.localPrivate.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
 `<div class="node">日本出口<br><code>${{E(R.exitIdentity.ipMasked)}}</code></div>`].join('');
 document.getElementById('cards').innerHTML=[
 badge('上海入口接入',{{status:R.access.status,reason:`PASS ${{R.access.pass}}/${{R.access.total}} · 覆盖 ${{R.access.coverage}}%`}}),
-badge('上海→日本映射链',R.mappingChain),badge('Mieru 真实握手',R.protocolHandshake),badge('日本出口一致性',R.exitMatch)].join('');
+badge('上海↔日本映射链',R.mappingChain),badge('专线会话返回',R.sessionReturn),
+badge('Mieru 真实握手',R.protocolHandshake),badge('日本出口一致性',R.exitMatch)].join('');
 const M=R.mieruService;
 document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="${{E(M.status)}}">${{E(M.status)}}</td><th>版本</th><td>${{E(M.version)}}</td></tr>
 <tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
@@ -1142,58 +1188,67 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         return_items = [x for x in report["returns"] if x["carrier"] == carrier]
         return_passed = [x for x in return_items if x["status"] == "PASS"]
         return_valid = [x for x in return_items if int(x.get("routeRank", 0)) > 0]
-        return_score = (
+        public_reference_score = (
             round(sum(int(x.get("routeScore", 0)) for x in return_items) / len(return_items))
             if return_items else 0
         )
-        return_probes = []
-        for item in return_items:
+        session_return_probes = []
+        for item in items:
             latency = item.get("latency") or {}
-            return_probes.append({
-                "city": item["capital"], "host": item["host"], "ip": item["host"],
-                "route": item["routeClass"], "evidence": item["reason"],
-                "score": int(item.get("routeScore", 0)),
-                "stars": (
-                    "★★★★★" if int(item.get("routeScore", 0)) >= 85
-                    else "★★★☆☆" if int(item.get("routeScore", 0)) >= 55
-                    else "☆☆☆☆☆"
+            passed_item = item["status"] == "PASS"
+            session_return_probes.append({
+                "city": CAPITALS[item["requestedRegion"]],
+                "host": report["entry"]["masked"], "ip": report["entry"]["masked"],
+                "route": "同一 Mieru TCP／NAT 会话返回",
+                "evidence": (
+                    "入口业务端口终点响应已返回该中国探针；证明同一 TCP/NAT 会话双向闭环，"
+                    "不代表已观察隐藏专线内段每一跳"
+                    if passed_item else
+                    "该探针未确认入口终点响应，不能据此确认对应会话返回"
                 ),
+                "score": 100 if passed_item else 0,
+                "stars": "★★★★★" if passed_item else "☆☆☆☆☆",
                 "avg": latency.get("avg"), "min": None, "max": None,
                 "p95": latency.get("p95"), "jitter": latency.get("jitter"),
                 "stddev": None, "loss": None,
-                "success": "1/1" if item["status"] == "PASS" else "0/1",
-                "routeHops": item["routeHops"], "timeoutHops": 0,
-                "backboneTags": item.get("backboneTags", []),
-                "routeNote": item.get("routeNote", ""),
-                "probeCapital": item["capital"],
-                "routeRank": int(item.get("routeRank", 0)),
-                "transport": item.get("transport", ""),
+                "success": "1/1" if passed_item else "0/1",
+                "routeHops": len(item.get("route", "").splitlines()), "timeoutHops": 0,
+                "backboneTags": ["TCP／NAT 会话闭环", "隐藏专线内段"],
+                "routeNote": "专线会话返回证据；日本出口主动回国路由另列为公网参考且不计分。",
+                "probeCapital": CAPITALS[item["requestedRegion"]],
+                "routeRank": 0,
+                "transport": "SAME_TCP_SESSION",
                 "reachability": item["status"],
             })
-        overall_score = round(score * 0.3 + return_score * 0.7)
+        overall_score = score
         carriers.append({
             "id": carrier, "name": carrier_names[carrier],
-            "route": "日本出口 → 北上广／六地运营商公网目标",
+            "route": "中国三网 ↔ 上海入口 ↔ 日本 Mita（同一 Mieru TCP／NAT 会话）",
             "score": overall_score,
             "stars": "★★★★★" if overall_score >= 80 else "★★★☆☆",
-            "probeCount": len(return_probes),
-            "routeTypes": len({x["routeClass"] for x in return_items}),
+            "probeCount": len(session_return_probes),
+            "routeTypes": 1,
             "forward": summary,
             "forwardRoute": "Mieru TCP 上海入口接入",
             "forwardProbes": flat, "forwardScore": score,
-            "returnScore": return_score,
-            "returnValid": f"{len(return_valid)}/{len(return_items)}",
-            "returnReachable": f"{len(return_passed)}/{len(return_items)}",
-            "bidirectional": False,
-            "probes": return_probes,
+            "returnScore": score,
+            "returnValid": f"{len(passed)}/{len(items)}",
+            "returnReachable": f"{len(passed)}/{len(items)}",
+            "bidirectional": report["sessionReturn"]["status"] == "PASS",
+            "scoreBasis": "SAME_TCP_SESSION",
+            "publicReferenceScore": public_reference_score,
+            "publicReferenceValid": f"{len(return_valid)}/{len(return_items)}",
+            "publicReferenceReachable": f"{len(return_passed)}/{len(return_items)}",
+            "publicReferenceCounted": False,
+            "probes": session_return_probes,
         })
     final_score = round(statistics.mean(x["score"] for x in carriers))
     return {
         "version": report["version"], "generated": report["generated"],
         "target": report["entry"]["masked"], "targetPort": report["entry"]["port"],
         "returnSshHost": report["exitIdentity"]["ipMasked"],
-        "selfTest": False, "mode": "沪日专线 Mieru 四层验证",
-        "matrix": report["matrix"] + "（北上广固定三网去程＋日本出口回程）",
+        "selfTest": False, "mode": "沪日专线 Mieru 会话闭环验证",
+        "matrix": report["matrix"] + "（同一 TCP/NAT 会话返回；日本公网回国另列参考）",
         "methodology": report["methodology"],
         "bgp": {
             "asn": report["exitIdentity"].get("asn") or "N/A",
@@ -1206,8 +1261,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "score": final_score,
             "stars": "★★★★★" if final_score >= 80 else "★★★☆☆",
             "title": (
-                f"Mieru 映射链 {report['mappingChain']['status']}｜"
-                "分数含回程骨干证据，不以 traceroute 可达直接计 100"
+                f"Mieru 会话返回 {report['sessionReturn']['status']}｜"
+                "评分仅按入口接入与同会话闭环；日本公网回国参考不计分"
             ),
             "elapsed": "N/A",
         },
@@ -1219,10 +1274,12 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "exit": report["exitIdentity"]["ipMasked"],
             "exitAsn": report["exitIdentity"].get("asn") or "N/A",
             "portStatus": report["mappingChain"]["status"],
+            "sessionReturn": report["sessionReturn"],
             "internalVerdict": (
                 f"Mita {report['mieruService']['status']}；"
                 f"真实握手 {report['protocolHandshake']['status']}；"
-                "未知私网对端不误算丢包"
+                f"同会话返回 {report['sessionReturn']['status']}；"
+                "日本公网回国不冒充专线回程"
             ),
         },
         "ixData": {
@@ -1237,7 +1294,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "ntp": report["mieruService"]["ntp"],
             },
             "protocolHandshake": report["protocolHandshake"],
-            "returns": [{
+            "sessionReturn": report["sessionReturn"],
+            "publicReturnReferences": [{
                 "carrier": x["carrier"], "capital": x["capital"],
                 "host": x["host"], "status": x["status"],
                 "routeClass": x["routeClass"], "routeHops": x["routeHops"],
@@ -1247,6 +1305,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "backboneTags": x.get("backboneTags", []),
                 "routeNote": x.get("routeNote", ""),
                 "latency": x["latency"],
+                "referenceOnly": True,
+                "countedInDedicatedScore": False,
             } for x in report["returns"]],
             "internal": {
                 "status": report["internal"]["status"],
@@ -1264,7 +1324,7 @@ def publish(report: dict[str, Any]) -> str:
         if forward_count not in {3, 6} or return_count not in {3, 6}:
             field(
                 "Chain 3Net",
-                f"上传前校验失败｜{carrier['id']} 去程 {forward_count}／回程 {return_count}，必须为 3 或 6",
+                f"上传前校验失败｜{carrier['id']} 入口接入 {forward_count}／同会话返回 {return_count}，必须为 3 或 6",
                 RED,
             )
             return ""
@@ -1297,7 +1357,7 @@ def main() -> int:
     if SELF_TEST and not client_verified_exit:
         client_verified_exit = "87.86.87.231"
     print(BLUE + "\n  ═══════════════════════════════════════════════════════════════" + RESET)
-    print(CYAN + f"  IX-ROUTE {VERSION} · 沪日专线／Mieru 双程四层验证" + RESET)
+    print(CYAN + f"  IX-ROUTE {VERSION} · 沪日专线／Mieru 会话闭环验证" + RESET)
     print(BLUE + "  ═══════════════════════════════════════════════════════════════" + RESET)
 
     section("TOPOLOGY / 检测拓扑", CYAN)
@@ -1306,7 +1366,7 @@ def main() -> int:
     field("日本预期出口", mask_ip(expected_exit), GREEN)
     field("日本端内网", mask_ip(local_private), CYAN)
     field("上海内网对端", mask_ip(remote_peer), MAGENTA)
-    field("测试边界", "入口接入、映射链、Mieru 服务／握手、日本出口；纯内段为附加项", YELLOW)
+    field("测试边界", "入口接入、同会话返回、映射链、Mieru 握手、日本出口；公网回国仅参考", YELLOW)
 
     identity = (
         {"ip": "87.86.87.231", "asn": "AS9999", "org": "SELF-TEST JP", "country": "Japan", "city": "Tokyo"}
@@ -1339,9 +1399,9 @@ def main() -> int:
             "reason": f"本机实际 {mask_ip(identity['ip'])}，与预期 {mask_ip(expected_exit)} 不一致",
         }
 
-    section("LAYER 1 / 中国三网到上海入口", CYAN)
+    section("LAYER 1 / 中国三网到上海入口（公网接入段）", CYAN)
     regions = FULL_REGIONS if FULL else CORE_REGIONS
-    field("模式", "完整六地区 × 三网双程" if FULL else "北上广固定三地区 × 三网双程")
+    field("模式", "完整六地区 × 三网接入＋会话返回" if FULL else "北上广固定三地区 × 三网接入＋会话返回")
     field("业务丢包口径", "TCP traceroute 只判到达／未确认；中间跳点不回不算 LOSS", YELLOW)
     probes: list[dict[str, Any]] = []
     total = len(regions) * len(CARRIERS)
@@ -1360,8 +1420,8 @@ def main() -> int:
             result_color = GREEN if item["status"] == "PASS" else YELLOW
             field("结果", f"{item['status']}｜终点 {'到达' if item['targetReached'] else '未确认'}｜RTT {shown_rtt}", result_color)
 
-    section("LAYER 1B / 日本出口到北上广三网回程", CYAN)
-    field("回程口径", "日本出口 → 各省会运营商公网目标；TCP traceroute 可见路由，不把跳点沉默算丢包", YELLOW)
+    section("REFERENCE / 日本出口公网回国参考", CYAN)
+    field("参考边界", "日本出口 → 中国三网公网目标；这是 BGP 公网参考，不是专线会话回程，不计专线评分", YELLOW)
     returns: list[dict[str, Any]] = []
     return_index = 0
     for region, _ in regions:
@@ -1422,6 +1482,12 @@ def main() -> int:
         chain,
     )
     field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
+    session_return = session_return_verdict(handshake, chain, listener, local_status)
+    field(
+        "专线会话返回",
+        f"{session_return['status']}｜{session_return['evidenceLevel']}｜{session_return['reason']}",
+        GREEN if session_return["status"] == "PASS" else YELLOW,
+    )
 
     section("LAYER 4 / 日本出口公网", GREEN)
     field("实际公网出口", mask_ip(identity.get("ip", "")), GREEN)
@@ -1434,7 +1500,11 @@ def main() -> int:
         "version": VERSION,
         "generated": generated.isoformat(timespec="seconds"),
         "mode": "HURI_MIERU_DEDICATED_LINE_FOUR_LAYER",
-        "matrix": "六地区 × 三网双程（36组）" if FULL else "北上广 × 三网双程（18组）",
+        "matrix": (
+            "六地区 × 三网接入 18 组＋同会话返回验证＋公网回国参考 18 组"
+            if FULL else
+            "北上广 × 三网接入 9 组＋同会话返回验证＋公网回国参考 9 组"
+        ),
         "entry": {"masked": mask_ip(entry), "port": port},
         "exitIdentity": {**identity, "ipMasked": mask_ip(identity.get("ip", ""))},
         "exitMatch": exit_match,
@@ -1449,15 +1519,21 @@ def main() -> int:
         "probes": probes,
         "returns": returns,
         "protocolHandshake": handshake,
+        "sessionReturn": session_return,
         "clientVerifiedExit": mask_ip(client_verified_exit),
         "methodology": (
             "中国侧不再随机扫描整座城市，也不把骨干 ASN 当成唯一探针 ASN；"
             "每组先以省会＋运营商名称／省级接入 ASN 定向查找 Globalping 探针，"
             "省会无探针时才退到同省其他城市，实际城市、ASN 与退选原因完整列示，绝不跨省替代。"
             "北京、上海、广州固定列入，--full 再扩展合肥、南京与杭州。"
-            "日本出口对相同地区的三网公网目标同时执行 TCP/443、ICMP、UDP traceroute，"
+            "专线返回方向不再用日本主机主动访问中国公网目标代替；"
+            "只有同一 Mieru TCP 会话完成上海入口映射、日本 Mita 响应及客户端出口核对时，"
+            "才把返回方向判为 PASS。该闭环依赖 NAT 会话状态，能确认端到端双向返回，"
+            "但不冒充已观察隐藏专线内段每一跳。"
+            "日本出口对相同地区的三网公网目标执行 TCP/443、ICMP、UDP traceroute，"
             "先选择 CN2／AS9929／CMIN2 等骨干证据等级最高的结果，等级相同才比较回覆跳数；"
-            "回程分数来自骨干等级与证据覆盖，不再把“有跳点回应”直接计为 100 分。"
+            "这些数据明确标为日本 BGP 公网回国参考，不代表 Mieru 专线会话回程，"
+            "也不参与专线评分。"
             "不把中间跳点沉默当作业务丢包。"
             "日本出口本机核对公网 IP、业务监听、本机内网地址、"
             "默认路由及到上海入口的路由；入口可达且日本端同端口监听、私网地址吻合时，"
@@ -1485,6 +1561,20 @@ def main() -> int:
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(markdown_report(report), encoding="utf-8")
     write_html(report, html_path)
+    if SELF_TEST:
+        preview_payload = public_report_payload(report)
+        assert session_return["status"] == "PASS"
+        assert all(
+            item["score"] == item["forwardScore"] == item["returnScore"]
+            and item["bidirectional"]
+            and item["publicReferenceCounted"] is False
+            for item in preview_payload["carriers"]
+        )
+        assert preview_payload["ixData"]["sessionReturn"]["status"] == "PASS"
+        assert all(
+            item["referenceOnly"] and item["countedInDedicatedScore"] is False
+            for item in preview_payload["ixData"]["publicReturnReferences"]
+        )
     public_url = "" if SELF_TEST or NO_PUBLISH else publish(report)
 
     section("FINAL / 四层独立结论", CYAN)
@@ -1493,14 +1583,19 @@ def main() -> int:
     return_valid = sum(int(x.get("routeRank", 0)) > 0 for x in returns)
     return_premium = sum(int(x.get("routeRank", 0)) == 5 for x in returns)
     field(
-        "北上广／六地回程",
+        "公网回国参考",
         (
             f"可达 {return_pass}/{len(returns)}｜骨干有效 {return_valid}/{len(returns)}｜"
-            f"精品证据 {return_premium}/{len(returns)}｜可达不直接计 100 分"
+            f"精品证据 {return_premium}/{len(returns)}｜不代表专线会话回程、不计专线评分"
         ),
         GREEN if return_valid else YELLOW,
     )
-    field("上海→日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
+    field("上海↔日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
+    field(
+        "专线会话返回",
+        f"{session_return['status']}｜{session_return['evidenceLevel']}｜{session_return['reason']}",
+        GREEN if session_return["status"] == "PASS" else YELLOW,
+    )
     field("专线纯内段附加项", quality_label(internal), GREEN if internal["status"] == "PASS" else YELLOW)
     field("Mieru／Mita 服务", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)
     field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
@@ -1511,7 +1606,7 @@ def main() -> int:
     field("Chain 3Net 公共页", public_url or ("已禁用" if NO_PUBLISH else "N/A｜本地报告已保留"), GREEN if public_url else YELLOW)
     field("重要说明", "IX-style 不等于证明经过某个 IXP；本工具用于专线／隐藏内段分层验证", MAGENTA)
     if SELF_TEST:
-        field("SELF-TEST", "PASS｜交互隔离、N/A 逻辑、报告生成均正常", GREEN)
+        field("SELF-TEST", "PASS｜会话回程与公网参考分离、评分排除、公报字段及报告生成均正常", GREEN)
     return 0
 
 
