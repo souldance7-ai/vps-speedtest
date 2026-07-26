@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC1"
+VERSION="v0.10 RC1"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,7 +14,7 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.9 RC1
+沪日专线／IX-style 四层质量检测 v0.10 RC1
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -108,7 +108,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.9 RC1")
+VERSION = os.environ.get("IX_VERSION", "v0.10 RC1")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -201,21 +201,22 @@ CITY_CANDIDATES = {
     ],
 }
 CARRIER_SELECTORS = {
-    "CT": ["China Telecom", "AS4134"],
-    "CU": ["China Unicom", "AS4837"],
-    "CM": ["China Mobile", "AS9808"],
+    "CT": ["China Telecom", "AS4134", "AS4812", "AS4816"],
+    "CU": ["China Unicom", "AS4837", "AS4808", "AS17816"],
+    "CM": ["China Mobile", "AS9808", "AS24445", "AS56040"],
 }
 CARRIER_ASNS = {
     # Globalping 探针可能挂在省网、接入网或运营商 IDC ASN，而不是骨干主 ASN。
     # 只收录可明确归属三大运营商的 ASN；第三方机房仍只能记 REFERENCE。
-    "CT": {4134, 4809, 4812, 17638, 17799, 23724, 134768},
+    "CT": {4134, 4809, 4812, 4816, 17638, 17799, 23724, 134768},
     "CU": {
         4837, 4808, 17620, 17621, 17622, 17623, 17773, 17788, 17789,
         17816, 134542,
     },
     "CM": {
-        9808, 24400, 24444, 24547, 56040, 56041, 56042, 56043, 56044,
-        56045, 56046, 56047, 56048, 58453,
+        9808, 24400, 24444, 24445, 24547, 56040, 56041, 56042, 56043,
+        56044, 56045, 56046, 56047, 56048, 56049, 56050, 56051, 56052,
+        56053, 56054, 56055, 56056, 56057, 56058, 58453,
     },
 }
 CARRIER_NAME_RE = {
@@ -1036,6 +1037,45 @@ def same_probe_tcp_check(entry: str, port: int, measurement_id: str) -> dict[str
         }
 
 
+def forward_sample_status(
+    *,
+    reached: bool,
+    city_verified: bool,
+    selection_province_verified: bool,
+    province_verified: bool,
+    asn_verified: bool,
+    is_cross_province: bool,
+    is_reference: bool,
+) -> tuple[str, bool, str]:
+    """Separate endpoint/carrier reachability from requested-region fidelity.
+
+    A same-carrier probe in another province can prove that carrier reaches the
+    business endpoint, but it cannot represent the requested province.  Keep
+    both facts instead of turning a successful TCP test into a zero-score
+    REFERENCE or pretending it was an exact regional sample.
+    """
+    carrier_reachable = bool(
+        reached
+        and city_verified
+        and selection_province_verified
+        and asn_verified
+    )
+    if (
+        carrier_reachable
+        and province_verified
+        and not is_cross_province
+        and not is_reference
+    ):
+        return "PASS", True, "REGION_EXACT"
+    if is_cross_province:
+        if carrier_reachable:
+            return "PASS_FALLBACK", True, "CROSS_PROVINCE_FALLBACK"
+        return "INCONCLUSIVE", False, "CROSS_PROVINCE_UNVERIFIED"
+    if reached and city_verified and selection_province_verified and is_reference:
+        return "REFERENCE", False, "PROVINCE_GENERIC_REFERENCE"
+    return "INCONCLUSIVE", False, "UNVERIFIED"
+
+
 def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str) -> dict[str, Any]:
     name, asn, _ = CARRIERS[carrier]
     # v0.9 uses Globalping state → explicit city map → unique coordinates. Overlapping
@@ -1192,9 +1232,11 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             is_reference = (
                 selection_tier.endswith("_REFERENCE") or is_cross_province
             )
-            carrier_representative = bool(asn_verified and not is_reference)
+            carrier_representative = bool(
+                asn_verified and province_verified and not is_reference
+            )
             source_class = (
-                "CROSS_PROVINCE_CARRIER_REFERENCE"
+                "CROSS_PROVINCE_CARRIER_FALLBACK"
                 if is_cross_province
                 else
                 "GENERIC_DATACENTER_REFERENCE"
@@ -1205,12 +1247,14 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 if selection_tier.endswith("_EYEBALL")
                 else "CARRIER_NETWORK"
             )
-            status = (
-                "REFERENCE"
-                if reached and city_verified and selection_province_verified and is_reference
-                else "PASS"
-                if reached and city_verified and province_verified and carrier_representative
-                else "INCONCLUSIVE"
+            status, carrier_reachability_verified, region_fidelity = forward_sample_status(
+                reached=reached,
+                city_verified=city_verified,
+                selection_province_verified=selection_province_verified,
+                province_verified=province_verified,
+                asn_verified=asn_verified,
+                is_cross_province=is_cross_province,
+                is_reference=is_reference,
             )
             reasons: list[str] = []
             if not city_verified:
@@ -1222,7 +1266,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                     f"省份核对失败：选点期望 {selection_region}，实际 "
                     f"{actual_probe_region or '无法确认'}（{province_match_method}）"
                 )
-            if not asn_verified and not is_reference:
+            if not asn_verified and (not is_reference or is_cross_province):
                 reasons.append(
                     f"运营商核对失败：预期 {name}，实际 AS{source_asn or 'N/A'}"
                     f" {actual_network or '未知网络'}"
@@ -1231,7 +1275,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 reasons.append(
                     f"{region}本省未取得{name}有效探针；最后降级到"
                     f"{selection_region} {requested_city} 的同运营商测点；"
-                    f"仅作跨省运营商参考，不代表{region}{name}"
+                    f"业务端口到达计入{name}可达，但不计入{region}地区精准覆盖"
                 )
             elif is_reference:
                 reasons.append(
@@ -1276,6 +1320,8 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 "sourceClass": source_class,
                 "inventoryPrechecked": inventory_used,
                 "carrierRepresentative": carrier_representative,
+                "carrierReachabilityVerified": carrier_reachability_verified,
+                "regionFidelity": region_fidelity,
                 "carrierIdentityVerified": asn_verified,
                 "asnVerified": asn_verified,
                 "cityVerified": city_verified,
@@ -1295,7 +1341,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             if status == "REFERENCE" and not is_cross_province:
                 same_province_reference = candidate_result
             candidate_rank = (
-                30 if status == "REFERENCE" and is_cross_province
+                30 if status == "PASS_FALLBACK"
                 else 20 if status == "REFERENCE"
                 else 10 if asn_verified and selection_province_verified
                 else 0
@@ -1322,7 +1368,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
     if best_result is not None:
         best_result.pop("_selectionRank", None)
         if (
-            best_result.get("sourceClass") == "CROSS_PROVINCE_CARRIER_REFERENCE"
+            best_result.get("sourceClass") == "CROSS_PROVINCE_CARRIER_FALLBACK"
             and same_province_reference is not None
         ):
             best_result["sameProvinceReference"] = {
@@ -1355,6 +1401,8 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
         "sourceClass": "NONE",
         "inventoryPrechecked": inventory_used,
         "carrierRepresentative": False,
+        "carrierReachabilityVerified": False,
+        "regionFidelity": "UNAVAILABLE",
         "carrierIdentityVerified": False,
         "asnVerified": False,
         "cityVerified": False,
@@ -1410,6 +1458,8 @@ def self_test_probe(carrier: str, region: str, city: str, index: int) -> dict[st
         ),
         "sourceClass": "CARRIER_EYEBALL",
         "carrierRepresentative": True,
+        "carrierReachabilityVerified": reached,
+        "regionFidelity": "REGION_EXACT" if reached else "UNVERIFIED",
         "carrierIdentityVerified": True,
         "asnVerified": True,
         "cityVerified": True,
@@ -1512,6 +1562,23 @@ def selection_self_test() -> None:
             "longitude": 118.79,
         })[0] != "江苏":
             raise AssertionError("南京行政区判定错误")
+        if 4816 not in CARRIER_ASNS["CT"]:
+            raise AssertionError("电信省网 ASN 家族缺少 AS4816")
+        if not {24445, *range(56049, 56059)}.issubset(CARRIER_ASNS["CM"]):
+            raise AssertionError("移动省网 ASN 家族不完整")
+        fallback_status = forward_sample_status(
+            reached=True,
+            city_verified=True,
+            selection_province_verified=True,
+            province_verified=False,
+            asn_verified=True,
+            is_cross_province=True,
+            is_reference=True,
+        )
+        if fallback_status != (
+            "PASS_FALLBACK", True, "CROSS_PROVINCE_FALLBACK"
+        ):
+            raise AssertionError("跨省同运营商到达未与地区精准度分离")
     finally:
         PROBE_INVENTORY = saved_inventory
         PROBE_INVENTORY_ERROR = saved_error
@@ -1746,11 +1813,12 @@ def markdown_report(report: dict[str, Any]) -> str:
         "## 结论",
         "",
         (
-            f"- 上海入口端到端 TCP：{access['status']}（运营商精确 "
-            f"{access['pass']}/{access['total']}，省级可达 "
+            f"- 上海入口端到端 TCP：{access['status']}（运营商可达 "
+            f"{access.get('carrierReachable', access['pass'])}/{access['total']}，"
+            f"原省精确 {access['pass']}/{access['total']}，省级可达 "
             f"{access.get('reachable', access['pass'])}/{access['total']}，"
             f"省内第三方机房参考 {access.get('provinceReference', 0)}，"
-            f"跨省同运营商参考 {access.get('crossProvinceReference', 0)}，"
+            f"跨省同运营商降级 {access.get('crossProvinceFallback', 0)}，"
             f"INCONCLUSIVE {access['inconclusive']}，"
             f"NO_PROBE {access.get('noProbe', 0)}，N/A {access['na']}）"
         ),
@@ -1783,7 +1851,7 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"{item.get('probeRegion') or 'N/A'}／{item.get('probeCity') or 'N/A'} | "
             f"{item.get('sourceClass') or 'N/A'} | "
             f"{item.get('selectionTier') or 'N/A'} | "
-            f"{'本省运营商有效' if item.get('carrierRepresentative') else '跨省同运营商参考' if item.get('sourceClass') == 'CROSS_PROVINCE_CARRIER_REFERENCE' else '省内第三方参考'} | "
+            f"{'本省运营商有效' if item.get('carrierRepresentative') else '跨省同运营商可达／非原省代表' if item.get('sourceClass') == 'CROSS_PROVINCE_CARRIER_FALLBACK' else '省内第三方参考'} | "
             f"{'到达' if item.get('targetReached') else '未确认'} | {rtt} | {item['status']} |"
         )
     lines.extend([
@@ -1834,7 +1902,7 @@ def write_html(report: dict[str, Any], path: Path) -> None:
 main{{max-width:1280px;margin:auto;padding:28px}}header,.panel{{background:rgba(13,27,45,.94);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px #0006}}
 header{{padding:25px;margin-bottom:18px}}h1{{margin:0;color:var(--cyan);letter-spacing:.06em}}.sub{{color:var(--muted);margin-top:7px}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
 .card{{padding:15px;border-radius:10px;background:#091827;border:1px solid var(--line)}}.card span{{display:block;color:var(--muted)}}.card strong{{display:block;margin-top:8px;font-size:18px}}
-.PASS{{color:var(--green)}}.FAIL{{color:var(--red)}}.N\\/A,.NO_PROBE,.INCONCLUSIVE,.PARTIAL,.REFERENCE{{color:var(--yellow)}}.panel{{padding:20px;margin:16px 0}}h2{{font-size:16px;color:var(--cyan);margin:0 0 14px}}
+.PASS,.PASS_FALLBACK{{color:var(--green)}}.FAIL{{color:var(--red)}}.N\\/A,.NO_PROBE,.INCONCLUSIVE,.PARTIAL,.REFERENCE{{color:var(--yellow)}}.panel{{padding:20px;margin:16px 0}}h2{{font-size:16px;color:var(--cyan);margin:0 0 14px}}
 .topology{{display:flex;align-items:center;gap:8px;overflow:auto;padding:6px 0}}.node{{min-width:180px;background:#091827;border:1px solid #2e5576;border-radius:10px;padding:13px;text-align:center}}.arrow{{color:var(--yellow);font-size:20px}}
 table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}}th{{color:var(--muted)}}code{{color:#a9efff}}button{{background:#0e7490;color:white;border:0;border-radius:8px;padding:9px 13px;cursor:pointer;margin-right:8px}}
 .note{{color:var(--muted)}}@media(max-width:850px){{.grid{{grid-template-columns:1fr 1fr}}main{{padding:14px}}}}@media print{{body{{background:white;color:#111}}header,.panel{{box-shadow:none;background:white}}}}
@@ -1844,7 +1912,7 @@ table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(-
 <section class="panel"><h2>TOPOLOGY / 实际业务拓扑</h2><div class="topology" id="topology"></div></section>
 <div class="grid" id="cards"></div>
 <section class="panel"><h2>MIERU / 日本端服务证据</h2><table id="mieru"></table></section>
-<section class="panel"><h2>FORWARD / 省级任务三网去程</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际省／城市</th><th>来源类型</th><th>选点层级</th><th>实际网络／ASN</th><th>代表性</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">省会无探针时先扫描同省全部在线城市；同省运营商机房／未分类运营商网络可作为运营商去程证据并明确标注非家宽。全省仍无指定运营商时，才使用跨省同运营商测点，并固定标为 CROSS_PROVINCE_REFERENCE，不计入原省 PASS 或省级可达率。NO_PROBE 不代表线路中断或 100% 丢包。</p></section>
+<section class="panel"><h2>FORWARD / 省级任务三网去程</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际省／城市</th><th>来源类型</th><th>选点层级</th><th>实际网络／ASN</th><th>代表性</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">省会无探针时先扫描同省全部在线城市；同省运营商机房／未分类运营商网络可作为运营商去程证据并明确标注非家宽。全省仍无指定运营商时，才使用跨省同运营商测点；终点到达标为 PASS_FALLBACK 并计入运营商可达，但不计入原省精准覆盖。NO_PROBE 不代表线路中断或 100% 丢包。</p></section>
 <section class="panel"><h2>RETURN / 日本出口至北上广固定三网回程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>目标</th><th>跳点</th><th>RTT</th><th>路由标签</th><th>骨干证据</th><th>状态</th></tr></thead><tbody id="returnRows"></tbody></table></div></section>
 <section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
 </main><script>
@@ -1859,13 +1927,13 @@ document.getElementById('topology').innerHTML=[
 `<div class="node">日本 Mita<br><code>${{E(R.localPrivate.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
 `<div class="node">日本出口<br><code>${{E(R.exitIdentity.ipMasked)}}</code></div>`].join('');
 document.getElementById('cards').innerHTML=[
-badge('上海入口接入',{{status:R.access.status,reason:`运营商精确 ${{R.access.pass}}/${{R.access.total}} · 省级可达 ${{R.access.reachable??R.access.pass}}/${{R.access.total}} · 跨省运营商参考 ${{R.access.crossProvinceReference??0}}`}}),
+badge('上海入口接入',{{status:R.access.status,reason:`运营商可达 ${{R.access.carrierReachable??R.access.pass}}/${{R.access.total}} · 原省精确 ${{R.access.pass}}/${{R.access.total}} · 跨省同运营商降级 ${{R.access.crossProvinceFallback??0}}`}}),
 badge('上海→日本映射链',R.mappingChain),badge('Mieru 真实握手',R.protocolHandshake),badge('日本出口一致性',R.exitMatch)].join('');
 const M=R.mieruService;
 document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="${{E(M.status)}}">${{E(M.status)}}</td><th>版本</th><td>${{E(M.version)}}</td></tr>
 <tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
 <tr><th>NTP</th><td>${{E(M.ntp)}}</td><th>端口监听</th><td class="${{E(R.listener.status)}}">${{E(R.listener.status)}} · ${{E(R.listener.evidence)}}</td></tr>`;
-document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.displayRegion||p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}${{p.sourceClass==='CROSS_PROVINCE_CARRIER_REFERENCE'?'<br><small>跨省最后备援</small>':p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{E(p.sourceClass||'N/A')}}</td><td>${{E(p.selectionTier||'N/A')}}</td><td>${{E(p.probeNetwork||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td>${{p.carrierRepresentative?'本省运营商有效':p.sourceClass==='CROSS_PROVINCE_CARRIER_REFERENCE'?'跨省同运营商参考':'省内第三方参考'}}</td><td>${{p.targetReached?'到达':'未确认'}}${{p.traceTargetReached===false&&p.targetReached?'<br><small>同探针 TCP 复核</small>':''}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
+document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.displayRegion||p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}${{p.sourceClass==='CROSS_PROVINCE_CARRIER_FALLBACK'?'<br><small>跨省最后备援</small>':p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{E(p.sourceClass||'N/A')}}</td><td>${{E(p.selectionTier||'N/A')}}</td><td>${{E(p.probeNetwork||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td>${{p.carrierRepresentative?'本省运营商有效':p.sourceClass==='CROSS_PROVINCE_CARRIER_FALLBACK'?'同运营商可达／非原省代表':'省内第三方参考'}}</td><td>${{p.targetReached?'到达':'未确认'}}${{p.traceTargetReached===false&&p.targetReached?'<br><small>同探针 TCP 复核</small>':''}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
 document.getElementById('returnRows').innerHTML=R.returns.map(p=>`<tr><td>${{E(p.capital)}}</td><td>${{E(p.carrierName)}}</td><td><code>${{E(p.host)}}</code><br><small>${{p.primaryHost&&p.host!==p.primaryHost?'省级动态备援':'固定主测点'}}</small></td><td>${{p.routeHops?E(p.routeHops):'N/A'}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td>${{E(p.routeClass)}}</td><td>${{E((p.backboneTags||[]).join(' → '))}}<br><small>${{E(p.routeNote)}}</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td></tr>`).join('');
 document.getElementById('method').textContent=R.methodology;
 document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='ix-route-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
@@ -1879,7 +1947,11 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     for carrier in ("CT", "CU", "CM"):
         items = [x for x in report["probes"] if x["carrier"] == carrier]
         passed = [x for x in items if x["status"] == "PASS"]
-        score = round(len(passed) * 100 / len(items)) if items else 0
+        fallback_passed = [x for x in items if x["status"] == "PASS_FALLBACK"]
+        carrier_reached = passed + fallback_passed
+        score = round(
+            (len(passed) * 100 + len(fallback_passed) * 70) / len(items)
+        ) if items else 0
         flat = []
         for item in items:
             latency = item.get("latency") or {}
@@ -1903,8 +1975,16 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                     f"TCP路由终点 {'到达' if item.get('traceTargetReached') else '未显示'}；"
                     f"{item.get('reason') or 'TCP traceroute 终点到达'}"
                 ),
-                "score": 100 if item["status"] == "PASS" else 0,
-                "stars": "★★★★★" if item["status"] == "PASS" else "☆☆☆☆☆",
+                "score": (
+                    100 if item["status"] == "PASS"
+                    else 70 if item["status"] == "PASS_FALLBACK"
+                    else 0
+                ),
+                "stars": (
+                    "★★★★★" if item["status"] == "PASS"
+                    else "★★★★☆" if item["status"] == "PASS_FALLBACK"
+                    else "☆☆☆☆☆"
+                ),
                 "avg": latency.get("avg"), "min": None, "max": None,
                 "p95": latency.get("p95"), "jitter": latency.get("jitter"),
                 "stddev": None, "loss": None,
@@ -1920,7 +2000,13 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                         else []
                     )
                 ),
-                "reachability": item["status"],
+                "reachability": (
+                    "PASS｜原省运营商探针到达"
+                    if item["status"] == "PASS"
+                    else "PASS_FALLBACK｜跨省同运营商探针到达，非原省代表"
+                    if item["status"] == "PASS_FALLBACK"
+                    else item["status"]
+                ),
             })
         summary = {
             "region": "入口接入汇总", "label": "中国三网 → 上海 Mieru 入口",
@@ -1932,14 +2018,23 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 for x in items
             ) if items else False,
             "route": "Mieru TCP 上海入口接入",
-            "evidence": f"PASS {len(passed)}/{len(items)}；仅为入口接入，不作为普通回程",
+            "evidence": (
+                f"运营商可达 {len(carrier_reached)}/{len(items)}；"
+                f"原省精确 {len(passed)}/{len(items)}；"
+                f"跨省同运营商降级 {len(fallback_passed)}；"
+                "仅为入口接入，不作为普通回程"
+            ),
             "score": score, "stars": "★★★★★" if score >= 80 else "★★★☆☆",
             "avg": round(statistics.mean(
-                x["latency"]["avg"] for x in passed if x.get("latency", {}).get("avg") is not None
-            ), 1) if any(x.get("latency", {}).get("avg") is not None for x in passed) else None,
+                x["latency"]["avg"] for x in carrier_reached
+                if x.get("latency", {}).get("avg") is not None
+            ), 1) if any(
+                x.get("latency", {}).get("avg") is not None
+                for x in carrier_reached
+            ) else None,
             "min": None, "max": None, "p95": None, "jitter": None,
             "stddev": None, "loss": None,
-            "success": f"{len(passed)}/{len(items)}", "routeHops": 0,
+            "success": f"{len(carrier_reached)}/{len(items)}", "routeHops": 0,
             "timeoutHops": 0, "backboneTags": ["Mieru TCP", "专线映射链"],
             "reachability": report["access"]["status"],
         }
@@ -2148,7 +2243,7 @@ def main() -> int:
             probes.append(item)
             latency = item.get("latency") or {}
             shown_rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
-            result_color = GREEN if item["status"] == "PASS" else YELLOW
+            result_color = GREEN if item["status"] in {"PASS", "PASS_FALLBACK"} else YELLOW
             field(
                 "结果",
                 (
@@ -2177,32 +2272,47 @@ def main() -> int:
     access = {
         "total": total,
         "pass": sum(x["status"] == "PASS" for x in probes),
+        "fallbackPass": sum(x["status"] == "PASS_FALLBACK" for x in probes),
         "inconclusive": sum(x["status"] == "INCONCLUSIVE" for x in probes),
         "reference": sum(x["status"] == "REFERENCE" for x in probes),
         "provinceReference": sum(
             x["status"] == "REFERENCE"
-            and x.get("sourceClass") != "CROSS_PROVINCE_CARRIER_REFERENCE"
             for x in probes
         ),
         "crossProvinceReference": sum(
-            x["status"] == "REFERENCE"
-            and x.get("sourceClass") == "CROSS_PROVINCE_CARRIER_REFERENCE"
+            x["status"] == "PASS_FALLBACK"
+            and x.get("sourceClass") == "CROSS_PROVINCE_CARRIER_FALLBACK"
             for x in probes
         ),
         "na": sum(x["status"] == "N/A" for x in probes),
         "noProbe": sum(x["status"] == "NO_PROBE" for x in probes),
     }
-    access["endpointReachable"] = access["pass"] + access["reference"]
+    access["crossProvinceFallback"] = access["fallbackPass"]
+    access["carrierReachable"] = access["pass"] + access["fallbackPass"]
+    access["endpointReachable"] = sum(
+        bool(x.get("targetReached")) for x in probes
+    )
     access["reachable"] = access["pass"] + access["provinceReference"]
     access["coverage"] = round(access["pass"] * 100 / total, 1) if total else 0.0
+    access["carrierCoverage"] = (
+        round(access["carrierReachable"] * 100 / total, 1) if total else 0.0
+    )
+    access["endpointCoverage"] = (
+        round(access["endpointReachable"] * 100 / total, 1) if total else 0.0
+    )
     access["provinceCoverage"] = (
         round(access["reachable"] * 100 / total, 1) if total else 0.0
     )
     access["status"] = (
-        "PASS" if access["pass"] / total >= 0.8
-        else "PARTIAL" if access["pass"] > 0
+        "PASS" if access["carrierReachable"] / total >= 0.8
+        else "PARTIAL" if access["carrierReachable"] > 0
         else "N/A" if access["na"] + access["noProbe"] == total
         else "INCONCLUSIVE"
+    )
+    access["regionStatus"] = (
+        "PASS" if access["pass"] / total >= 0.8
+        else "PARTIAL" if access["pass"] > 0
+        else "N/A"
     )
 
     section("LAYER 2 / 上海→日本映射链与可选纯内段", MAGENTA)
@@ -2265,7 +2375,7 @@ def main() -> int:
         "protocolHandshake": handshake,
         "clientVerifiedExit": mask_ip(client_verified_exit),
         "methodology": (
-            "中国侧使用 Globalping 指定中国电信 AS4134、联通 AS4837、移动 AS9808，"
+            "中国侧使用 Globalping 指定中国电信、联通、移动完整运营商 ASN 家族，"
             "对上海入口业务端口执行 TCP traceroute；北京、上海、广州固定列入，"
             "--full 再扩展合肥、南京与杭州。日本出口同时对相同城市的三网公网目标执行"
             "TCP traceroute，作为真实可见的回程证据；不把中间跳点沉默当作业务丢包。"
@@ -2281,8 +2391,8 @@ def main() -> int:
             "重叠经纬度矩形不得把徐州／南京等江苏城市误标为安徽。"
             "运营商数据中心／未分类网络必须通过 ASN 或网络名称核对，并明确标注非家宽；"
             "第三方省内数据中心只标 REFERENCE，不冒充三网。全省没有指定运营商探针时，"
-            "才按相邻优先顺序改用其他省份的同运营商探针，固定标为 CROSS_PROVINCE_REFERENCE，"
-            "不计入原省 PASS 或省级可达率。TCP traceroute 末跳沉默时，使用原 measurement ID "
+            "才按相邻优先顺序改用其他省份的同运营商探针；终点到达标为 PASS_FALLBACK，"
+            "计入运营商端口可达，但不计入原省精准覆盖。TCP traceroute 末跳沉默时，使用原 measurement ID "
             "锁定同一探针，对业务端口追加三次 TCP ping；端口有响应可确认去程可达，"
             "同时保留“完整末跳未显示”的事实。Globalping magic 请求的 limit 位于请求最外层；"
             "测量使用严格 country+city+ASN+tag 参数；只有确认所有合法候选均无在线探针才记 NO_PROBE，"
@@ -2317,10 +2427,10 @@ def main() -> int:
     field(
         "上海入口接入",
         (
-            f"{access['status']}｜运营商精确 {access['pass']}/{access['total']} "
-            f"({access['coverage']}%)｜省级可达 {access['reachable']}/{access['total']} "
-            f"({access['provinceCoverage']}%)｜省内第三方参考 {access['provinceReference']}｜"
-            f"跨省同运营商参考 {access['crossProvinceReference']}｜"
+            f"{access['status']}｜运营商可达 {access['carrierReachable']}/{access['total']} "
+            f"({access['carrierCoverage']}%)｜原省精确 {access['pass']}/{access['total']} "
+            f"({access['coverage']}%)｜省内第三方参考 {access['provinceReference']}｜"
+            f"跨省同运营商降级 {access['crossProvinceFallback']}｜"
             f"NO_PROBE {access['noProbe']}"
         ),
         GREEN if access["status"] == "PASS" else YELLOW,
