@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.4 CAPITAL-PROBE ROUTE-LABELS"
+VERSION="v0.9 RC4.2.5 CAPITAL-HEALTHCHECK MULTI-ASN"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.4 省会探针路由注释版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.5 省会测点健康检查版
 
 用法：
   bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh
@@ -17,7 +17,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   本脚本直接在出口 VPS 上运行，不使用 SSH 密码或私钥。
   目标 IP 示例：203.55.99.88
   业务端口示例：443（Trojan／AnyTLS 等协议实际监听端口，不是 SSH 22）
-  去程：中国电信 AS4134／联通 AS4837／移动 AS9808 六省会远端探针 → 国内入口。
+  去程：先扫描六省会在线探针，再按三网省级接入 ASN／运营商名称核对 → 国内入口。
   回程：当前出口 VPS → 北京市／上海市／广州市／合肥市／南京市／杭州市三网十八组目标。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
   traceroute 跳点不回应只计为“路由回覆率”，不会伪装成业务丢包。
@@ -97,7 +97,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.4 CAPITAL-PROBE ROUTE-LABELS")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.5 CAPITAL-HEALTHCHECK MULTI-ASN")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
@@ -155,6 +155,21 @@ FORWARD_REGIONS = [
     ("浙江", "Hangzhou"),
 ]
 FORWARD_ASN = {"CT": 4134, "CU": 4837, "CM": 9808}
+# 省会接入网不一定直接使用三大运营商的骨干 ASN。只锁 AS4134／AS4837／
+# AS9808 会漏掉上海联通 AS4808、广州联通 AS17622、北京移动 AS56048 等
+# 合法省网测点。下列 ASN 只用于确认“探针所属运营商”，线路等级仍由实际
+# traceroute 中的骨干 ASN／特征 IP 判定，不能拿接入 ASN 冒充精品骨干。
+FORWARD_ASN_FAMILIES = {
+    "CT": {4134, 4809, 4812, 4816, 23764},
+    "CU": {4837, 4808, 9929, 10099, 17622, 17623, 17816},
+    "CM": {9808, 24445, 56040, 56041, 56042, 56044, 56046, 56047,
+           56048, 56050, 56055, 56056, 56057, 56058},
+}
+FORWARD_NETWORK_HINTS = {
+    "CT": ("chinanet", "china telecom", "telecom"),
+    "CU": ("china unicom", "china169", "unicom"),
+    "CM": ("china mobile", "mobile communications", "mobile communica"),
+}
 CAPITALS = {
     "北京": "北京市",
     "上海": "上海市",
@@ -167,6 +182,18 @@ CAPITALS = {
 
 def normalize_city(value: str) -> str:
     return re.sub(r"[^a-z]", "", value.lower())
+
+
+def probe_matches_carrier(probe: dict[str, Any], carrier: str) -> bool:
+    try:
+        probe_asn = int(probe.get("asn") or 0)
+    except (TypeError, ValueError):
+        probe_asn = 0
+    network = str(probe.get("network") or "").lower()
+    return (
+        probe_asn in FORWARD_ASN_FAMILIES[carrier]
+        or any(hint in network for hint in FORWARD_NETWORK_HINTS[carrier])
+    )
 
 
 def backbone_labels(carrier: str, route_class: str, route: str) -> tuple[list[str], str]:
@@ -197,7 +224,9 @@ def backbone_labels(carrier: str, route_class: str, route: str) -> tuple[list[st
         tags = [f"未识别{carrier_text}骨干｜可见跳点证据不足"]
 
     joined = " → ".join(tags)
-    if "仅见" in route_class and "目的网" in route_class:
+    if "测点不可用" in route_class or "探针不可用" in route_class:
+        note = f"测点健康检查未通过；本组没有可判定的{carrier_text}路由，不参与评分。"
+    elif "仅见" in route_class and "目的网" in route_class:
         note = f"可见跳点只证明目的省会的{carrier_text}接入／交付网，未形成连续骨干证据，不能据此判定完整回程。"
     elif route_class.startswith("INCONCLUSIVE"):
         note = f"当前可见跳点未形成可复核的{carrier_text}骨干链路；保持证据不足，不按普通线或精品线扣分。"
@@ -574,117 +603,153 @@ def public_ip() -> tuple[str, str]:
     return "", "公网出口识别失败"
 
 
+GLOBALPING_CITY_CACHE: dict[tuple[str, int, str], tuple[list[dict[str, Any]], str]] = {}
+
+
+def globalping_city_results(target: str, port: int,
+                            probe_city: str) -> tuple[list[dict[str, Any]], str]:
+    """Run one city-wide measurement and reuse its results for all three carriers."""
+    cache_key = (target, port, probe_city)
+    if cache_key in GLOBALPING_CITY_CACHE:
+        return GLOBALPING_CITY_CACHE[cache_key]
+
+    # Globalping v1 requires limit at the request root. RC4.2.4 incorrectly put
+    # limit inside each locations object, which caused HTTP 422 before any probe
+    # was selected. Query the capital once, then verify city/carrier ourselves.
+    payload = {
+        "limit": 50,
+        "target": target,
+        "type": "traceroute",
+        "locations": [{"magic": probe_city}],
+        "measurementOptions": {"protocol": "TCP", "port": port},
+    }
+    try:
+        created = http_json(GLOBALPING_API, "POST", payload)
+        measurement_id = created.get("id")
+        if not measurement_id:
+            raise RuntimeError("Globalping 未返回 measurement id")
+        measurement = None
+        for _ in range(36):
+            time.sleep(0.8)
+            measurement = http_json(f"{GLOBALPING_API}/{measurement_id}")
+            if measurement.get("status") == "finished":
+                break
+            if measurement.get("status") not in ("in-progress", None):
+                raise RuntimeError(f"Globalping 状态 {measurement.get('status')}")
+        if not measurement or measurement.get("status") != "finished":
+            raise TimeoutError("等待省会远端结果超时")
+        entries = [
+            x for x in measurement.get("results", [])
+            if x.get("result", {}).get("status") == "finished"
+            and normalize_city(str(x.get("probe", {}).get("city") or ""))
+            == normalize_city(probe_city)
+        ]
+        summary = "、".join(
+            f"AS{x.get('probe', {}).get('asn', 0)} {x.get('probe', {}).get('network', '未知网络')}"
+            for x in entries
+        ) or "该省会当前无在线探针"
+        GLOBALPING_CITY_CACHE[cache_key] = (entries, summary)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        if exc.code == 422 and "no_probes_found" in detail:
+            message = "该省会当前无在线探针（Globalping no_probes_found）"
+        else:
+            message = f"Globalping HTTP {exc.code}｜{detail[:180]}"
+        GLOBALPING_CITY_CACHE[cache_key] = ([], message)
+    except Exception as exc:
+        GLOBALPING_CITY_CACHE[cache_key] = (
+            [], f"Globalping {type(exc).__name__}｜{exc}"
+        )
+    return GLOBALPING_CITY_CACHE[cache_key]
+
+
 def globalping_trace(target: str, port: int, carrier: str,
                      region: str, probe_city: str) -> dict[str, Any]:
-    asn = FORWARD_ASN[carrier]
-    errors: list[str] = []
-    # 只查指定省会，不允许全国探针代替省会样本。先用严格字段，
-    # 再用 Globalping 官方推荐的 magic 组合做同省会重试。
-    location_modes = [
-        (
-            f"{region}省会+ASN+家宽",
-            {"country": "CN", "city": probe_city, "asn": asn,
-             "tags": ["eyeball-network"], "limit": 1},
-        ),
-        (
-            f"{region}省会+ASN",
-            {"country": "CN", "city": probe_city, "asn": asn, "limit": 1},
-        ),
-        (
-            f"{region}省会+AS{asn} magic",
-            {"magic": f"{probe_city}+AS{asn}", "limit": 1},
-        ),
+    preferred_asn = FORWARD_ASN[carrier]
+    entries, availability = globalping_city_results(target, port, probe_city)
+    candidates = [
+        entry for entry in entries
+        if probe_matches_carrier(entry.get("probe", {}), carrier)
     ]
-    for mode, location in location_modes:
-        payload = {
-            "target": target,
-            "type": "traceroute",
-            "locations": [location],
-            "measurementOptions": {"protocol": "TCP", "port": port},
+    candidates.sort(key=lambda entry: (
+        int(entry.get("probe", {}).get("asn") or 0) != preferred_asn,
+        "eyeball-network" not in (entry.get("probe", {}).get("tags") or []),
+    ))
+    entry = candidates[0] if candidates else None
+    if not entry:
+        empty = stats([], 0, loss_valid=False, metric="TCP traceroute RTT（测点不可用）")
+        return {
+            "carrier": carrier, "region": region, "requestedCity": probe_city,
+            "access": f"{CAPITALS.get(region, region)}｜{CARRIER_NAME[carrier]}",
+            "probeHealth": "OFFLINE｜省会无该运营商在线测点",
+            "verified": False, "route": "", "class": "省会测点不可用", "rank": 0,
+            "evidence": (
+                f"已先扫描 {CAPITALS.get(region, region)} 全部在线探针；"
+                f"未找到{CARRIER_NAME[carrier]}接入网。当前可见：{availability}。"
+                "本组不跨省替代、不参与评分；可在 AntPing 路由追踪页面人工复核。"
+            ),
+            "targetReached": False,
+            "reachability": "INCONCLUSIVE｜省会无该运营商在线测点",
+            "stats": asdict(empty), "score": 0, "stars": "☆☆☆☆☆",
         }
-        try:
-            created = http_json(GLOBALPING_API, "POST", payload)
-            measurement_id = created.get("id")
-            if not measurement_id:
-                raise RuntimeError("未返回 measurement id")
-            measurement = None
-            for _ in range(30):
-                time.sleep(0.8)
-                measurement = http_json(f"{GLOBALPING_API}/{measurement_id}")
-                if measurement.get("status") == "finished":
-                    break
-                if measurement.get("status") != "in-progress":
-                    raise RuntimeError(f"状态 {measurement.get('status')}")
-            if not measurement or measurement.get("status") != "finished":
-                raise TimeoutError("等待远端结果超时")
-            entry = next((x for x in measurement.get("results", []) if x.get("result", {}).get("status") == "finished"), None)
-            if not entry:
-                raise RuntimeError("探针无有效 traceroute 结果")
-            probe = entry.get("probe", {})
-            route_lines: list[str] = []
-            last_timings: list[float] = []
-            target_timings: list[float] = []
-            target_reached = False
-            for index, hop in enumerate(entry.get("result", {}).get("hops", []), 1):
-                ip = str(hop.get("resolvedAddress") or "")
-                hostname = str(hop.get("resolvedHostname") or "")
-                timings = [float(x["rtt"]) for x in hop.get("timings", []) if x.get("rtt") is not None]
-                if timings:
-                    last_timings = timings
-                if ip == target:
-                    target_reached = True
-                    target_timings = timings
-                rtt_text = "  ".join(f"{x:.1f} ms" for x in timings) if timings else "*  *  *"
-                asn_text = origin_asn(ip)
-                identity = " ".join(x for x in (ip, asn_text, hostname) if x)
-                route_lines.append(f"{index:2d}  {identity:<42} {rtt_text}")
-            route = "\n".join(route_lines) or str(entry.get("result", {}).get("rawOutput", ""))
-            route = enrich_route(route)
-            route_class, rank, evidence = classify(carrier, route, "Forward")
-            source_asn = int(probe.get("asn") or 0)
-            access = f"{probe.get('city', '')}, {probe.get('country', '')}｜{probe.get('network', '')}｜AS{source_asn}"
-            route_timings = target_timings or last_timings
-            result_stats = stats(
-                route_timings, len(route_timings), loss_valid=False,
-                metric="TCP traceroute RTT（不作为业务丢包）"
-            )
-            value = score(rank, result_stats)
-            asn_verified = source_asn == asn
-            actual_city = str(probe.get("city") or "")
-            city_verified = normalize_city(actual_city) == normalize_city(probe_city)
-            verified = asn_verified and city_verified
-            if not city_verified:
-                evidence = (
-                    f"省会核对失败：请求 {CAPITALS.get(region, region)}（{probe_city}），"
-                    f"实际返回 {actual_city or '未知城市'} AS{source_asn}；"
-                    "该样本不纳入省会去程评分。"
-                ) + evidence
-            elif not asn_verified:
-                evidence = (
-                    f"运营商核对失败：省会城市正确，但实际 ASN 为 AS{source_asn}，"
-                    f"预期 AS{asn}；该样本不纳入评分。"
-                ) + evidence
-            if not verified:
-                value = max(0, value - 15)
-            return {
-                "carrier": carrier, "region": region,
-                "requestedCity": probe_city, "access": access,
-                "verified": verified, "route": route,
-                "class": route_class, "rank": rank, "evidence": evidence,
-                "targetReached": target_reached,
-                "reachability": "PASS｜外部 TCP traceroute 到达入口" if target_reached
-                                else "INCONCLUSIVE｜未显示终点，不等于端口关闭",
-                "stats": asdict(result_stats), "score": value, "stars": stars(value),
-            }
-        except Exception as exc:
-            errors.append(f"{mode}: {exc}")
-    empty = stats([], 0, loss_valid=False, metric="TCP traceroute RTT（探针不可用）")
+
+    probe = entry.get("probe", {})
+    route_lines: list[str] = []
+    last_timings: list[float] = []
+    target_timings: list[float] = []
+    target_reached = False
+    for index, hop in enumerate(entry.get("result", {}).get("hops", []), 1):
+        ip = str(hop.get("resolvedAddress") or "")
+        hostname = str(hop.get("resolvedHostname") or "")
+        timings = [
+            float(x["rtt"]) for x in hop.get("timings", [])
+            if x.get("rtt") is not None
+        ]
+        if timings:
+            last_timings = timings
+        if ip == target:
+            target_reached = True
+            target_timings = timings
+        rtt_text = "  ".join(f"{x:.1f} ms" for x in timings) if timings else "*  *  *"
+        asn_text = origin_asn(ip)
+        identity = " ".join(x for x in (ip, asn_text, hostname) if x)
+        route_lines.append(f"{index:2d}  {identity:<42} {rtt_text}")
+    route = "\n".join(route_lines) or str(entry.get("result", {}).get("rawOutput", ""))
+    route = enrich_route(route)
+    route_class, rank, evidence = classify(carrier, route, "Forward")
+    source_asn = int(probe.get("asn") or 0)
+    actual_city = str(probe.get("city") or "")
+    city_verified = normalize_city(actual_city) == normalize_city(probe_city)
+    carrier_verified = probe_matches_carrier(probe, carrier)
+    verified = city_verified and carrier_verified
+    access = (
+        f"{actual_city}, {probe.get('country', '')}｜"
+        f"{probe.get('network', '')}｜AS{source_asn}"
+    )
+    route_timings = target_timings or last_timings
+    result_stats = stats(
+        route_timings, len(route_timings), loss_valid=False,
+        metric="TCP traceroute RTT（不作为业务丢包）"
+    )
+    value = score(rank, result_stats) if verified else 0
+    health = (
+        f"ONLINE-EXACT｜AS{source_asn}"
+        if source_asn == preferred_asn
+        else f"ONLINE-FAMILY｜省网 AS{source_asn}"
+    )
+    if source_asn != preferred_asn:
+        evidence = (
+            f"省会测点健康检查通过：实际为{CARRIER_NAME[carrier]}省级接入网 AS{source_asn}，"
+            f"不是骨干过滤 ASN AS{preferred_asn}；线路等级仍依据 traceroute 判定。"
+        ) + evidence
     return {
         "carrier": carrier, "region": region, "requestedCity": probe_city,
-        "access": f"{region}远端 AS{asn}", "verified": False, "route": "",
-        "class": "远端探针不可用", "rank": 0, "evidence": "；".join(errors),
-        "targetReached": False, "reachability": "INCONCLUSIVE｜远端探针不可用",
-        "stats": asdict(empty), "score": 0, "stars": "☆☆☆☆☆",
+        "access": access, "probeHealth": health, "verified": verified,
+        "route": route, "class": route_class, "rank": rank,
+        "evidence": evidence, "targetReached": target_reached,
+        "reachability": "PASS｜外部 TCP traceroute 到达入口" if target_reached
+                        else "INCONCLUSIVE｜未显示终点，不等于端口关闭",
+        "stats": asdict(result_stats), "score": value, "stars": stars(value),
     }
 
 
@@ -694,6 +759,7 @@ def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
         result_stats = stats([], 0, loss_valid=False, metric="回程探针不可用（DNS／目标解析失败）")
         return {
             "carrier": carrier, "city": city, "host": host, "probeIp": "",
+            "probeHealth": "OFFLINE｜目标解析失败",
             "route": "", "routeHops": 0,
             "class": "回程探针不可用", "rank": 0,
             "evidence": "目标无法解析；本组不参与线路类型与综合分数判定",
@@ -702,17 +768,41 @@ def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
         }
 
     if shutil.which("traceroute"):
-        route = run(["traceroute", "-n", "-T", "-p", "80", "-q", "1", "-w", "1", "-m", "25", ip], 35)
+        # 目标可能不开放 TCP/80；依次尝试 TCP/443、ICMP、UDP，并采用
+        # 回覆跳点最多的一组。传输方式只影响可见度，不改变骨干分类规则。
+        route_candidates = [
+            (
+                "TCP/443",
+                run(["traceroute", "-n", "-T", "-p", "443", "-q", "1",
+                     "-w", "1", "-m", "25", ip], 35),
+            ),
+            (
+                "ICMP",
+                run(["traceroute", "-n", "-I", "-q", "1", "-w", "1",
+                     "-m", "25", ip], 35),
+            ),
+            (
+                "UDP",
+                run(["traceroute", "-n", "-q", "1", "-w", "1",
+                     "-m", "25", ip], 35),
+            ),
+        ]
+        probe_transport, route = max(
+            route_candidates, key=lambda candidate: route_hop_count(candidate[1])
+        )
     elif shutil.which("tracepath"):
         route = run(["tracepath", "-n", "-m", "25", ip], 35)
+        probe_transport = "TRACEPATH"
     else:
         route = "TRACEROUTE_UNAVAILABLE"
+        probe_transport = "UNAVAILABLE"
 
     hop_count = route_hop_count(route)
     if hop_count == 0:
         result_stats = stats([], 0, loss_valid=False, metric="回程 traceroute 无有效跳点")
         return {
             "carrier": carrier, "city": city, "host": host, "probeIp": ip,
+            "probeHealth": f"OFFLINE｜{probe_transport} 无回覆跳点",
             "route": route, "routeHops": 0,
             "class": "回程探针无有效路由", "rank": 0,
             "evidence": "traceroute 未取得任何有效回覆跳点；不等同 100% 业务丢包，本组不参与评分",
@@ -728,6 +818,7 @@ def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
     value = score(rank, result_stats)
     return {
         "carrier": carrier, "city": city, "host": host, "probeIp": ip,
+        "probeHealth": f"ONLINE｜{probe_transport}｜{hop_count} 跳回覆",
         "route": route, "routeHops": hop_count,
         "class": route_class, "rank": rank, "evidence": evidence,
         "reachability": f"PASS｜取得 {hop_count} 个有效回程跳点",
@@ -935,6 +1026,7 @@ def show_forward(item: dict[str, Any], index: int, total: int) -> None:
         color,
     )
     field("请求省会", f"{item.get('probeCapital', item.get('region', '中国'))}｜{item.get('requestedCity', '')}", color)
+    field("测点健康", item.get("probeHealth", "SELF-TEST｜离线样本"), GREEN if item.get("verified") else YELLOW)
     field("来源核对", ("PASS｜" if item["verified"] else "WARN｜") + item["access"], GREEN if item["verified"] else YELLOW)
     field("入口可达性", item.get("reachability", "INCONCLUSIVE"), GREEN if item.get("targetReached") else YELLOW)
     field("去程线路", item["class"], color)
@@ -954,6 +1046,7 @@ def show_return(item: dict[str, Any], index: int, total: int) -> None:
         color,
     )
     field("省会目标", f"{item.get('probeCapital', item['city'])}｜{item.get('probeIp') or item.get('host')}", color)
+    field("测点健康", item.get("probeHealth", "SELF-TEST｜离线样本"), GREEN if valid else YELLOW)
     field("回程线路", item["class"], color if valid else YELLOW)
     field("骨干标签", " → ".join(item.get("backboneTags", [])), color)
     field("中文路由注释", item.get("routeNote", ""), GRAY)
@@ -989,15 +1082,15 @@ document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
 document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
-document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六省会双程证据</h2><table><thead><tr><th>方向／省会</th><th>线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
+document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六省会双程证据</h2><table><thead><tr><th>方向／省会</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
   const tabs=':::: tabs\\n'+['CT','CU','CM'].map(c=>{{
     const g=R.grades.find(x=>x.carrier===c);
     const forwards=R.forward.filter(x=>x.carrier===c);
     const returns=R.returns.filter(x=>x.carrier===c);
-    const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
-    const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
+    const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
+    const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
     return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜去程有效 ${{g.forwardValid}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
@@ -1033,6 +1126,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "backboneTags": item.get("backboneTags", []),
             "routeNote": item.get("routeNote", ""),
             "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("region", ""), "")),
+            "probeHealth": item.get("probeHealth", ""),
             "reachability": item.get("reachability", "INCONCLUSIVE"),
         }
 
@@ -1061,6 +1155,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "backboneTags": item.get("backboneTags", []),
                 "routeNote": item.get("routeNote", ""),
                 "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("city", ""), "")),
+                "probeHealth": item.get("probeHealth", ""),
                 "reachability": item.get("reachability", "INCONCLUSIVE"),
             })
         forward_flat = {
@@ -1185,7 +1280,7 @@ def main() -> int:
     return_total = sum(len(items) for items in PROBES.values())
     banner("RETURN PROBE / 出口 VPS 原生三网十八组回程", CYAN)
     field("执行位置", mask_ip(exit_ip), GREEN)
-    field("执行方式", "六省会运营商目标 traceroute TCP/80；仅可见 ASN／特征 IP 判定骨干，目标端口不响应不计业务丢包", GRAY)
+    field("执行方式", "六省会目标依次尝试 TCP/443、ICMP、UDP，采用回覆跳点最多者；仅按可见 ASN／特征 IP 判定骨干", GRAY)
     returns: list[dict[str, Any]] = []
     index = 0
     for carrier in ("CT", "CU", "CM"):
@@ -1220,7 +1315,7 @@ def main() -> int:
         "selfTest": SELF_TEST,
         "target": {"host": mask_ip(target), "port": port, "role": "国内入口"},
         "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "出口 VPS 本机"},
-        "methodology": "Globalping 严格按北京市／上海市／广州市／合肥市／南京市／杭州市调用中国电信 AS4134／联通 AS4837／移动 AS9808 省会远端探针，对国内入口协议业务端口执行十八组 TCP traceroute；每组必须同时核对实际返回城市与 ASN，找不到省会探针即标记 INCONCLUSIVE，不允许全国或跨省探针代替。出口 VPS 本机对相同六省会三网十八组明确运营商 IP 执行原生 traceroute；DNS 失败或无有效跳点标记为 INCONCLUSIVE 并排除评分，不伪报 100% 业务丢包，Cymru DNS 补查可见 IP Origin ASN。NAT／端口映射隐藏的入口至出口专线内段单列为不可见，不强判线路等级。",
+        "methodology": "Globalping 先按北京市／上海市／广州市／合肥市／南京市／杭州市各执行一次城市级在线测点扫描（limit 位于 API 请求根节点），再从实际返回结果中按电信／联通／移动省级接入 ASN 家族及运营商名称选择对应探针；例如上海联通 AS4808、广州联通 AS17622、北京移动 AS56048 均可作为所属运营商省会探针，但线路等级仍只依据实际 traceroute 中的 AS4809／AS9929／AS58807 等骨干证据。找不到同省会同运营商测点即标记 INCONCLUSIVE，不允许跨省替代。出口 VPS 对六省会三网目标依次尝试 TCP/443、ICMP、UDP traceroute 并采用回覆跳点最多的一组；DNS 失败或无有效跳点排除评分，不伪报业务丢包。AntPing 仅作为人工交叉复核入口，不依赖其未公开网页接口，避免网站改版导致脚本失效。NAT／端口映射隐藏的专线内段单列为不可见，不强判线路等级。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
