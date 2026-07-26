@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.6 CARRIER-DIRECTED PROVINCE-FALLBACK"
+VERSION="v0.9 RC4.2.7 DYNAMIC-RETURN-POOL"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.6 运营商定向选点版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.7 动态回程测点池版
 
 用法：
   bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh
@@ -77,8 +77,10 @@ export THREE_NET_TARGET_PORT="$TARGET_PORT"
 python3 /dev/fd/3 3<<'PY'
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import html
+import io
 import ipaddress
 import json
 import math
@@ -97,12 +99,16 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.6 CARRIER-DIRECTED PROVINCE-FALLBACK")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.7 DYNAMIC-RETURN-POOL")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
+TCPQUALITY_NODES_API = os.environ.get(
+    "THREE_NET_RETURN_POOL",
+    "https://tcpquality.ibsgss.uk/getNodes?format=tsv&scope=cdn",
+).strip()
 WIDTH = min(max(shutil.get_terminal_size((112, 32)).columns, 92), 132)
 
 RESET = "\033[0m"
@@ -392,6 +398,13 @@ def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int =
 
 
 ASN_CACHE: dict[str, str] = {}
+
+
+def http_text(url: str, timeout: int = 25) -> str:
+    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.7", "Accept": "text/plain,*/*"}
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read().decode("utf-8-sig", "replace")
 
 
 def origin_asn(ip: str) -> str:
@@ -827,13 +840,122 @@ def globalping_trace(target: str, port: int, carrier: str,
     }
 
 
-def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
-    ip = resolve_ipv4(host)
+def static_return_probe_pool() -> dict[str, list[dict[str, Any]]]:
+    return {
+        carrier: [
+            {"city": city, "host": host, "ip": "", "port": 443,
+             "backupHost": "", "backupIp": "", "backupPort": 443,
+             "nodeSource": "STATIC_FALLBACK"}
+            for city, host in entries
+        ]
+        for carrier, entries in PROBES.items()
+    }
+
+
+def normalized_province(value: str) -> str:
+    text = str(value or "").strip()
+    aliases = {"北京市": "北京", "上海市": "上海", "广东省": "广东",
+               "安徽省": "安徽", "江苏省": "江苏", "浙江省": "浙江"}
+    return aliases.get(text, text.removesuffix("省").removesuffix("市"))
+
+
+def carrier_from_node_isp(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if "电信" in text or "telecom" in text or "chinanet" in text:
+        return "CT"
+    if "联通" in text or "unicom" in text or "china169" in text:
+        return "CU"
+    if "移动" in text or "mobile" in text or "cmnet" in text:
+        return "CM"
+    return ""
+
+
+def parse_port(value: Any, default: int = 443) -> int:
+    try:
+        port = int(str(value or "").strip())
+        return port if 1 <= port <= 65535 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def load_return_probe_pool() -> tuple[dict[str, list[dict[str, Any]]], str]:
+    """Load province/carrier nodes with real TCP ports; retain static fallbacks."""
+    pool = static_return_probe_pool()
+    if SELF_TEST:
+        return pool, "SELF-TEST｜静态离线样本"
+    try:
+        body = http_text(TCPQUALITY_NODES_API, timeout=20)
+        reader = csv.DictReader(io.StringIO(body), delimiter="\t")
+        candidates: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        wanted = {city for entries in PROBES.values() for city, _ in entries}
+        for row in reader:
+            if str(row.get("type") or "").strip().lower() != "cdn":
+                continue
+            if str(row.get("family") or "").strip() != "4":
+                continue
+            city = normalized_province(str(row.get("prov") or ""))
+            carrier = carrier_from_node_isp(str(row.get("isp") or ""))
+            fixed_ip = str(row.get("ip") or "").strip()
+            if city not in wanted or carrier not in PROBES or not valid_public_ipv4(fixed_ip):
+                continue
+            spec = {
+                "city": city, "host": str(row.get("host") or fixed_ip).strip(),
+                "ip": fixed_ip, "port": parse_port(row.get("port"), 80),
+                "backupHost": str(row.get("backup_host") or "").strip(),
+                "backupIp": str(row.get("backup_ip") or "").strip(),
+                "backupPort": parse_port(row.get("backup_port"), 80),
+                "nodeSource": "TcpQuality getNodes",
+            }
+            candidates.setdefault((carrier, city), []).append(spec)
+        dynamic_count = 0
+        missing: list[str] = []
+        for carrier, static_entries in PROBES.items():
+            resolved: list[dict[str, Any]] = []
+            for city, static_host in static_entries:
+                items = candidates.get((carrier, city), [])
+                if items:
+                    resolved.append(items[0])
+                    dynamic_count += 1
+                else:
+                    resolved.append({"city": city, "host": static_host, "ip": "", "port": 443,
+                                     "backupHost": "", "backupIp": "", "backupPort": 443,
+                                     "nodeSource": "STATIC_FALLBACK"})
+                    missing.append(f"{carrier}-{city}")
+            pool[carrier] = resolved
+        status = f"ONLINE｜动态节点 {dynamic_count}/18"
+        if missing:
+            status += f"｜静态回退 {len(missing)} 组"
+        return pool, status
+    except Exception as exc:
+        return pool, f"DEGRADED｜动态节点池不可用，18 组使用静态回退｜{type(exc).__name__}: {exc}"
+
+
+def return_probe(carrier: str, city: str, spec: dict[str, Any]) -> dict[str, Any]:
+    host = str(spec.get("host") or "")
+    fixed_ip = str(spec.get("ip") or "")
+    target_port = parse_port(spec.get("port"), 443)
+    backup_host = str(spec.get("backupHost") or "")
+    backup_ip = str(spec.get("backupIp") or "")
+    backup_port = parse_port(spec.get("backupPort"), target_port)
+    node_source = str(spec.get("nodeSource") or "STATIC_FALLBACK")
+    fallback_used = False
+    primary_ip = fixed_ip if valid_public_ipv4(fixed_ip) else resolve_ipv4(host)
+    selected_host, ip, selected_port = host, primary_ip, target_port
+    precheck = tcp_samples(ip, selected_port, count=2, timeout=2.5) if ip else []
+    if not precheck and (backup_host or valid_public_ipv4(backup_ip)):
+        candidate_ip = backup_ip if valid_public_ipv4(backup_ip) else resolve_ipv4(backup_host)
+        candidate_samples = tcp_samples(candidate_ip, backup_port, count=2, timeout=2.5) if candidate_ip else []
+        if candidate_samples:
+            selected_host = backup_host or candidate_ip
+            ip, selected_port, precheck = candidate_ip, backup_port, candidate_samples
+            fallback_used = True
     if not ip:
         result_stats = stats([], 0, loss_valid=False, metric="回程探针不可用（DNS／目标解析失败）")
         return {
             "carrier": carrier, "city": city, "host": host, "probeIp": "",
-            "probeHealth": "OFFLINE｜目标解析失败",
+            "targetPort": selected_port, "nodeSource": node_source,
+            "fallbackUsed": fallback_used,
+            "probeHealth": "OFFLINE｜主备目标均不可用",
             "route": "", "routeHops": 0,
             "class": "回程探针不可用", "rank": 0,
             "evidence": "目标无法解析；本组不参与线路类型与综合分数判定",
@@ -847,8 +969,8 @@ def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
         # 路由覆盖真正命中 CN2／AS9929／CMIN2 的结果。
         route_candidates = [
             (
-                "TCP/443",
-                run(["traceroute", "-n", "-T", "-p", "443", "-q", "1",
+                f"TCP/{selected_port}",
+                run(["traceroute", "-n", "-T", "-p", str(selected_port), "-q", "1",
                      "-w", "1", "-m", "25", ip], 35),
             ),
             (
@@ -890,7 +1012,9 @@ def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
     if hop_count == 0:
         result_stats = stats([], 0, loss_valid=False, metric="回程 traceroute 无有效跳点")
         return {
-            "carrier": carrier, "city": city, "host": host, "probeIp": ip,
+            "carrier": carrier, "city": city, "host": selected_host, "probeIp": ip,
+            "targetPort": selected_port, "nodeSource": node_source,
+            "fallbackUsed": fallback_used,
             "probeHealth": f"OFFLINE｜{probe_transport} 无回覆跳点",
             "route": route, "routeHops": 0,
             "class": "回程探针无有效路由", "rank": 0,
@@ -903,12 +1027,23 @@ def return_probe(carrier: str, city: str, host: str) -> dict[str, Any]:
     if not shutil.which("traceroute"):
         route = enrich_route(route)
         route_class, rank, evidence = classify(carrier, route, "Return")
+    connect_values = precheck + tcp_samples(
+        ip, selected_port, count=max(0, 5 - len(precheck)), timeout=3.0
+    )
     sample = rtts[-3:]
-    result_stats = stats(sample, len(sample), loss_valid=False, metric="TCP traceroute RTT（不作为业务丢包）")
+    result_stats = (
+        stats(connect_values[:5], 5, loss_valid=True, metric=f"TCP connect/{selected_port}")
+        if connect_values
+        else stats(sample, len(sample), loss_valid=False,
+                   metric="TCP traceroute RTT（端口未回应，不作为业务丢包）")
+    )
     value = score(rank, result_stats)
+    source_note = f"{node_source}｜{'已切备用' if fallback_used else '主节点'}｜TCP/{selected_port}"
     return {
-        "carrier": carrier, "city": city, "host": host, "probeIp": ip,
-        "probeHealth": f"ONLINE｜{probe_transport}｜{hop_count} 跳回覆",
+        "carrier": carrier, "city": city, "host": selected_host, "probeIp": ip,
+        "targetPort": selected_port, "nodeSource": node_source,
+        "fallbackUsed": fallback_used,
+        "probeHealth": f"ONLINE｜{source_note}｜{probe_transport}｜{hop_count} 跳回覆",
         "route": route, "routeHops": hop_count,
         "class": route_class, "rank": rank, "evidence": evidence,
         "reachability": f"PASS｜取得 {hop_count} 个有效回程跳点",
@@ -1135,7 +1270,8 @@ def show_return(item: dict[str, Any], index: int, total: int) -> None:
         f"RETURN [{index}/{total}] {carrier} / {CARRIER_NAME[carrier]} · {item.get('probeCapital', item['city'])}回程",
         color,
     )
-    field("省会目标", f"{item.get('probeCapital', item['city'])}｜{item.get('probeIp') or item.get('host')}", color)
+    field("省会目标", f"{item.get('probeCapital', item['city'])}｜{item.get('probeIp') or item.get('host')}:{item.get('targetPort', 443)}", color)
+    field("节点来源", f"{item.get('nodeSource', 'STATIC_FALLBACK')}｜{'已切备用' if item.get('fallbackUsed') else '主节点'}", GRAY)
     field("测点健康", item.get("probeHealth", "SELF-TEST｜离线样本"), GREEN if valid else YELLOW)
     field("回程线路", item["class"], color if valid else YELLOW)
     field("骨干标签", " → ".join(item.get("backboneTags", [])), color)
@@ -1235,6 +1371,9 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             s = item["stats"]
             probes.append({
                 "city": item["city"], "host": item["host"], "ip": item["probeIp"],
+                "targetPort": item.get("targetPort", 443),
+                "nodeSource": item.get("nodeSource", "STATIC_FALLBACK"),
+                "fallbackUsed": bool(item.get("fallbackUsed")),
                 "route": item["class"], "evidence": item["evidence"],
                 "score": item["score"], "stars": item["stars"],
                 "avg": s.get("avg"), "min": s.get("minimum"), "max": s.get("maximum"),
@@ -1367,16 +1506,19 @@ def main() -> int:
     field("内段可见性", "NAT 隐藏｜不强判精品或普通线路", YELLOW)
     field("判断边界", dedicated_line["internalVerdict"], GRAY)
 
-    return_total = sum(len(items) for items in PROBES.values())
+    return_pool, return_pool_status = load_return_probe_pool()
+    return_total = sum(len(items) for items in return_pool.values())
     banner("RETURN PROBE / 出口 VPS 原生三网十八组回程", CYAN)
     field("执行位置", mask_ip(exit_ip), GREEN)
-    field("执行方式", "六省会目标尝试 TCP/443、ICMP、UDP；先选骨干证据等级最高者，同级再比回覆跳数", GRAY)
+    field("动态测点池", return_pool_status, GREEN if return_pool_status.startswith("ONLINE") else YELLOW)
+    field("执行方式", "六省三网使用节点真实 TCP 端口，主节点失败切同省同运营商备用；线路由 TCP／ICMP／UDP 交叉识别", GRAY)
     returns: list[dict[str, Any]] = []
     index = 0
     for carrier in ("CT", "CU", "CM"):
-        for city, host in PROBES[carrier]:
+        for spec in return_pool[carrier]:
+            city, host = str(spec["city"]), str(spec["host"])
             index += 1
-            item = self_test_return(carrier, city, host) if SELF_TEST else return_probe(carrier, city, host)
+            item = self_test_return(carrier, city, host) if SELF_TEST else return_probe(carrier, city, spec)
             item = add_route_labels(item)
             returns.append(item)
             show_return(item, index, return_total)
@@ -1405,7 +1547,7 @@ def main() -> int:
         "selfTest": SELF_TEST,
         "target": {"host": mask_ip(target), "port": port, "role": "国内入口"},
         "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "出口 VPS 本机"},
-        "methodology": "Globalping 对北京市／上海市／广州市／合肥市／南京市／杭州市分别以省会＋运营商名称／省级接入 ASN 定向请求电信、联通、移动探针，不再随机扫描整座城市。省会无在线探针时只允许退到同省候选城市，并完整记录实际城市、ASN 与退选原因；北京、上海不跨直辖市，所有地区禁止跨省替代。省级接入 ASN 只确认探针所属运营商，线路等级仍只依据实际 traceroute 中的 AS4809／AS9929／AS58807 等骨干证据。出口 VPS 对六省会三网目标依次尝试 TCP/443、ICMP、UDP traceroute，先选骨干证据等级最高的一组，等级相同才比较回覆跳数；DNS 失败或无有效跳点排除评分，不伪报业务丢包。AntPing 仅作为人工交叉复核入口，不依赖其未公开网页接口，避免网站改版导致脚本失效。NAT／端口映射隐藏的专线内段单列为不可见，不强判线路等级。",
+        "methodology": "去程仍由 Globalping 对六省会按运营商定向请求真实外部 TCP traceroute；无中国在线探针时保持 INCONCLUSIVE，绝不以回程反推去程。回程借鉴 TcpQuality 的动态节点池设计：运行时取得省份、运营商、固定 IP、真实 TCP 端口及同组备用节点；主节点 TCP 健康检查失败才切备用，动态池缺项或不可用时才退回内置静态目标。VPS 对实际端口、ICMP、UDP traceroute 交叉取证，并以实际 TCP connect 计算端到端质量；线路等级只依据可见 AS4809／AS9929／AS58807 等骨干证据。NAT／端口映射隐藏的专线内段单列为不可见，不强判线路等级。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
