@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.15 FINAL-BRAND-CLEANUP"
+VERSION="v0.9 RC4.2.16 FINAL"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.15 封版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.16 FINAL
 
 用法：
-  bash 3net-route.sh
-  bash 3net-route.sh --extended
-  bash 3net-route.sh --extended --speed
+  bash 3net-route.sh --port 443
+  bash 3net-route.sh --extended --port 443
+  bash 3net-route.sh --extended --speed --port 443
   bash 3net-route.sh --self-test
   bash 3net-route.sh --target 203.55.99.88 --port 443
   bash 3net-route.sh --target 203.55.99.88 --port 443 --forward-evidence /root/forward_evidence.json
 
 说明：
-  本脚本直接在出口 VPS 上运行，不使用 SSH 密码或私钥。
-  目标 IP 示例：203.55.99.88
+  本脚本直接在被测 VPS 上运行，自动识别当前 VPS 公网 IPv4，不要求输入中国入口 IP。
   业务端口示例：443（Trojan／AnyTLS 等协议实际监听端口，不是 SSH 22）
+  --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   --speed：追加北上广三网公网单线程速度（9 组），约需 4～12 分钟并消耗测速流量。
@@ -123,7 +123,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.15 FINAL-BRAND-CLEANUP")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.16 FINAL")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -425,17 +425,19 @@ def valid_public_ipv4(value: str) -> bool:
         return False
 
 
-def ask_target() -> tuple[str, int]:
+def ask_target(detected_ip: str) -> tuple[str, int]:
     global TARGET, PORT_TEXT
     if SELF_TEST:
         return "45.207.225.70", 10100
-    banner("INPUT GUIDE / 目标输入说明", MAGENTA)
-    field("目标 IP 示例", "203.55.99.88", CYAN)
+    banner("VPS NATIVE / 本机自动识别", MAGENTA)
+    if not TARGET and valid_public_ipv4(detected_ip):
+        TARGET = detected_ip
+    field("当前 VPS IPv4", mask_ip(TARGET), CYAN)
     field("协议端口示例", "443", GREEN)
     field("重要提醒", "这里填写 Trojan／AnyTLS／Hysteria 等协议实际监听端口，不是 SSH 登录端口 22", YELLOW)
-    field("完整输入示例", "上方输入 203.55.99.88；下方输入 443", WHITE)
+    field("IP 输入", "已自动识别；普通 VPS 本机检测无需填写中国入口 IP", GREEN)
     while not valid_public_ipv4(TARGET):
-        TARGET = input("请输入被测 VPS 的公网 IPv4〔例 203.55.99.88〕：").strip()
+        TARGET = input("自动识别失败，请输入当前 VPS 的公网 IPv4：").strip()
         if not valid_public_ipv4(TARGET):
             print(RED + "  IPv4 无效，请重新输入。" + RESET)
     while True:
@@ -2164,6 +2166,8 @@ def self_test_regressions() -> None:
         raise AssertionError("全国同运营商参考不得触发精品双程 PASS")
     if reference_grade["forwardReference"] != len(FORWARD_REGIONS):
         raise AssertionError("全国同运营商参考计数回归失败")
+    if reference_grade["routeGrade"]["label"] != "单向优化／混合":
+        raise AssertionError("全国参考不得把样本级精品证据升级为完整双程精品")
     if not national_reference({"selectionScope": "NATIONAL_SHARED_REFERENCE"}):
         raise AssertionError("共享全国参考范围识别回归失败")
 
@@ -2239,6 +2243,55 @@ def self_test_regressions() -> None:
         raise AssertionError("独立探针未接通必须计为一次真实失败")
     if failure_grade["forwardScore"] >= reference_grade["forwardScore"]:
         raise AssertionError("真实失败样本必须以 0 分拉低有效样本表现")
+
+    ordinary_forwards = [
+        {
+            **self_test_forward("CU", region, probe_city),
+            "class": "AS4837 普通联通",
+            "rank": 2,
+        }
+        for region, probe_city in FORWARD_REGIONS
+    ]
+    ordinary_returns = [
+        {
+            **self_test_return("CU", region, f"ordinary-{region}"),
+            "class": "AS4837 普通联通",
+            "rank": 2,
+        }
+        for region, _ in FORWARD_REGIONS
+    ]
+    if grade("CU", ordinary_forwards, ordinary_returns)["routeGrade"]["label"] != "普通公网":
+        raise AssertionError("普通公网线路等级回归失败")
+
+    mixed_returns = [
+        {
+            **self_test_return("CU", region, f"mixed-{region}"),
+            "class": "AS4837 普通联通",
+            "rank": 2,
+        }
+        for region, _ in FORWARD_REGIONS
+    ]
+    if grade(
+        "CU",
+        [self_test_forward("CU", region, city) for region, city in FORWARD_REGIONS],
+        mixed_returns,
+    )["routeGrade"]["label"] != "单向优化／混合":
+        raise AssertionError("单向优化／混合线路等级回归失败")
+
+    insufficient_forwards = [
+        {
+            **self_test_forward("CM", region, city),
+            "class": "INCONCLUSIVE｜未见移动骨干",
+            "rank": 0,
+        }
+        for region, city in FORWARD_REGIONS
+    ]
+    if grade(
+        "CM",
+        insufficient_forwards,
+        [self_test_return("CM", region, f"unknown-{region}") for region, _ in FORWARD_REGIONS],
+    )["routeGrade"]["label"] != "证据不足":
+        raise AssertionError("证据不足线路等级回归失败")
 
     synthetic_pool = [
         {"probe": {"country": "CN", "city": city, "asn": asn,
@@ -2565,6 +2618,112 @@ def national_reference(item: dict[str, Any]) -> bool:
     return str(item.get("selectionScope", "")).startswith("NATIONAL_")
 
 
+def route_evidence_kind(carrier: str, item: dict[str, Any]) -> str:
+    """Reduce one route result to premium, mixed, ordinary or unknown evidence."""
+    route_class = str(item.get("class", ""))
+    if int(item.get("rank", 0)) <= 0 or route_class.startswith("INCONCLUSIVE"):
+        return "UNKNOWN"
+    if premium_route(carrier, item):
+        return "PREMIUM"
+    if "混合" in route_class or "GT" in route_class:
+        return "MIXED"
+    return "ORDINARY"
+
+
+def carrier_route_grade(
+    carrier: str,
+    forward_items: list[dict[str, Any]],
+    return_items: list[dict[str, Any]],
+    bidirectional_premium: bool,
+) -> dict[str, Any]:
+    forward_kinds = [route_evidence_kind(carrier, item) for item in forward_items]
+    return_kinds = [route_evidence_kind(carrier, item) for item in return_items]
+    forward_known = [kind for kind in forward_kinds if kind != "UNKNOWN"]
+    return_known = [kind for kind in return_kinds if kind != "UNKNOWN"]
+    premium_count = forward_known.count("PREMIUM") + return_known.count("PREMIUM")
+    mixed_count = forward_known.count("MIXED") + return_known.count("MIXED")
+    ordinary_count = forward_known.count("ORDINARY") + return_known.count("ORDINARY")
+
+    if bidirectional_premium:
+        level = "BIDIRECTIONAL_PREMIUM"
+        label = "双程精品"
+        reason = "指定地区去程与全部回程均命中该运营商精品骨干，且没有回落普通骨干。"
+    elif not forward_known or not return_known:
+        level = "EVIDENCE_INSUFFICIENT"
+        label = "证据不足"
+        missing = []
+        if not forward_known:
+            missing.append("去程")
+        if not return_known:
+            missing.append("回程")
+        reason = (
+            f"{'、'.join(missing)}未取得可复核骨干证据；"
+            "低延迟、端口可达或单一目的网跳点不能替代线路判定。"
+        )
+    elif premium_count or mixed_count:
+        level = "ONE_WAY_OPTIMIZED_OR_MIXED"
+        label = "单向优化／混合"
+        reason = (
+            f"可见样本含精品 {premium_count}、混合 {mixed_count}、普通 {ordinary_count} 组；"
+            "至少一方向未形成纯净且完整的双程精品链路。"
+        )
+    else:
+        level = "ORDINARY_PUBLIC"
+        label = "普通公网"
+        reason = (
+            f"去、回程已取得普通骨干证据，共 {ordinary_count} 组；"
+            "未见足以升级为精品骨干的 ASN／特征跳点。"
+        )
+
+    return {
+        "level": level,
+        "label": label,
+        "reason": reason,
+        "forwardEvidence": {
+            "premium": forward_kinds.count("PREMIUM"),
+            "mixed": forward_kinds.count("MIXED"),
+            "ordinary": forward_kinds.count("ORDINARY"),
+            "unknown": forward_kinds.count("UNKNOWN"),
+        },
+        "returnEvidence": {
+            "premium": return_kinds.count("PREMIUM"),
+            "mixed": return_kinds.count("MIXED"),
+            "ordinary": return_kinds.count("ORDINARY"),
+            "unknown": return_kinds.count("UNKNOWN"),
+        },
+    }
+
+
+def overall_route_grade(grades: list[dict[str, Any]]) -> dict[str, Any]:
+    carrier_levels = [item["routeGrade"]["level"] for item in grades]
+    carrier_labels = {
+        item["carrier"]: item["routeGrade"]["label"] for item in grades
+    }
+    if carrier_levels and all(
+        level == "BIDIRECTIONAL_PREMIUM" for level in carrier_levels
+    ):
+        level, label = "BIDIRECTIONAL_PREMIUM", "三网双程精品"
+        reason = "电信、联通、移动均已取得完整双程精品骨干证据。"
+    elif "EVIDENCE_INSUFFICIENT" in carrier_levels:
+        level, label = "EVIDENCE_INSUFFICIENT", "证据不足"
+        reason = "至少一个运营商缺少必要方向的可复核骨干证据，不能给三网整体升级。"
+    elif carrier_levels and all(
+        level == "ORDINARY_PUBLIC" for level in carrier_levels
+    ):
+        level, label = "ORDINARY_PUBLIC", "三网普通公网"
+        reason = "电信、联通、移动去回程均只确认普通公网骨干。"
+    else:
+        level, label = "ONE_WAY_OPTIMIZED_OR_MIXED", "三网单向优化／混合"
+        reason = "三网中存在单向精品、混合路由，或不同运营商线路等级不一致。"
+    return {
+        "overallLevel": level,
+        "overallLabel": label,
+        "reason": reason,
+        "policy": "ASN／特征跳点证据优先；延迟、速度与丢包不用于推定精品等级。",
+        "carrierLabels": carrier_labels,
+    }
+
+
 def grade(carrier: str, forwards: list[dict[str, Any]],
           returns: list[dict[str, Any]]) -> dict[str, Any]:
     forward_items = [x for x in forwards if x["carrier"] == carrier]
@@ -2674,6 +2833,9 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         and regional_forward_premium == len(regional_forwards)
         and return_premium == len(valid_returns)
     )
+    route_grade = carrier_route_grade(
+        carrier, valid_forwards, valid_returns, bidirectional_premium
+    )
     return {
         "carrier": carrier,
         "forwardRoute": representative_route(valid_forwards, "去程"),
@@ -2693,6 +2855,7 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         "forwardPremium": f"{forward_premium}/{len(valid_forwards)}",
         "returnPremium": f"{return_premium}/{len(valid_returns)}",
         "bidirectionalPremium": bidirectional_premium,
+        "routeGrade": route_grade,
         "matrixStatus": matrix_status,
         "matrixComplete": matrix_complete,
         "evidenceCoverage": measurement_coverage,
@@ -2782,7 +2945,7 @@ document.getElementById('topology').innerHTML=`<h2>被测网络模型</h2><table
 <tr><th>被测 VPS</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>执行 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>矩阵状态</th><td colspan="3">${{E((R.matrixAssessment||{{}}).status||'N/A')}}</td></tr>
 <tr><th>模型边界</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
-document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{carrierBrand(g.carrier)}}</h2><div class="route-verdict">去程 ${{E(g.forwardRoute)}} ↔ 回程 ${{E(g.returnRoute)}}</div><div>矩阵：${{E(g.matrixStatus)}}｜指定地区去程 ${{E(g.forwardRegional)}}｜回程有效 ${{E(g.returnValid)}}</div><div>测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%</div><div>全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜参考不补足省份矩阵</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
+document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{carrierBrand(g.carrier)}}</h2><div class="route-verdict">${{E(g.routeGrade?.label||'证据不足')}}｜去程 ${{E(g.forwardRoute)}} ↔ 回程 ${{E(g.returnRoute)}}</div><div>${{E(g.routeGrade?.reason||'按可见 ASN／特征跳点判定')}}</div><div>矩阵：${{E(g.matrixStatus)}}｜指定地区去程 ${{E(g.forwardRegional)}}｜回程有效 ${{E(g.returnValid)}}</div><div>测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%</div><div>全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜参考不补足省份矩阵</div></section>`).join('');
 const bands=((R.latencyHeatmap||{{}}).absoluteBands||[]).map(b=>`<span style="background:${{E(b.color)}}">${{E(b.range)}}</span>`).join('');
 const heatRows=['CT','CU','CM'].map(c=>{{
   const fs=R.forward.filter(x=>x.carrier===c),rs=R.returns.filter(x=>x.carrier===c);
@@ -2807,7 +2970,7 @@ function nodeSeek(){{
     const visual=x=>x.latencyVisual?.measured?`AVG ${{x.latencyVisual.avgMs}} ms｜P95 ${{x.latencyVisual.p95Ms}} ms｜相对热度 ${{x.latencyVisual.relativeHeat}}%｜${{x.latencyVisual.absoluteBand}}`:`N/A｜${{x.latencyVisual?.reason||'未测'}}`;
     const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜${{visual(x)}}｜注释 ${{x.routeNote||'N/A'}}`).join('\\n');
     const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜${{visual(x)}}｜LOSS ${{x.stats.loss??'N/A'}}%｜注释 ${{x.routeNote||'N/A'}}`).join('\\n');
-    return `::: tab-item ${{carrierMeta[c].glyph}} ${{carrierMeta[c].mark}} ${{names[c]}}\n线路判定：去程 ${{g.forwardRoute}} ↔ 回程 ${{g.returnRoute}}｜矩阵 ${{g.matrixStatus}}｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%｜指定地区去程 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
+    return `::: tab-item ${{carrierMeta[c].glyph}} ${{carrierMeta[c].mark}} ${{names[c]}}\n线路等级：${{g.routeGrade?.label||'证据不足'}}｜去程 ${{g.forwardRoute}} ↔ 回程 ${{g.returnRoute}}｜矩阵 ${{g.matrixStatus}}｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%｜指定地区去程 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程有效 ${{g.returnValid}}\n判定说明：${{g.routeGrade?.reason||'按可见 ASN／特征跳点判定'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   const speedText=(R.singleThreadSpeed?.rows||[]).map(x=>`- ${{x.label}}：回程 ${{x.returnMbps??'N/A'}} Mbps／重传 ${{x.returnRetransmits??'N/A'}}；去程 ${{x.forwardMbps??'N/A'}} Mbps`).join('\\n');
   const advice=(R.improvements||[]).map((x,i)=>`${{i+1}}. ${{x}}`).join('\\n');
@@ -2960,18 +3123,23 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "returnMeasured": grade_item["returnMeasured"],
             "returnValid": grade_item["returnValid"],
             "returnFailures": grade_item["returnFailures"],
-            "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
+            "bidirectional": grade_item["bidirectionalPremium"],
+            "routeGrade": grade_item["routeGrade"],
+            "probes": probes,
         })
     matrix_complete = all(x["matrixComplete"] for x in report["grades"])
     forward_regional_total = sum(
         int(str(x["forwardRegional"]).split("/", 1)[0])
         for x in report["grades"]
     )
+    route_classification = report["routeClassification"]
     final_title = (
-        "三网完整矩阵｜线路＋延迟＋单线程吞吐"
-        if matrix_complete else
-        f"PARTIAL｜指定省份矩阵未完整｜指定地区去程 "
-        f"{forward_regional_total}/{EXPECTED_PER_DIRECTION}"
+        f"{route_classification['overallLabel']}｜"
+        + (
+            "三网完整矩阵"
+            if matrix_complete else
+            f"矩阵 PARTIAL｜指定地区去程 {forward_regional_total}/{EXPECTED_PER_DIRECTION}"
+        )
     )
     return {
         "version": report["version"], "generated": report["generated"],
@@ -2990,8 +3158,10 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "matrixStatus": "COMPLETE" if matrix_complete else "PARTIAL",
             "title": final_title,
             "elapsed": "N/A",
+            "routeGrade": route_classification,
         },
         "carriers": carriers,
+        "routeClassification": route_classification,
         "singleThreadSpeed": report.get("singleThreadSpeed", {}),
         "improvements": report.get("improvements", []),
         "latencyHeatmap": report.get("latencyHeatmap", {}),
@@ -3020,11 +3190,11 @@ def publish(report: dict[str, Any]) -> str:
 
 def main() -> int:
     logo()
-    target, port = ask_target()
     if SELF_TEST:
         exit_ip, exit_identity = "45.207.225.70", "SELF-TEST VPS"
     else:
         exit_ip, exit_identity = public_ip()
+    target, port = ask_target(exit_ip)
 
     banner("TARGET / 双端检测模型", CYAN)
     native_mode = target == exit_ip
@@ -3140,6 +3310,7 @@ def main() -> int:
     speed = single_thread_speed()
     latency_heatmap = annotate_latency_visuals(forward, returns)
     grades = [grade(c, forward, returns) for c in ("CT", "CU", "CM")]
+    route_classification = overall_route_grade(grades)
     measured_total = sum(
         int(item["forwardMeasured"].split("/", 1)[0])
         + int(item["returnMeasured"].split("/", 1)[0])
@@ -3175,12 +3346,26 @@ def main() -> int:
         self_test_regressions()
         if not all(item["bidirectionalPremium"] for item in grades):
             raise AssertionError("离线精品双程样本未通过严格双程判定")
+        if route_classification["overallLevel"] != "BIDIRECTIONAL_PREMIUM":
+            raise AssertionError("离线三网最终线路等级未判为双程精品")
     banner("FINAL VERDICT / 三网双程线路判定", CYAN)
+    overall_color = (
+        GREEN
+        if route_classification["overallLevel"] == "BIDIRECTIONAL_PREMIUM"
+        else YELLOW
+        if route_classification["overallLevel"] == "ONE_WAY_OPTIMIZED_OR_MIXED"
+        else RED
+        if route_classification["overallLevel"] == "EVIDENCE_INSUFFICIENT"
+        else CYAN
+    )
+    field("最终线路等级", route_classification["overallLabel"], overall_color)
+    field("等级判定依据", route_classification["reason"], GRAY)
+    field("判定边界", route_classification["policy"], YELLOW)
     for item in grades:
         color = CARRIER_COLOR[item["carrier"]]
-        premium_text = "精品双程 PASS" if item["bidirectionalPremium"] else "精品双程未证实"
         field(
             carrier_label(item["carrier"]),
+            f"等级 {item['routeGrade']['label']}｜"
             f"去程 {item['forwardRoute']}〔地区 {item['forwardRegional']}｜"
             f"测量 {item['forwardMeasured']}｜有效 {item['forwardValid']}｜"
             f"全国独立参考 {item['forwardReference']}｜"
@@ -3188,10 +3373,10 @@ def main() -> int:
             f"回程 {item['returnRoute']}〔测量 {item['returnMeasured']}｜"
             f"有效 {item['returnValid']}｜失败 {item['returnFailures']}〕｜"
             f"测量覆盖 {round(item['measurementCoverage'] * 100)}%｜"
-            f"{premium_text}｜"
             f"矩阵 {item['matrixStatus']}",
             color,
         )
+        field("判定说明", item["routeGrade"]["reason"], GRAY)
     field(
         "矩阵完整性",
         f"{matrix_assessment['status']}｜完成 {matrix_assessment['completed']}｜"
@@ -3240,6 +3425,7 @@ def main() -> int:
         "forward": forward,
         "returns": returns,
         "grades": grades,
+        "routeClassification": route_classification,
         "latencyHeatmap": latency_heatmap,
         "singleThreadSpeed": speed,
         "improvements": improvements,
