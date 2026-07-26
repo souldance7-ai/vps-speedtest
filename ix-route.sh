@@ -1438,11 +1438,6 @@ def tcp_response_confirmation_from_probe(
     status = "PASS" if trace_reply or tcp_reply else (
         "N/A" if probe.get("status") in {"N/A", "NO_PROBE"} else "INCONCLUSIVE"
     )
-    latency = (
-        check.get("latency")
-        if tcp_reply and (check.get("latency") or {}).get("avg") is not None
-        else probe.get("latency") or summarize([], 0)
-    )
     if tcp_reply:
         reason = (
             f"原探针对同一入口、同一业务端口收到 TCP 应答 "
@@ -1471,7 +1466,6 @@ def tcp_response_confirmation_from_probe(
         "entry": mask_ip(entry),
         "port": port,
         "status": status,
-        "latency": latency,
         "tcpResponses": int(check.get("received") or (1 if trace_reply else 0)),
         "forwardMeasurementId": measurement_id,
         "responseMeasurementId": str(check.get("measurementId") or ""),
@@ -2476,7 +2470,6 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "isReverseRoute": False,
                 "reverseRouteVisible": False,
                 "tcpResponses": x["tcpResponses"],
-                "latency": x["latency"],
             } for x in report["tcpResponseConfirmations"]],
             "internal": {
                 "status": report["internal"]["status"],
@@ -2920,6 +2913,11 @@ def main() -> int:
                 raise AssertionError("公共报告不得计算回程分数")
             if carrier_payload.get("bidirectional") is not False:
                 raise AssertionError("TCP应答确认不得标成独立双程路由")
+            if any(
+                "latency" in item
+                for item in carrier_payload.get("tcpResponseConfirmations") or []
+            ):
+                raise AssertionError("TCP应答确认不得重复包装去程RTT")
         if report["entry"]["port"] != mask_port(port):
             raise AssertionError("业务端口末三位未脱敏")
         if payload_check.get("targetPort") != mask_port(port):
@@ -2928,6 +2926,13 @@ def main() -> int:
             raise AssertionError("公共页目标VPS与出口ASN身份未对齐")
         if "returns" in payload_check.get("ixData", {}):
             raise AssertionError("公共报告仍残留误导性的returns字段")
+        if any(
+            "latency" in item
+            for item in payload_check.get("ixData", {}).get(
+                "tcpResponseConfirmations", []
+            )
+        ):
+            raise AssertionError("公共报告ixData不得在TCP应答中重复RTT")
         if payload_check.get("final", {}).get("score") is not None:
             raise AssertionError("公共报告最终结论不得保留评分")
         if payload_check.get("final", {}).get("stars"):
