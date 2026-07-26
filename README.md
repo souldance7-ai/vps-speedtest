@@ -23,11 +23,11 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 ---
 
-## RC4.2.3 六地区三网双程质量检测
+## RC4.2.4 六省会三网双程质量检测
 
-适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京、上海、广东、安徽、江苏、浙江六地区，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
+适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京市、上海市、广州市、合肥市、南京市、杭州市六个省会，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
 
-RC4.2.3 继续修正电信、联通去回程判定：指定省市探针不可用时，同 ASN 全国备用结果只作参考，不再冒充该省有效样本；没有运营商骨干证据、或回程只见单个目的网交付跳点时标记为 `INCONCLUSIVE` 并排除评分；公开报告的“双程精品”改为依据有效去回程样本计算，不再固定显示为成立。
+RC4.2.4 改为北京市／上海市／广州市／合肥市／南京市／杭州市六个省会逐一寻找三网探针，并同时核对 Globalping 实际返回城市与 ASN；找不到对应省会探针时直接标记 `INCONCLUSIVE`，不再使用武汉、西安、徐州等跨省探针代替。CMD、HTML、JSON 与 NodeSeek 报告都会显示实际骨干标签及中文路由注释，例如 `AS9929｜CUII 联通精品骨干`、`AS4837｜China169 联通普通骨干`、`AS10099｜CUG 联通国际网`；只有目的网交付证据时会明确说明不能据此判断完整回程。
 
 ### VPS / Linux 一键执行（推荐）
 
@@ -52,7 +52,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.3 六地区去回程核验版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.4 六地区去回程核验版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
 
 ---
 
