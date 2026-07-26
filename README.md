@@ -1,16 +1,18 @@
 # LazyVPS VPS 测速正式 v1.0
 
 
-## 独立工具：中国三网入口去程／TCP应答与专线映射核对 v1.1.0
+## 独立工具：中国三网入口去程／TCP应答与专线映射核对 v1.2.0
 
 `ix-route.sh` 与 `3net-route.sh` 完全独立，适用于“中国用户 → 中国侧公网入口 → NAT／IPLC／IEPL／中转隐藏内段 → 出口 VPS”架构。
 
 正式版不再用“出口 VPS → 中国公共目标”的默认公网 traceroute 冒充专线回程。每组去程后只确认原中国探针是否收到同一入口、同一业务端口的 TCP 应答；该结果不是独立反向逐跳路由，也不计算回程分数。若能提供或自动识别入口端私网对端，才额外验证出口→入口私网对端的同路径内段回程。
 
+v1.2.0 可用 `--speed` 在 CMD 与报告中追加北京、上海、广东三网单线程速度表。该辅助项来自固定提交版本的开源 [TcpQuality](https://github.com/ibsgss/TcpQuality)，测量“出口 VPS ↔ 中国三网公共测速端”，不经过中国侧业务入口，不参与隐藏专线映射链与真实协议握手判定。
+
 ### 在出口 VPS 一键执行完整六地区 × 三网
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh") --full
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh") --full --speed
 ```
 
 脚本会依次引导输入：
@@ -21,7 +23,7 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 - 出口端专线内网 IPv4（未知可留空）
 - 入口端专线内网对端（未知可留空；脚本会尝试从活动连接识别）
 
-`--full` 生成18组TCP去程＋对应18组原探针TCP应答确认。所有用户相关入口、出口、私网对端及客户端实测 IPv4 在 JSON、HTML、Markdown 与公共页中只保留前两段；业务端口末三位统一显示为 `***`。
+`--full` 生成18组TCP去程＋对应18组原探针TCP应答确认，`--speed` 追加北上广三网九组公网单线程辅助测速。所有用户相关入口、出口、私网对端及客户端实测 IPv4 在 JSON、HTML、Markdown 与公共页中只保留前两段；业务端口末三位统一显示为 `***`。最终判定不输出分数／星级，并列出缺失证据、低速与高重传等建议改善。
 
 [完整使用说明与判定边界](IX_ROUTE_GUIDE.md) · [查看脚本](ix-route.sh)
 
