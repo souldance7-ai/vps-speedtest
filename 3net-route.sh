@@ -68,7 +68,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 3
 fi
 
-if [[ "$SELF_TEST" -eq 0 && "$NO_INSTALL" -eq 0 ]]; then
+if [[ "$SELF_TEST" -eq 0 && "$NO_INSTALL" -eq 0 && -z "$RETRY_UPLOAD" ]]; then
   missing=()
   command -v curl >/dev/null 2>&1 || missing+=(curl)
   command -v traceroute >/dev/null 2>&1 || missing+=(traceroute)
