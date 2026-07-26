@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.16 FINAL"
+VERSION="v0.9 RC4.2.17 UPLOAD-FIX"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.16 FINAL
+中国三网 VPS 双程质量检测 v0.9 RC4.2.17 UPLOAD-FIX
 
 用法：
   bash 3net-route.sh --port 443
@@ -101,7 +101,9 @@ python3 /dev/fd/3 3<<'PY'
 from __future__ import annotations
 
 import csv
+import base64
 import datetime as dt
+import gzip
 import html
 import io
 import ipaddress
@@ -124,7 +126,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.16 FINAL")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.17 UPLOAD-FIX")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -132,7 +134,7 @@ TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
-PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
+PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
 TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
 TCPQUALITY_RAW_BASE = (
     "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
@@ -3171,21 +3173,106 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def cli_upload_envelope(payload: dict[str, Any]) -> bytes:
+    """Compress and armor the report so route evidence cannot trip edge WAF rules."""
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=9, mtime=0)
+    envelope = {
+        "encoding": "gzip+base64",
+        "payload": base64.b64encode(compressed).decode("ascii"),
+    }
+    return json.dumps(envelope, separators=(",", ":")).encode("ascii")
+
+
+def curl_json_upload(url: str, payload: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
+    body = cli_upload_envelope(payload)
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--compressed",
+        "--connect-timeout", "12",
+        "--max-time", str(timeout),
+        "--retry", "2",
+        "--retry-delay", "1",
+        "--request", "POST",
+        "--header", "Content-Type: application/json",
+        "--header", "Accept: application/json",
+        "--header", "Cache-Control: no-cache",
+        "--user-agent", "3net-route-cli/RC4.2.17",
+        "--data-binary", "@-",
+        "--write-out", "\n%{http_code}",
+        url,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            input=body,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout + 8,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("上传连接超时；本地 HTML／JSON 已保留") from exc
+
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        detail = re.sub(r"\s+", " ", detail)[:160]
+        raise RuntimeError(
+            f"上传网络失败（curl {completed.returncode}）"
+            + (f"｜{detail}" if detail else "")
+        )
+
+    try:
+        response_body, status_text = completed.stdout.rsplit(b"\n", 1)
+        status = int(status_text.strip())
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError("上传接口返回格式异常；本地 HTML／JSON 已保留") from exc
+
+    result: dict[str, Any] = {}
+    content_type_is_json = response_body.lstrip().startswith((b"{", b"["))
+    if content_type_is_json:
+        try:
+            parsed = json.loads(response_body.decode("utf-8", "replace"))
+            if isinstance(parsed, dict):
+                result = parsed
+        except json.JSONDecodeError:
+            result = {}
+
+    if not 200 <= status < 300:
+        api_error = str(result.get("error") or "").strip()
+        if not api_error:
+            api_error = (
+                "站点边缘拒绝了 CLI 请求"
+                if status == 403 else
+                "接口未返回可读 JSON"
+            )
+        raise RuntimeError(
+            f"HTTP {status}｜{api_error}；本地 HTML／JSON 已保留"
+        )
+    if not result:
+        raise RuntimeError("上传接口未返回有效 JSON；本地 HTML／JSON 已保留")
+    return result
+
+
 def publish(report: dict[str, Any]) -> str:
     try:
-        result = http_json(PUBLIC_REPORT_API, "POST", public_report_payload(report), 30)
+        result = curl_json_upload(
+            PUBLIC_REPORT_API,
+            public_report_payload(report),
+            45,
+        )
         for key in ("url", "reportUrl", "report_url", "publicUrl"):
             if result.get(key):
                 return str(result[key])
         if result.get("id"):
-            return f"https://china-3net-route-report.souldance4.chatgpt.site/report/{result['id']}"
-        return ""
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:300]
-        field("公共报告", f"上传失败｜HTTP {exc.code}｜{detail}", YELLOW)
+            return f"https://china-3net-route-report.souldance4.chatgpt.site/r/{result['id']}"
+        field("公共报告", "上传完成，但接口未返回报告网址；本地 HTML／JSON 已保留", YELLOW)
         return ""
     except Exception as exc:
-        field("公共报告", f"上传失败｜{exc}", YELLOW)
+        detail = re.sub(r"\s+", " ", str(exc)).strip()[:220]
+        field("公共报告", f"上传失败｜{detail}", YELLOW)
         return ""
 
 
@@ -3436,8 +3523,17 @@ def main() -> int:
     }
     if SELF_TEST:
         public_payload = public_report_payload(report)
+        upload_envelope = json.loads(cli_upload_envelope(public_payload).decode("ascii"))
+        upload_round_trip = json.loads(
+            gzip.decompress(base64.b64decode(upload_envelope["payload"])).decode("utf-8")
+        )
         speed_check = public_payload.get("singleThreadSpeed") or {}
         serialized_payload = json.dumps(public_payload, ensure_ascii=False)
+        if (
+            upload_envelope.get("encoding") != "gzip+base64"
+            or upload_round_trip != public_payload
+        ):
+            raise AssertionError("CLI 压缩上传封包无法无损还原")
         if (
             not public_payload.get("latencyHeatmap", {}).get("forward")
             or any(
