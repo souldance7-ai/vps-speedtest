@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v1.1.0"
+VERSION="v1.2.0"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -11,10 +11,11 @@ CLIENT_VERIFIED_EXIT=""
 FULL=0
 SELF_TEST=0
 NO_PUBLISH=0
+SPEED_TEST=0
 
 usage() {
   cat <<'EOF'
-中国三网入口去程／TCP应答与专线映射核对 v1.1.0
+中国三网入口去程／TCP应答与专线映射核对 v1.2.0
 
 用途：
   独立检测“中国用户 → 中国侧公网入口 → NAT／IPLC／IEPL／中转隐藏内段 → 出口 VPS”。
@@ -39,6 +40,7 @@ usage() {
   --client-verified-exit IP
                         中国客户端连接协议后实测到的出口；Mieru 可进一步核对握手
   --full                 在固定北上广基础上加入安徽、江苏、浙江 × 三网
+  --speed                追加北上广三网公网单线程速度辅助测试
   --no-publish           只生成本地 HTML／JSON／Markdown，不上传 Chain 3Net
   --self-test            离线自检，不发起网络探测
   -h, --help             显示帮助
@@ -52,6 +54,8 @@ usage() {
   DNS、探针或权限失败一律显示 N/A，不会换算成 100% LOSS。
   北京、上海、广州固定列入三网 TCP 去程与对应 TCP 应答确认；--full 再加入合肥、南京、杭州。
   TCP 应答确认只证明原探针收到入口端应答，不等于独立反向逐跳路由。
+  --speed 使用第三方开源 TcpQuality 的三网公网单线程测量；它不经过用户填写的
+  中国侧业务入口，不代表隐藏专线或实际协议端到端吞吐，不参与映射链 PASS。
   本地与公共报告会把用户相关 IPv4 脱敏为前两段，业务端口末三位脱敏为 ***。
   报告保存到“Chain 3Net”目录，并生成 HTML／JSON／Markdown；上传成功必须显示公共网址。
 EOF
@@ -66,6 +70,7 @@ while [[ $# -gt 0 ]]; do
     --peer) REMOTE_PEER="${2:-}"; shift 2 ;;
     --client-verified-exit) CLIENT_VERIFIED_EXIT="${2:-}"; shift 2 ;;
     --full) FULL=1; shift ;;
+    --speed) SPEED_TEST=1; shift ;;
     --no-publish) NO_PUBLISH=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -88,12 +93,14 @@ export IX_CLIENT_VERIFIED_EXIT="$CLIENT_VERIFIED_EXIT"
 export IX_FULL="$FULL"
 export IX_SELF_TEST="$SELF_TEST"
 export IX_NO_PUBLISH="$NO_PUBLISH"
+export IX_SPEED_TEST="$SPEED_TEST"
 
 # Python 程序从文件描述符 3 读取，stdin 保留给交互输入。
 python3 /dev/fd/3 3<<'PY'
 from __future__ import annotations
 
 import datetime as dt
+import csv
 import html
 import ipaddress
 import json
@@ -101,16 +108,18 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v1.1.0")
+VERSION = os.environ.get("IX_VERSION", "v1.2.0")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -120,10 +129,16 @@ CLIENT_VERIFIED_EXIT = os.environ.get("IX_CLIENT_VERIFIED_EXIT", "").strip()
 FULL = os.environ.get("IX_FULL") == "1"
 SELF_TEST = os.environ.get("IX_SELF_TEST") == "1"
 NO_PUBLISH = os.environ.get("IX_NO_PUBLISH") == "1"
+SPEED_TEST = os.environ.get("IX_SPEED_TEST") == "1"
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 GLOBALPING_PROBES_API = "https://api.globalping.io/v1/probes"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
 PUBLIC_REPORT_ROOT = "https://china-3net-route-report.souldance4.chatgpt.site"
+TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
+TCPQUALITY_RAW_BASE = (
+    "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
+    f"{TCPQUALITY_COMMIT}"
+)
 
 RESET = "\033[0m"
 GRAY = "\033[38;5;245m"
@@ -611,7 +626,7 @@ def handshake_verdict(
             "status": "INCONCLUSIVE",
             "reason": "客户端出口一致，但出口 VPS 的 mita 服务状态未确认",
         }
-    if chain.get("status") != "PASS":
+    if chain.get("status") not in {"PASS", "PARTIAL"}:
         return {
             "status": "INCONCLUSIVE",
             "reason": "客户端出口一致，但入口映射链证据尚不完整",
@@ -647,6 +662,319 @@ def summarize(values: list[float], sent: int) -> dict[str, Any]:
         "received": len(values),
         "sent": sent,
     }
+
+
+def speed_value(value: str) -> float | None:
+    value = value.strip()
+    if not value or value.lower() in {"failed", "null", "n/a"}:
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return round(number, 1) if number >= 0 else None
+
+
+def retrans_value(value: str) -> int | None:
+    value = value.strip()
+    if not value or value.lower() in {"failed", "null", "n/a"}:
+        return None
+    try:
+        number = int(float(value))
+    except ValueError:
+        return None
+    return max(0, number)
+
+
+def speed_row(
+    region: str,
+    carrier: str,
+    city: str,
+    return_mbps: float | None,
+    forward_mbps: float | None,
+    return_retransmits: int | None,
+) -> dict[str, Any]:
+    carrier_codes = {"电信": "CT", "联通": "CU", "移动": "CM"}
+    valid = return_mbps is not None or forward_mbps is not None
+    return {
+        "region": region,
+        "carrier": carrier_codes.get(carrier, ""),
+        "carrierName": f"中国{carrier}",
+        "nodeCity": city or region,
+        "label": f"{city or region}{carrier}",
+        "returnRetransmits": return_retransmits,
+        "returnMbps": return_mbps,
+        "forwardMbps": forward_mbps,
+        "status": "PASS" if valid else "N/A",
+        "measurement": "PUBLIC_TOS_SINGLE_STREAM",
+        "pathIncludesBusinessEntry": False,
+    }
+
+
+def self_test_speed_rows() -> list[dict[str, Any]]:
+    samples = [
+        ("北京", "电信", "北京", 318.9, 422.0, 703),
+        ("北京", "联通", "北京", 429.1, 430.2, 1644),
+        ("北京", "移动", "北京", 90.2, 436.5, 1264),
+        ("上海", "电信", "上海", 359.9, 446.7, 630),
+        ("上海", "联通", "上海", 50.2, 429.0, 1245),
+        ("上海", "移动", "上海", 59.9, 382.5, 132),
+        ("广东", "电信", "广东", 50.3, 420.5, 814),
+        ("广东", "联通", "广东", 134.9, 433.0, 37),
+        ("广东", "移动", "广东", 156.1, 435.7, 81),
+    ]
+    return [speed_row(*sample) for sample in samples]
+
+
+def newest_speed_csv(started: float, before: set[Path]) -> Path | None:
+    candidates = [
+        path
+        for path in Path("/tmp").glob("zstatic_nping_*.csv")
+        if path not in before and path.is_file()
+    ]
+    if not candidates:
+        candidates = [
+            path
+            for path in Path("/tmp").glob("zstatic_nping_*.csv")
+            if path.is_file() and path.stat().st_mtime >= started - 3
+        ]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def parse_tcpquality_speed_csv(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        for values in csv.reader(handle):
+            if len(values) < 10 or values[0] != "三网单线程速度":
+                continue
+            region = values[1].strip()
+            carrier = values[2].strip()
+            city = values[3].strip()
+            status = values[6].strip().upper()
+            return_mbps = speed_value(values[7])
+            return_retransmits = retrans_value(values[8])
+            forward_mbps = speed_value(values[9])
+            row = speed_row(
+                region,
+                carrier,
+                city,
+                return_mbps,
+                forward_mbps,
+                return_retransmits,
+            )
+            if status != "OK" and return_mbps is None and forward_mbps is None:
+                row["status"] = "N/A"
+            rows.append(row)
+    order = {"北京": 0, "上海": 1, "广东": 2}
+    carrier_order = {"CT": 0, "CU": 1, "CM": 2}
+    return sorted(
+        rows,
+        key=lambda row: (
+            order.get(str(row["region"]), 99),
+            carrier_order.get(str(row["carrier"]), 99),
+        ),
+    )
+
+
+def single_thread_speed() -> dict[str, Any]:
+    boundary = (
+        "辅助项：出口VPS与中国三网公共TOS测速端的单数据流能力；"
+        "不经过用户填写的中国侧业务入口，不代表隐藏专线或实际协议端到端吞吐，"
+        "不参与映射链与真实握手判定。"
+    )
+    if not SPEED_TEST:
+        return {
+            "enabled": False,
+            "status": "N/A",
+            "reason": "未使用 --speed；本项未执行",
+            "source": "TcpQuality pinned upstream",
+            "upstreamCommit": TCPQUALITY_COMMIT,
+            "rows": [],
+            "boundary": boundary,
+            "pathIncludesBusinessEntry": False,
+        }
+    if SELF_TEST:
+        rows = self_test_speed_rows()
+        return {
+            "enabled": True,
+            "status": "PASS",
+            "reason": "SELF-TEST 九组结构完整",
+            "source": "TcpQuality-compatible self-test fixture",
+            "upstreamCommit": TCPQUALITY_COMMIT,
+            "rows": rows,
+            "boundary": boundary,
+            "pathIncludesBusinessEntry": False,
+        }
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return {
+            "enabled": True,
+            "status": "N/A",
+            "reason": "三网单线程速度需要 Linux root 环境",
+            "source": "TcpQuality pinned upstream",
+            "upstreamCommit": TCPQUALITY_COMMIT,
+            "rows": [],
+            "boundary": boundary,
+            "pathIncludesBusinessEntry": False,
+        }
+
+    workdir = Path(tempfile.mkdtemp(prefix="ix-speed-"))
+    entry_script = workdir / "runTcpQuality.sh"
+    before = set(Path("/tmp").glob("zstatic_nping_*.csv"))
+    started = time.time()
+    try:
+        req = urllib.request.Request(
+            f"{TCPQUALITY_RAW_BASE}/runTcpQuality.sh",
+            headers={"User-Agent": f"ix-route/{VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=40) as response:
+            entry_script.write_bytes(response.read())
+        entry_script.chmod(0o700)
+        env = os.environ.copy()
+        env.update({
+            "TCPQUALITY_RAW_BASE": TCPQUALITY_RAW_BASE,
+            "TOS_TIMEOUT": "15",
+            "TOS_WARMUP": "5",
+            "TERM": env.get("TERM") or "xterm",
+        })
+        process = subprocess.Popen(
+            [
+                "bash",
+                str(entry_script),
+                "--no-rootfs",
+                "--only-speedtest",
+                "--no-rank-upload",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            output, _ = process.communicate(timeout=720)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                output, _ = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                output, _ = process.communicate()
+            return {
+                "enabled": True,
+                "status": "N/A",
+                "reason": "三网单线程速度超过12分钟，已终止；建议稍后单独复测",
+                "source": "TcpQuality pinned upstream",
+                "upstreamCommit": TCPQUALITY_COMMIT,
+                "rows": [],
+                "boundary": boundary,
+                "pathIncludesBusinessEntry": False,
+            }
+        csv_path = newest_speed_csv(started, before)
+        rows = parse_tcpquality_speed_csv(csv_path) if csv_path else []
+        valid = sum(row["status"] == "PASS" for row in rows)
+        status = "PASS" if valid == 9 else "PARTIAL" if valid else "N/A"
+        reason = (
+            f"北上广三网公网单线程有效 {valid}/9"
+            if valid
+            else "未取得可解析的三网单线程速度结果"
+        )
+        if process.returncode and not valid:
+            tail = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output or "")
+            tail = " ".join(tail.splitlines()[-3:])[:220]
+            reason += f"；上游退出码 {process.returncode}" + (f"：{tail}" if tail else "")
+        return {
+            "enabled": True,
+            "status": status,
+            "reason": reason,
+            "source": "ibsgss/TcpQuality --only-speedtest --no-rank-upload",
+            "upstreamCommit": TCPQUALITY_COMMIT,
+            "rows": rows,
+            "boundary": boundary,
+            "pathIncludesBusinessEntry": False,
+        }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "status": "N/A",
+            "reason": f"测速辅助项异常 {type(exc).__name__}: {exc}",
+            "source": "TcpQuality pinned upstream",
+            "upstreamCommit": TCPQUALITY_COMMIT,
+            "rows": [],
+            "boundary": boundary,
+            "pathIncludesBusinessEntry": False,
+        }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def speed_recommendations(speed: dict[str, Any]) -> list[str]:
+    if not speed.get("enabled"):
+        return ["如需三网公网单线程辅助数据，下次加 --speed；真实专线速度仍应由中国客户端直连业务协议测试。"]
+    rows = speed.get("rows") or []
+    valid = [row for row in rows if row.get("status") == "PASS"]
+    notes: list[str] = []
+    if len(valid) < 9:
+        notes.append(f"三网公网单线程仅取得 {len(valid)}/9，失败项应换时段复测，不能按0 Mbps计入质量。")
+    slow = [
+        row for row in valid
+        if min(
+            value for value in (row.get("returnMbps"), row.get("forwardMbps"))
+            if value is not None
+        ) < 50
+    ]
+    if slow:
+        labels = "、".join(str(row["label"]) for row in slow[:4])
+        notes.append(f"{labels}至少一个方向低于50 Mbps，建议晚高峰／闲时各复测一次并与中国客户端真实协议测速对照。")
+    high_retrans = [
+        row for row in valid
+        if row.get("returnRetransmits") is not None
+        and int(row["returnRetransmits"]) >= 1000
+    ]
+    if high_retrans:
+        labels = "、".join(str(row["label"]) for row in high_retrans[:4])
+        notes.append(f"{labels}回程重传偏高，优先检查晚高峰拥塞、出口限速与跨境路径波动。")
+    if valid and not slow and not high_retrans and len(valid) == 9:
+        notes.append("公网辅助测速九组完整，未见明显低速或高重传；仍需中国客户端真实协议测速确认隐藏专线端到端吞吐。")
+    return notes
+
+
+def show_single_thread_speed(speed: dict[str, Any]) -> None:
+    section("AUX / 三网公网单线程速度（辅助项）", CYAN)
+    field("测量边界", speed.get("boundary") or "N/A", YELLOW)
+    field(
+        "状态",
+        f"{speed.get('status', 'N/A')}｜{speed.get('reason', 'N/A')}",
+        GREEN if speed.get("status") == "PASS" else YELLOW,
+    )
+    rows = speed.get("rows") or []
+    if not rows:
+        return
+    carrier_color = {"CT": CYAN, "CU": RED, "CM": GREEN}
+    current_region = ""
+    for row in rows:
+        region = str(row.get("region") or "N/A")
+        if region != current_region:
+            print()
+            print(MAGENTA + f"  {region}" + RESET)
+            print(
+                GRAY
+                + f"  {'地区':<14}{'回程重传':>10}{'回程速度':>14}{'去程速度':>14}"
+                + RESET
+            )
+            current_region = region
+        retrans = row.get("returnRetransmits")
+        return_mbps = row.get("returnMbps")
+        forward_mbps = row.get("forwardMbps")
+        retrans_text = "N/A" if retrans is None else str(retrans)
+        return_text = "N/A" if return_mbps is None else f"{return_mbps:.1f}Mbps"
+        forward_text = "N/A" if forward_mbps is None else f"{forward_mbps:.1f}Mbps"
+        print(
+            carrier_color.get(str(row.get("carrier")), WHITE)
+            + f"  {str(row.get('label') or 'N/A'):<14}"
+            + f"{retrans_text:>10}{return_text:>14}{forward_text:>14}"
+            + RESET
+        )
 
 
 def normalized_city(value: str) -> str:
@@ -1737,8 +2065,11 @@ def mapping_chain(access: dict[str, Any], listener: dict[str, Any], local_status
     )
     if reachable > 0 and listener.get("status") == "PASS" and local_status == "PASS":
         return {
-            "status": "PASS",
-            "reason": "中国省级在线探针可达入口业务端口＋出口端私网主机同端口监听＋本机私网地址吻合",
+            "status": "PARTIAL",
+            "reason": (
+                "入口业务端口可达＋出口同端口监听＋本机私网地址吻合；"
+                "尚缺中国客户端真实协议握手，不能判整条隐藏映射链PASS"
+            ),
         }
     if reachable > 0 and listener.get("status") == "PASS":
         return {
@@ -1788,12 +2119,21 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"{response_summary['confirmed']}/{response_summary['total']}；"
             "仅确认入口端口应答，非独立反向逐跳路由，不计算回程分数"
         ),
+        (
+            f"- 三网公网单线程速度：{report['singleThreadSpeed']['status']} — "
+            f"{report['singleThreadSpeed']['reason']}；不经过中国侧业务入口，"
+            "不参与专线映射链判定"
+        ),
         f"- 出口端业务监听：{listener['status']} — {listener['evidence']}",
         f"- Mieru／Mita 服务：{report['mieruService']['status']} — {report['mieruService']['evidence']}",
         f"- Mieru 真实握手：{report['protocolHandshake']['status']} — {report['protocolHandshake']['reason']}",
         f"- 入口→出口端口映射链：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
         f"- 专线纯内段（可选）：{internal['status']} — {quality_label(internal)}",
         f"- 出口公网一致性：{report['exitMatch']['status']} — {report['exitMatch']['reason']}",
+        "",
+        "## 最终改善建议",
+        "",
+        *[f"- {item}" for item in report.get("improvements") or []],
         "",
         "## 四层判定边界",
         "",
@@ -1824,17 +2164,41 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 原探针 TCP 应答确认（非反向路由）",
         "",
-        "| 省级任务 | 运营商 | 实际探针 | TCP 应答 | RTT | 判定边界 | 状态 |",
-        "|---|---|---|---:|---:|---|---|",
+        "| 省级任务 | 运营商 | 实际探针 | 入口 | TCP 应答 | 判定边界 | 状态 |",
+        "|---|---|---|---|---:|---|---|",
     ])
     for item in report["tcpResponseConfirmations"]:
-        latency = item.get("latency") or {}
-        rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
         lines.append(
             f"| {item['requestedRegion']} | {item['carrierName']} | "
             f"{item.get('probeRegion') or 'N/A'}／{item.get('probeCity') or 'N/A'} | "
-            f"{item.get('tcpResponses', 0)} | {rtt} | "
+            f"`{item['entry']}:{item['port']}` | {item.get('tcpResponses', 0)} | "
             f"原探针收到入口 TCP 应答；非反向逐跳路由 | {item['status']} |"
+        )
+    lines.extend([
+        "",
+        "## 三网公网单线程速度（辅助项）",
+        "",
+        report["singleThreadSpeed"]["boundary"],
+        "",
+        "| 区域 | 测速节点 | 回程重传 | 回程速度 | 去程速度 | 状态 |",
+        "|---|---|---:|---:|---:|---|",
+    ])
+    for item in report["singleThreadSpeed"].get("rows") or []:
+        retrans = (
+            str(item["returnRetransmits"])
+            if item.get("returnRetransmits") is not None else "N/A"
+        )
+        return_speed = (
+            f"{item['returnMbps']:.1f} Mbps"
+            if item.get("returnMbps") is not None else "N/A"
+        )
+        forward_speed = (
+            f"{item['forwardMbps']:.1f} Mbps"
+            if item.get("forwardMbps") is not None else "N/A"
+        )
+        lines.append(
+            f"| {item['region']} | {item['label']} | {retrans} | "
+            f"{return_speed} | {forward_speed} | {item['status']} |"
         )
     stats = internal.get("stats") or {}
     lines.extend([
@@ -1883,7 +2247,9 @@ table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(-
 <div class="grid" id="cards"></div>
 <section class="panel"><h2>MIERU / 出口端可选服务证据</h2><table id="mieru"></table></section>
 <section class="panel"><h2>FORWARD / 省级任务三网去程</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际省／城市</th><th>来源类型</th><th>选点层级</th><th>实际网络／ASN</th><th>代表性</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">省会无探针时先扫描同省全部在线城市；同省运营商机房／未分类运营商网络可作为运营商去程证据并明确标注非家宽。全省仍无指定运营商时，才使用跨省同运营商测点；终点到达标为 PASS_FALLBACK 并计入运营商可达，但不计入原省精准覆盖。NO_PROBE 不代表线路中断或 100% 丢包。</p></section>
-<section class="panel"><h2>TCP RESPONSE / 原探针TCP应答确认（非反向路由）</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际探针</th><th>入口</th><th>应答证据</th><th>RTT</th><th>判定边界</th><th>状态</th><th>说明</th></tr></thead><tbody id="responseRows"></tbody></table></div><p class="note">本区只确认原中国探针收到同一入口、同一业务端口的 TCP 应答。它不是独立反向 traceroute，不显示反向逐跳路径，也不计算回程分数。</p></section>
+<section class="panel"><h2>TCP RESPONSE / 原探针TCP应答确认（非反向路由）</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际探针</th><th>入口</th><th>应答证据</th><th>反向逐跳</th><th>状态</th><th>说明</th></tr></thead><tbody id="responseRows"></tbody></table></div><p class="note">本区只确认原中国探针收到同一入口、同一业务端口的 TCP 应答。去程表中的延迟是入口 TCP 往返 RTT，不是单向去程；此区不重复包装成“回程延迟”。</p></section>
+<section class="panel"><h2>SPEED / 三网公网单线程速度（辅助项）</h2><div style="overflow:auto"><table><thead><tr><th>区域</th><th>测速节点</th><th>回程重传</th><th>回程速度</th><th>去程速度</th><th>状态</th></tr></thead><tbody id="speedRows"></tbody></table></div><p class="note" id="speedBoundary"></p></section>
+<section class="panel"><h2>IMPROVEMENTS / 最终改善建议</h2><ul id="improvements"></ul></section>
 <section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
 </main><script>
 const R={embedded}; const E=s=>String(s??'N/A').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
@@ -1904,7 +2270,11 @@ document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="
 <tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
 <tr><th>NTP</th><td>${{E(M.ntp)}}</td><th>端口监听</th><td class="${{E(R.listener.status)}}">${{E(R.listener.status)}} · ${{E(R.listener.evidence)}}</td></tr>`;
 document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.displayRegion||p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}${{p.sourceClass==='CROSS_PROVINCE_CARRIER_FALLBACK'?'<br><small>跨省最后备援</small>':p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{E(p.sourceClass||'N/A')}}</td><td>${{E(p.selectionTier||'N/A')}}</td><td>${{E(p.probeNetwork||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td>${{p.carrierRepresentative?'本省运营商有效':p.sourceClass==='CROSS_PROVINCE_CARRIER_FALLBACK'?'同运营商可达／非原省代表':'省内第三方参考'}}</td><td>${{p.targetReached?'到达':'未确认'}}${{p.traceTargetReached===false&&p.targetReached?'<br><small>同探针 TCP 复核</small>':''}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
-document.getElementById('responseRows').innerHTML=R.tcpResponseConfirmations.map(p=>`<tr><td>${{E(p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td><code>${{E(p.entry)}}:${{E(p.port)}}</code></td><td>${{E(p.tcpResponses||0)}} 次 TCP 应答</td><td>${{metric(p.latency?.avg,' ms')}}</td><td>端口应答已确认<br><small>非反向逐跳路由</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
+document.getElementById('responseRows').innerHTML=R.tcpResponseConfirmations.map(p=>`<tr><td>${{E(p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td><code>${{E(p.entry)}}:${{E(p.port)}}</code></td><td>${{E(p.tcpResponses||0)}} 次 TCP 应答</td><td>不可见<br><small>非反向路由</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
+const S=R.singleThreadSpeed||{{rows:[],status:'N/A',reason:'未执行',boundary:'N/A'}};
+document.getElementById('speedRows').innerHTML=(S.rows?.length?S.rows:[{{region:'N/A',label:S.reason,returnRetransmits:null,returnMbps:null,forwardMbps:null,status:S.status}}]).map(p=>`<tr><td>${{E(p.region)}}</td><td>${{E(p.label)}}</td><td>${{metric(p.returnRetransmits)}}</td><td>${{metric(p.returnMbps,' Mbps')}}</td><td>${{metric(p.forwardMbps,' Mbps')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td></tr>`).join('');
+document.getElementById('speedBoundary').textContent=S.boundary||S.reason||'N/A';
+document.getElementById('improvements').innerHTML=(R.improvements||[]).map(p=>`<li>${{E(p)}}</li>`).join('');
 document.getElementById('method').textContent=R.methodology;
 document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='ix-route-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
 </script></body></html>""", encoding="utf-8")
@@ -1919,9 +2289,6 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         passed = [x for x in items if x["status"] == "PASS"]
         fallback_passed = [x for x in items if x["status"] == "PASS_FALLBACK"]
         carrier_reached = passed + fallback_passed
-        score = round(
-            (len(passed) * 100 + len(fallback_passed) * 70) / len(items)
-        ) if items else 0
         flat = []
         for item in items:
             latency = item.get("latency") or {}
@@ -1945,16 +2312,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                     f"TCP路由终点 {'到达' if item.get('traceTargetReached') else '未显示'}；"
                     f"{item.get('reason') or 'TCP traceroute 终点到达'}"
                 ),
-                "score": (
-                    100 if item["status"] == "PASS"
-                    else 70 if item["status"] == "PASS_FALLBACK"
-                    else 0
-                ),
-                "stars": (
-                    "★★★★★" if item["status"] == "PASS"
-                    else "★★★★☆" if item["status"] == "PASS_FALLBACK"
-                    else "☆☆☆☆☆"
-                ),
+                "score": None,
+                "stars": "",
                 "avg": latency.get("avg"), "min": None, "max": None,
                 "p95": latency.get("p95"), "jitter": latency.get("jitter"),
                 "stddev": None, "loss": None,
@@ -1994,7 +2353,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 f"跨省同运营商降级 {len(fallback_passed)}；"
                 "仅为入口TCP去程，不代表出口VPS普通公网回程"
             ),
-            "score": score, "stars": "★★★★★" if score >= 80 else "★★★☆☆",
+            "score": None, "stars": "",
             "avg": round(statistics.mean(
                 x["latency"]["avg"] for x in carrier_reached
                 if x.get("latency", {}).get("avg") is not None
@@ -2019,44 +2378,40 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         )
         response_probes = []
         for item in response_items:
-            latency = item.get("latency") or {}
             response_probes.append({
-                "city": item["requestedRegion"],
-                "host": item["entry"], "ip": item["entry"],
+                "requestedRegion": item["requestedRegion"],
+                "probeRegion": item.get("probeRegion") or "",
+                "probeCity": item.get("probeCity") or "",
+                "probeAsn": item.get("probeAsn") or 0,
+                "carrierName": item.get("carrierName") or "",
+                "entry": item["entry"],
+                "port": item["port"],
                 "route": "入口TCP应答已返回原探针（非反向路由）",
                 "evidence": item["reason"],
-                "score": None,
-                "stars": "",
-                "avg": latency.get("avg"), "min": None, "max": None,
-                "p95": latency.get("p95"), "jitter": latency.get("jitter"),
-                "stddev": None, "loss": None,
-                "success": "1/1" if item["status"] == "PASS" else "0/1",
-                "routeHops": 0, "timeoutHops": 0,
-                "backboneTags": ["TCP应答确认", "非反向逐跳路由"],
+                "status": item["status"],
+                "tcpResponses": item.get("tcpResponses") or 0,
+                "reverseRouteVisible": False,
                 "routeNote": "只确认原探针收到入口TCP应答；不计算回程分数",
-                "probeCapital": item["requestedRegion"],
                 "targetSource": "FORWARD_MEASUREMENT_REUSE",
-                "primaryHost": item["entry"],
-                "reachability": item["status"],
             })
         carriers.append({
             "id": carrier, "name": carrier_names[carrier],
-            "route": "TCP去程＋TCP应答确认（非反向路由）",
-            "score": score,
-            "stars": "★★★★★" if score >= 80 else "★★★☆☆",
+            "route": "原探针TCP应答确认（非反向路由）",
+            "score": None,
+            "stars": "",
             "probeCount": len(response_probes),
             "routeTypes": 1 if response_items else 0,
             "forward": summary,
             "forwardRoute": "中国三网探针 → 中国侧入口（TCP去程）",
-            "forwardProbes": flat, "forwardScore": score,
+            "forwardProbes": flat, "forwardScore": None,
             "returnScore": None,
             "tcpResponseRate": response_rate,
             "bidirectional": False,
-            "probes": response_probes,
+            "tcpResponseConfirmations": response_probes,
         })
-    final_score = round(statistics.mean(x["score"] for x in carriers))
     return {
         "version": report["version"], "generated": report["generated"],
+        "reportKind": "IX_ENTRY_AUDIT",
         "target": report["exitIdentity"]["ipMasked"],
         "targetPort": report["entry"]["port"],
         "returnSshHost": report["exitIdentity"]["ipMasked"],
@@ -2071,16 +2426,19 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             ])),
         },
         "final": {
-            "score": final_score,
-            "stars": "★★★★★" if final_score >= 80 else "★★★☆☆",
+            "score": None,
+            "stars": "",
             "title": (
                 f"入口TCP {report['access']['status']}｜"
                 f"原探针应答 {report['tcpResponseSummary']['confirmed']}/"
                 f"{report['tcpResponseSummary']['total']}（非反向路由）"
             ),
             "elapsed": "N/A",
+            "presentationPolicy": "EVIDENCE_ONLY_NO_SCORE_NO_STARS",
         },
         "carriers": carriers,
+        "singleThreadSpeed": report["singleThreadSpeed"],
+        "improvements": report["improvements"],
         "dedicatedLine": {
             "topology": "中国客户端→中国侧公网入口→隐藏内段→出口 VPS→公网出口",
             "entry": f"{report['entry']['masked']}:{report['entry']['port']}",
@@ -2106,6 +2464,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "ntp": report["mieruService"]["ntp"],
             },
             "protocolHandshake": report["protocolHandshake"],
+            "singleThreadSpeed": report["singleThreadSpeed"],
+            "improvements": report["improvements"],
             "tcpResponseConfirmations": [{
                 "carrier": x["carrier"], "requestedRegion": x["requestedRegion"],
                 "probeRegion": x.get("probeRegion") or "",
@@ -2130,7 +2490,7 @@ def publish(report: dict[str, Any]) -> str:
     payload = public_report_payload(report)
     for carrier in payload["carriers"]:
         forward_count = len(carrier.get("forwardProbes") or [])
-        response_count = len(carrier.get("probes") or [])
+        response_count = len(carrier.get("tcpResponseConfirmations") or [])
         if forward_count not in {3, 6} or response_count not in {3, 6}:
             field(
                 "Chain 3Net",
@@ -2298,6 +2658,16 @@ def main() -> int:
         GREEN if response_pass else YELLOW,
     )
 
+    if SPEED_TEST:
+        field(
+            "下一项",
+            "开始北上广三网公网单线程辅助测速，约需4～8分钟；"
+            "该流量不经过中国侧业务入口",
+            YELLOW,
+        )
+    speed = single_thread_speed()
+    show_single_thread_speed(speed)
+
     access = {
         "total": total,
         "pass": sum(x["status"] == "PASS" for x in probes),
@@ -2419,6 +2789,14 @@ def main() -> int:
         mieru,
         chain,
     )
+    if handshake["status"] == "PASS" and chain["status"] == "PARTIAL":
+        chain = {
+            "status": "PASS",
+            "reason": (
+                "入口可达、出口监听、本机私网核对及中国客户端真实协议出口"
+                "已形成端到端闭环证据"
+            ),
+        }
     field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
 
     section("LAYER 4 / 出口公网", GREEN)
@@ -2426,6 +2804,26 @@ def main() -> int:
     field("ASN／运营商", f"{identity.get('asn') or 'N/A'}｜{identity.get('org') or 'N/A'}")
     field("位置", f"{identity.get('country') or 'N/A'} {identity.get('city') or ''}")
     field("与预期出口", f"{exit_match['status']}｜{exit_match['reason']}", GREEN if exit_match["status"] == "PASS" else YELLOW)
+
+    improvements: list[str] = []
+    if access["pass"] < access["total"]:
+        improvements.append(
+            f"原省指定运营商精确探针仅 {access['pass']}/{access['total']}；"
+            "跨省同运营商结果只证明可达，建议补充目标省真实客户端复测。"
+        )
+    if internal["status"] != "PASS":
+        improvements.append(
+            "尚未取得入口私网对端，无法观察同路径内段回程；"
+            "可向供应商索取私网对端，或在真实连接建立后重新执行。"
+        )
+    if handshake["status"] != "PASS":
+        improvements.append(
+            "尚未完成中国客户端真实协议握手；连接节点后核对客户端公网出口，"
+            "再用 --client-verified-exit 提交实测出口。"
+        )
+    improvements.extend(speed_recommendations(speed))
+    if not improvements:
+        improvements.append("当前证据闭环完整；建议保留闲时与晚高峰两份报告用于对比。")
 
     generated = dt.datetime.now(dt.timezone.utc).astimezone()
     report = {
@@ -2450,7 +2848,9 @@ def main() -> int:
         "probes": probes,
         "tcpResponseConfirmations": tcp_responses,
         "tcpResponseSummary": response_summary,
+        "singleThreadSpeed": speed,
         "protocolHandshake": handshake,
+        "improvements": improvements,
         "clientVerifiedExit": mask_ip(client_verified_exit),
         "privacy": (
             "入口、出口、内网对端及客户端实测IPv4仅保留前两段；"
@@ -2506,10 +2906,16 @@ def main() -> int:
         for carrier_payload in payload_check["carriers"]:
             if len(carrier_payload.get("forwardProbes") or []) != 6:
                 raise AssertionError("公共报告去程必须为每网六组")
-            if len(carrier_payload.get("probes") or []) != 6:
+            if len(carrier_payload.get("tcpResponseConfirmations") or []) != 6:
                 raise AssertionError("公共报告TCP应答确认必须为每网六组")
-            if carrier_payload.get("route") != "TCP去程＋TCP应答确认（非反向路由）":
+            if carrier_payload.get("route") != "原探针TCP应答确认（非反向路由）":
                 raise AssertionError("公共报告TCP应答判定名称错误")
+            if carrier_payload.get("score") is not None:
+                raise AssertionError("公共报告不得保留三网评分")
+            if carrier_payload.get("stars"):
+                raise AssertionError("公共报告不得保留星级")
+            if carrier_payload.get("forwardScore") is not None:
+                raise AssertionError("公共报告不得计算去程分数")
             if carrier_payload.get("returnScore") is not None:
                 raise AssertionError("公共报告不得计算回程分数")
             if carrier_payload.get("bidirectional") is not False:
@@ -2522,6 +2928,15 @@ def main() -> int:
             raise AssertionError("公共页目标VPS与出口ASN身份未对齐")
         if "returns" in payload_check.get("ixData", {}):
             raise AssertionError("公共报告仍残留误导性的returns字段")
+        if payload_check.get("final", {}).get("score") is not None:
+            raise AssertionError("公共报告最终结论不得保留评分")
+        if payload_check.get("final", {}).get("stars"):
+            raise AssertionError("公共报告最终结论不得保留星级")
+        speed_check = payload_check.get("singleThreadSpeed") or {}
+        if len(speed_check.get("rows") or []) != 9:
+            raise AssertionError("三网单线程速度必须包含三地区×三运营商九组")
+        if speed_check.get("pathIncludesBusinessEntry") is not False:
+            raise AssertionError("公网单线程速度不得冒充中国侧业务入口链路")
 
     output_name = f"ix-route-report-{generated.strftime('%Y%m%d-%H%M%S')}"
     preferred_root = Path("/root") if os.geteuid() == 0 else Path.cwd()
@@ -2562,6 +2977,14 @@ def main() -> int:
     field("Mieru／Mita 服务", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)
     field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
     field("出口公网", f"{exit_match['status']}｜{mask_ip(identity.get('ip', ''))}", GREEN if exit_match["status"] == "PASS" else YELLOW)
+    field(
+        "三网单线程辅助",
+        f"{speed['status']}｜{speed['reason']}｜不经过中国侧业务入口",
+        GREEN if speed["status"] == "PASS" else YELLOW,
+    )
+    section("IMPROVEMENTS / 最终判定建议改善", MAGENTA)
+    for index, suggestion in enumerate(improvements, start=1):
+        field(f"建议 {index}", suggestion, YELLOW)
     field("HTML 网页", str(html_path), GREEN)
     field("Markdown 报告", str(md_path), GREEN)
     field("JSON 数据", str(json_path), GREEN)
