@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.4 RC1"
+VERSION="v0.5 RC1"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,7 +14,7 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.4 RC1
+沪日专线／IX-style 四层质量检测 v0.5 RC1
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -108,7 +108,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.4 RC1")
+VERSION = os.environ.get("IX_VERSION", "v0.5 RC1")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -171,6 +171,31 @@ RETURN_TARGETS = {
 CAPITALS = {
     "北京": "北京市", "上海": "上海市", "广东": "广州市",
     "安徽": "合肥市", "江苏": "南京市", "浙江": "杭州市",
+}
+CITY_CANDIDATES = {
+    # 必须先试省会；仅在省会没有在线探针时，才允许退到同省城市。
+    "北京": ["Beijing"],
+    "上海": ["Shanghai"],
+    "广东": ["Guangzhou", "Shenzhen", "Dongguan", "Foshan"],
+    "安徽": ["Hefei", "Wuhu"],
+    "江苏": ["Nanjing", "Suzhou", "Wuxi", "Changzhou"],
+    "浙江": ["Hangzhou", "Ningbo", "Wenzhou", "Jiaxing"],
+}
+CARRIER_SELECTORS = {
+    "CT": ["China Telecom", "AS4134"],
+    "CU": ["China Unicom", "AS4837"],
+    "CM": ["China Mobile", "AS9808"],
+}
+CARRIER_ASNS = {
+    # Globalping 的家宽探针可能挂在省网／接入网 ASN，而不是骨干主 ASN。
+    "CT": {4134, 4812, 134768},
+    "CU": {4837, 4808, 17621, 17816, 134542},
+    "CM": {9808, 56040, 56041, 56042, 56044, 56046, 56047, 58453},
+}
+CARRIER_NAME_RE = {
+    "CT": re.compile(r"china\s*telecom|chinanet|中国电信", re.I),
+    "CU": re.compile(r"china\s*unicom|china169|中国联通", re.I),
+    "CM": re.compile(r"china\s*mobile|cmnet|cmi|中国移动", re.I),
 }
 
 
@@ -502,22 +527,30 @@ def ping_peer(peer: str, count: int = 20) -> dict[str, Any]:
 
 def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str) -> dict[str, Any]:
     name, asn, _ = CARRIERS[carrier]
-    attempts = [
-        (
-            f"{CAPITALS[region]}+AS{asn}+家宽",
-            {"country": "CN", "city": city, "asn": asn, "tags": ["eyeball-network"], "limit": 1},
-        ),
-        (
-            f"{CAPITALS[region]}+AS{asn}",
-            {"country": "CN", "city": city, "asn": asn, "limit": 1},
-        ),
-        (
-            f"{CAPITALS[region]}+AS{asn} magic",
-            {"magic": f"{city}+AS{asn}", "limit": 1},
-        ),
-    ]
+    # Globalping 官方 magic 语法使用英文地点＋网络／ASN＋eyeball 叠加筛选。
+    # 旧版把 city/asn/tags 组成静态 location，API 对多数中国组合直接回 422。
+    # 新版严格按“省会优先→同省备选”预筛；绝不跨省或用全国探针冒充。
+    attempts: list[tuple[str, dict[str, Any], str, bool]] = []
+    for candidate_city in CITY_CANDIDATES.get(region, [city]):
+        is_capital = candidate_city == city
+        for selector in CARRIER_SELECTORS[carrier]:
+            attempts.extend([
+                (
+                    f"{candidate_city}+{selector}+eyeball",
+                    {"magic": f"{candidate_city}+{selector}+eyeball", "limit": 1},
+                    candidate_city,
+                    is_capital,
+                ),
+                (
+                    f"{candidate_city}+{selector}",
+                    {"magic": f"{candidate_city}+{selector}", "limit": 1},
+                    candidate_city,
+                    is_capital,
+                ),
+            ])
     errors: list[str] = []
-    for mode, location in attempts:
+    unavailable_selectors = 0
+    for mode, location, requested_city, is_capital in attempts:
         try:
             created = http_json(
                 GLOBALPING_API,
@@ -551,10 +584,19 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             probe = item.get("probe") or {}
             source_asn = int(probe.get("asn") or 0)
             actual_city = str(probe.get("city") or "")
-            city_verified = re.sub(r"[^a-z]", "", actual_city.lower()) == re.sub(
-                r"[^a-z]", "", city.lower()
+            actual_network = str(
+                probe.get("network")
+                or probe.get("networkName")
+                or probe.get("isp")
+                or ""
             )
-            asn_verified = source_asn == asn
+            city_verified = re.sub(r"[^a-z]", "", actual_city.lower()) == re.sub(
+                r"[^a-z]", "", requested_city.lower()
+            )
+            asn_verified = (
+                source_asn in CARRIER_ASNS[carrier]
+                or bool(CARRIER_NAME_RE[carrier].search(actual_network))
+            )
             route_lines: list[str] = []
             target_rtts: list[float] = []
             last_rtts: list[float] = []
@@ -579,12 +621,19 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
             reasons: list[str] = []
             if not city_verified:
                 reasons.append(
-                    f"省会核对失败：请求 {CAPITALS[region]}，实际 {actual_city or '未知城市'}"
+                    f"城市核对失败：请求 {requested_city}，实际 {actual_city or '未知城市'}"
                 )
             if not asn_verified:
-                reasons.append(f"运营商核对失败：预期 AS{asn}，实际 AS{source_asn or 'N/A'}")
+                reasons.append(
+                    f"运营商核对失败：预期 {name}，实际 AS{source_asn or 'N/A'}"
+                    f" {actual_network or '未知网络'}"
+                )
             if not reached:
                 reasons.append("TCP traceroute 未显示终点；不等于真实业务 100% 丢包")
+            if not is_capital:
+                reasons.append(
+                    f"省会 {city} 无可用探针，已退到同省 {requested_city}"
+                )
             return {
                 "carrier": carrier,
                 "carrierName": name,
@@ -592,6 +641,9 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 "mode": mode,
                 "probeCity": actual_city,
                 "probeAsn": source_asn,
+                "probeNetwork": actual_network,
+                "capitalPreferred": is_capital,
+                "selectorCity": requested_city,
                 "asnVerified": asn_verified,
                 "cityVerified": city_verified,
                 "status": status,
@@ -600,22 +652,36 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 "route": "\n".join(route_lines),
                 "reason": "；".join(reasons),
             }
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:180]
+            if exc.code == 422:
+                unavailable_selectors += 1
+                errors.append(f"{mode}: 无在线匹配探针")
+            else:
+                errors.append(f"{mode}: HTTP {exc.code} {detail}")
         except Exception as exc:
             errors.append(f"{mode}: {type(exc).__name__}: {exc}")
     return {
         "carrier": carrier,
         "carrierName": name,
         "requestedRegion": region,
-        "mode": "N/A",
+        "mode": "NO_PROBE" if unavailable_selectors == len(attempts) else "N/A",
         "probeCity": "",
         "probeAsn": 0,
+        "probeNetwork": "",
+        "capitalPreferred": True,
+        "selectorCity": city,
         "asnVerified": False,
         "cityVerified": False,
-        "status": "N/A",
+        "status": "NO_PROBE" if unavailable_selectors == len(attempts) else "N/A",
         "targetReached": False,
         "latency": summarize([], 0),
         "route": "",
-        "reason": "；".join(errors),
+        "reason": (
+            f"已按省会优先筛选 {len(attempts)} 组候选；该省 {name} 当前没有在线匹配探针"
+            if unavailable_selectors == len(attempts)
+            else "；".join(errors[-6:])
+        ),
     }
 
 
@@ -792,7 +858,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 结论",
         "",
-        f"- 上海入口端到端 TCP：{access['status']}（PASS {access['pass']}/{access['total']}，INCONCLUSIVE {access['inconclusive']}，N/A {access['na']}）",
+        f"- 上海入口端到端 TCP：{access['status']}（PASS {access['pass']}/{access['total']}，INCONCLUSIVE {access['inconclusive']}，NO_PROBE {access.get('noProbe', 0)}，N/A {access['na']}）",
         f"- 日本端业务监听：{listener['status']} — {listener['evidence']}",
         f"- Mieru／Mita 服务：{report['mieruService']['status']} — {report['mieruService']['evidence']}",
         f"- Mieru 真实握手：{report['protocolHandshake']['status']} — {report['protocolHandshake']['reason']}",
@@ -872,7 +938,7 @@ def write_html(report: dict[str, Any], path: Path) -> None:
 main{{max-width:1280px;margin:auto;padding:28px}}header,.panel{{background:rgba(13,27,45,.94);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px #0006}}
 header{{padding:25px;margin-bottom:18px}}h1{{margin:0;color:var(--cyan);letter-spacing:.06em}}.sub{{color:var(--muted);margin-top:7px}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
 .card{{padding:15px;border-radius:10px;background:#091827;border:1px solid var(--line)}}.card span{{display:block;color:var(--muted)}}.card strong{{display:block;margin-top:8px;font-size:18px}}
-.PASS{{color:var(--green)}}.FAIL{{color:var(--red)}}.N\\/A,.INCONCLUSIVE,.PARTIAL{{color:var(--yellow)}}.panel{{padding:20px;margin:16px 0}}h2{{font-size:16px;color:var(--cyan);margin:0 0 14px}}
+.PASS{{color:var(--green)}}.FAIL{{color:var(--red)}}.N\\/A,.NO_PROBE,.INCONCLUSIVE,.PARTIAL{{color:var(--yellow)}}.panel{{padding:20px;margin:16px 0}}h2{{font-size:16px;color:var(--cyan);margin:0 0 14px}}
 .topology{{display:flex;align-items:center;gap:8px;overflow:auto;padding:6px 0}}.node{{min-width:180px;background:#091827;border:1px solid #2e5576;border-radius:10px;padding:13px;text-align:center}}.arrow{{color:var(--yellow);font-size:20px}}
 table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}}th{{color:var(--muted)}}code{{color:#a9efff}}button{{background:#0e7490;color:white;border:0;border-radius:8px;padding:9px 13px;cursor:pointer;margin-right:8px}}
 .note{{color:var(--muted)}}@media(max-width:850px){{.grid{{grid-template-columns:1fr 1fr}}main{{padding:14px}}}}@media print{{body{{background:white;color:#111}}header,.panel{{box-shadow:none;background:white}}}}
@@ -882,11 +948,12 @@ table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(-
 <section class="panel"><h2>TOPOLOGY / 实际业务拓扑</h2><div class="topology" id="topology"></div></section>
 <div class="grid" id="cards"></div>
 <section class="panel"><h2>MIERU / 日本端服务证据</h2><table id="mieru"></table></section>
-<section class="panel"><h2>FORWARD / 北上广固定三网去程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>实际探针</th><th>城市</th><th>ASN</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section class="panel"><h2>FORWARD / 北上广固定三网去程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>实际探针</th><th>城市</th><th>ASN</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">NO_PROBE 表示该省／运营商当前没有在线匹配探针，不代表线路中断或 100% 丢包。</p></section>
 <section class="panel"><h2>RETURN / 日本出口至北上广固定三网回程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>目标</th><th>跳点</th><th>RTT</th><th>路由标签</th><th>骨干证据</th><th>状态</th></tr></thead><tbody id="returnRows"></tbody></table></div></section>
 <section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
 </main><script>
 const R={embedded}; const E=s=>String(s??'N/A').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+const metric=(v,suffix='')=>v===null||v===undefined||v===''?'N/A':`${{E(v)}}${{suffix}}`;
 const badge=(label,obj)=>`<article class="card"><span>${{E(label)}}</span><strong class="${{E(obj.status)}}">${{E(obj.status)}}</strong><small>${{E(obj.reason||obj.evidence||'')}}</small></article>`;
 document.getElementById('meta').textContent=`${{R.generated}} · ${{R.version}} · ${{R.matrix}}`;
 document.getElementById('topology').innerHTML=[
@@ -902,8 +969,8 @@ const M=R.mieruService;
 document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="${{E(M.status)}}">${{E(M.status)}}</td><th>版本</th><td>${{E(M.version)}}</td></tr>
 <tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
 <tr><th>NTP</th><td>${{E(M.ntp)}}</td><th>端口监听</th><td class="${{E(R.listener.status)}}">${{E(R.listener.status)}} · ${{E(R.listener.evidence)}}</td></tr>`;
-document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeCity)}}</td><td>${{p.cityVerified?'已核对':'未核对'}}</td><td>${{p.asnVerified?'已核对':'未核对'}}</td><td>${{p.targetReached?'到达':'未确认'}}</td><td>${{E(p.latency?.avg)}} ms</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
-document.getElementById('returnRows').innerHTML=R.returns.map(p=>`<tr><td>${{E(p.capital)}}</td><td>${{E(p.carrierName)}}</td><td><code>${{E(p.host)}}</code></td><td>${{E(p.routeHops)}}</td><td>${{E(p.latency?.avg)}} ms</td><td>${{E(p.routeClass)}}</td><td>${{E((p.backboneTags||[]).join(' → '))}}<br><small>${{E(p.routeNote)}}</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td></tr>`).join('');
+document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeCity||'N/A')}}${{p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{p.cityVerified?'已核对':'未核对'}}</td><td>${{p.asnVerified?'已核对':'未核对'}}</td><td>${{p.targetReached?'到达':'未确认'}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
+document.getElementById('returnRows').innerHTML=R.returns.map(p=>`<tr><td>${{E(p.capital)}}</td><td>${{E(p.carrierName)}}</td><td><code>${{E(p.host)}}</code></td><td>${{p.routeHops?E(p.routeHops):'N/A'}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td>${{E(p.routeClass)}}</td><td>${{E((p.backboneTags||[]).join(' → '))}}<br><small>${{E(p.routeNote)}}</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td></tr>`).join('');
 document.getElementById('method').textContent=R.methodology;
 document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='ix-route-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
 </script></body></html>""", encoding="utf-8")
@@ -1178,12 +1245,13 @@ def main() -> int:
         "pass": sum(x["status"] == "PASS" for x in probes),
         "inconclusive": sum(x["status"] == "INCONCLUSIVE" for x in probes),
         "na": sum(x["status"] == "N/A" for x in probes),
+        "noProbe": sum(x["status"] == "NO_PROBE" for x in probes),
     }
     access["coverage"] = round(access["pass"] * 100 / total, 1) if total else 0.0
     access["status"] = (
         "PASS" if access["pass"] / total >= 0.8
         else "PARTIAL" if access["pass"] > 0
-        else "N/A" if access["na"] == total
+        else "N/A" if access["na"] + access["noProbe"] == total
         else "INCONCLUSIVE"
     )
 
@@ -1257,7 +1325,8 @@ def main() -> int:
             "只有中国客户端连接 Mieru 后实测出口与日本端实际／预期出口一致，"
             "才把真实握手判为 PASS。供应商确实提供上海内网对端时，才用 20 次 ICMP 与 "
             "MTR／traceroute 增测专线纯内段。"
-            "探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
+            "去程先按省会筛选在线探针，省会无探针时只允许退到同省城市；"
+            "全省无匹配探针记 NO_PROBE。探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
             "不会换算为 100% 业务丢包。"
         ),
     }
@@ -1280,7 +1349,7 @@ def main() -> int:
     public_url = "" if SELF_TEST or NO_PUBLISH else publish(report)
 
     section("FINAL / 四层独立结论", CYAN)
-    field("上海入口接入", f"{access['status']}｜PASS {access['pass']}/{access['total']}｜覆盖 {access['coverage']}%", GREEN if access["status"] == "PASS" else YELLOW)
+    field("上海入口接入", f"{access['status']}｜PASS {access['pass']}/{access['total']}｜NO_PROBE {access['noProbe']}｜覆盖 {access['coverage']}%", GREEN if access["status"] == "PASS" else YELLOW)
     return_pass = sum(x["status"] == "PASS" for x in returns)
     field("北上广／六地回程", f"PASS {return_pass}/{len(returns)}｜N/A/未确认不计 100% LOSS", GREEN if return_pass else YELLOW)
     field("上海→日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
