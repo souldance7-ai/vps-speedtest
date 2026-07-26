@@ -1,6 +1,6 @@
 # 中国三网入口去程／TCP应答与专线映射核对
 
-版本：v1.1.0  
+版本：v1.2.0  
 脚本：[`ix-route.sh`](ix-route.sh)
 
 ## 1. 适用架构
@@ -49,12 +49,29 @@
 
 正式版不会运行“出口 VPS → 其他中国公共 IP”的默认公网 traceroute 来充当专线回程。那种测试只能说明出口 VPS 的普通互联网回程，不能代表当前入口映射连接的反向路径。
 
+### 三网公网单线程速度（可选辅助项）
+
+加上 `--speed` 后，CMD、本地 HTML／JSON／Markdown 与公共报告会增加北京、上海、广东三网九组单线程数据：
+
+- 回程重传
+- 回程速度
+- 去程速度
+
+此模块调用固定提交版本的开源 [ibsgss/TcpQuality](https://github.com/ibsgss/TcpQuality)，并关闭排行榜上传。它测量的是“出口 VPS ↔ 中国三网公共 TOS 测速端”，不经过用户填写的中国侧业务入口，因此：
+
+- 可作为日本出口 VPS 的三网公网单线程能力参考。
+- 不能代表中国客户端经过 Mieru／其他业务协议的真实端到端速度。
+- 不参与入口映射链、真实握手与专线 PASS 判定。
+- 真正的滬日隐藏专线吞吐仍需在中国客户端连接实际业务协议后另测。
+- 执行约需 4～8 分钟，并会产生明显测试流量；流量计费 VPS 请先确认余量。
+- 运行时会临时下载上游测速组件；脚本固定上游提交并使用 `--no-rank-upload`，不会参与速度排行榜。
+
 ## 3. 一键执行
 
 在出口 VPS 的 Linux 终端执行：
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh") --full
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh") --full --speed
 ```
 
 ## 4. 下载 `.sh` 后执行
@@ -64,7 +81,7 @@ curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/h
   -o /root/ix-route.sh
 
 chmod +x /root/ix-route.sh
-bash /root/ix-route.sh --full
+bash /root/ix-route.sh --full --speed
 ```
 
 需要保留本地脚本、稍后重复测试时，推荐使用这一方式。
@@ -79,10 +96,11 @@ bash /root/ix-route.sh --full
 4. 出口端专线内网 IPv4；没有或未知可直接回车。
 5. 入口端专线内网对端；未知可直接回车，脚本会尝试从业务端口的活动私网连接识别。
 
-默认测试北上广三地区×三网。公开评测建议加 `--full`，覆盖六地区×三网：
+默认测试北上广三地区×三网。公开评测建议加 `--full --speed`，路由覆盖六地区×三网，并追加北上广三网单线程速度：
 
 ```text
 18组TCP去程 + 18组原探针TCP应答确认（非反向路由）
+9组三网公网单线程速度（辅助项，不经过中国侧业务入口）
 ```
 
 ## 6. 非交互执行
@@ -95,7 +113,8 @@ bash /root/ix-route.sh \
   --local-private 你的出口端内网IPv4 \
   --peer 你的入口端内网对端IPv4 \
   --client-verified-exit 中国客户端连接后实测出口IPv4 \
-  --full
+  --full \
+  --speed
 ```
 
 未知的可选值可以整项删除。`--client-verified-exit` 主要用于 Mieru 真实握手核对。
@@ -114,7 +133,7 @@ bash /root/ix-route.sh \
 终端底部会显示公共页链接。只想保存在 VPS，不上传公共页：
 
 ```bash
-bash /root/ix-route.sh --full --no-publish
+bash /root/ix-route.sh --full --speed --no-publish
 ```
 
 ## 8. 状态说明
@@ -157,11 +176,35 @@ IPv4：前两段.*.*
 - 没有入口私网对端或活动私网连接时，同路径内段回程必须显示 `N/A`，不能用普通公网回程代替。
 - `PASS_FALLBACK` 证明该运营商可达，不代表原省网络质量。
 - 入口可达与出口监听能形成映射链证据，但只有实际客户端连接后出口一致，才能进一步确认真实协议握手。
+- 单线程速度仅为出口 VPS 公网辅助项，不能用于证明隐藏专线吞吐或协议握手。
+- 最终判定不再输出分数或星级；报告会依据缺失证据、低速与高重传列出“建议改善”。
 
-## 11. 离线自检
+## 11. CMD 与报告显示
+
+执行 `--speed` 后，CMD 与三种本地报告、公共报告使用同一组结构化数据，显示方式为：
+
+```text
+三网公网单线程速度（辅助项）
+地区      回程重传    回程速度    去程速度
+北京电信       ...      ...Mbps     ...Mbps
+```
+
+报告会紧邻表格注明“不经过中国侧业务入口”。失败项显示 `N/A`，不会以 `0 Mbps` 计入判定。
+
+最终页分开显示：
+
+- 中国侧入口 TCP 可达与原省／跨省探针覆盖。
+- 原探针 TCP 应答确认；明确注明非反向逐跳路由。
+- 映射链证据、私网内段回程、真实协议握手与出口公网。
+- 三网公网单线程辅助项。
+- 建议改善；包括缺少原省探针、未取得私网对端、未完成真实握手、低速或高重传。
+
+三网详情页不会再显示“RETURN／VPS → 探针”、重复 RTT、回程分数或星级。
+
+## 12. 离线自检
 
 ```bash
-bash /root/ix-route.sh --self-test --full --no-publish
+bash /root/ix-route.sh --self-test --full --speed --no-publish
 ```
 
 自检会验证：
@@ -171,5 +214,7 @@ bash /root/ix-route.sh --self-test --full --no-publish
 - 省份与运营商选点规则
 - `PASS_FALLBACK` 与原省精准覆盖分离
 - 公共报告三网映射
+- 北上广三网九组单线程速度结构及测量边界
+- 最终评分／星级移除
 - JSON、HTML、Markdown生成
 - 用户相关 IPv4 与业务端口脱敏
