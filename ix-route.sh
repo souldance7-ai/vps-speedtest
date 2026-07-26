@@ -1486,7 +1486,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "host": x["host"], "status": x["status"],
                 "primaryHost": x.get("primaryHost", x["host"]),
                 "targetSource": x.get("targetSource", "STATIC_PRIMARY"),
-                "routeClass": x["routeClass"], "routeHops": x["routeHops"],\n                "selectedProtocol": x.get("selectedProtocol", "N/A"),
+                "routeClass": x["routeClass"], "routeHops": x["routeHops"],
+                "selectedProtocol": x.get("selectedProtocol", "N/A"),
                 "latency": x["latency"],
             } for x in report["returns"]],
             "internal": {
@@ -1709,7 +1710,8 @@ def main() -> int:
             "测量使用严格 country+city+ASN+tag 参数；只有确认所有合法候选均无在线探针才记 NO_PROBE，"
             "结构化 no_probes_found 与其他 API 422 分开处理。"
             "回程参考 oneclickvirt/backtrace 的备援策略：每省每运营商保留固定主测点，"
-            "主测点骨干证据不足时，从每日更新的省级三网 ICMP 目标池选择最多两个备援地址；"\n            "每个目标先以 TCP 三探测追踪，证据不足时依次回退 ICMP 与 UDP，最大 30 跳、单跳等待 2 秒；"
+            "主测点骨干证据不足时，从每日更新的省级三网 ICMP 目标池选择最多两个备援地址；"
+            "每个目标先以 TCP 三探测追踪，证据不足时依次回退 ICMP 与 UDP，最大 30 跳、单跳等待 2 秒；"
             "备援仅改变日本出口的回程目标，不会冒充中国侧去程来源。"
             "探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
             "不会换算为 100% 业务丢包。"
