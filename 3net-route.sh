@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2 SIX-REGION FULL"
+VERSION="v0.9 RC4.2.1 SIX-REGION FULL"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2 六地区完整版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.1 六地区完整版
 
 用法：
   bash 中国三网VPS双程质量检测_v0.9_RC4.2_六地区完整版.sh
@@ -72,7 +72,9 @@ export THREE_NET_SELF_TEST="$SELF_TEST"
 export THREE_NET_TARGET="$TARGET"
 export THREE_NET_TARGET_PORT="$TARGET_PORT"
 
-python3 - <<'PY'
+# 将 Python 源码放到独立文件描述符 3，保留标准输入给 input() 读取终端。
+# 这样直接运行、curl 进程替换、管道输入三种方式都不会在交互提示处 EOF。
+python3 /dev/fd/3 3<<'PY'
 from __future__ import annotations
 
 import datetime as dt
@@ -95,7 +97,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2 SIX-REGION FULL")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.1 SIX-REGION FULL")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
