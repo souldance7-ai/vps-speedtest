@@ -1,5 +1,36 @@
 # LazyVPS VPS 测速正式 v1.0
 
+## RC4.2 六地区三网双程质量检测
+
+适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京、上海、广东、安徽、江苏、浙江六地区，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
+
+### VPS / Linux 一键执行（推荐）
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh)
+```
+
+运行后按提示输入：
+
+- 目标 IP，例如 `203.55.99.88`
+- 协议业务端口，例如 `443`（不是 SSH 端口 `22`）
+
+### 下载到 VPS 后执行
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh
+```
+
+### Windows CMD 远程触发
+
+```cmd
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
+```
+
+> 当前版本：RC4.2 六地区完整版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+
+---
+
 <p align="center">
   <b>中国三网 VPS 综合闭环测速工具包</b><br>
   <sub>VPS 回程 · 中国本地去程 · 代理体感 · BBS 信息板 · Markdown / CSV / MTR / Traceroute 留档</sub>
