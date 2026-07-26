@@ -23,15 +23,15 @@
 
 ---
 
-## RC4.2.6 运营商定向选点版
+## RC4.2.7 动态回程测点池版
 
-适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京市、上海市、广州市、合肥市、南京市、杭州市六个省会，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
+适用于在 VPS 内检测中国电信、联通、移动的去程与回程质量，覆盖北京、上海、广东、安徽、江苏、浙江六省三网，并生成 CMD、HTML、JSON、公共报告及 NodeSeek 格式。
 
-RC4.2.6 不再先随机扫描整座城市；每个地区、每家运营商分别用省会＋运营商名称／省级接入 ASN 定向请求测点。省会没有在线探针时，才依次退到同省候选城市，并在 CMD、HTML、JSON、NodeSeek 标明 `CAPITAL` 或 `PROVINCE_FALLBACK`、实际城市和 ASN。上海联通 AS17621／AS4837、广州联通 AS17622、北京移动 AS56048 等省级接入网可用于确认测点身份，但精品／普通线路仍只按 traceroute 的实际骨干证据判定。
+RC4.2.7 将两个方向严格分开：去程仍使用 Globalping 的中国外部探针，有真实探针才纳入判断；无在线探针时显示 `INCONCLUSIVE`，不以回程反推去程。回程改为运行时取得“省份＋运营商＋固定 IP＋真实 TCP 端口＋备用 IP/端口”的动态节点资料，主节点健康检查失败才切换同省同运营商备用节点；动态池缺项或整体不可用时才使用内置静态目标。
 
-去程每列显示 `ONLINE-CAPITAL`、`ONLINE-PROVINCE-FALLBACK` 或 `OFFLINE`。北京、上海没有跨直辖市备用；广东、安徽、江苏、浙江只允许同省备用。回程依次尝试 TCP/443、ICMP、UDP traceroute，先选择骨干证据等级最高的一组，等级相同才采用回覆跳点更多者，避免普通路由覆盖 AS9929／CN2／CMIN2 证据。CMD、HTML、JSON 与 NodeSeek 同步显示测点健康、实际 ASN、骨干标签及中文路由注释。
+回程质量用实际节点端口的 TCP connect 计算，并以 TCP traceroute、ICMP、UDP 三种路由交叉取证；CN2 GIA、AS9929、CMIN2 等等级仍只依实际跳点判断。CMD、HTML、JSON 与 NodeSeek 同步显示节点来源、实际端口、主备切换、骨干标签和中文路由注释。动态节点池设计参考公开项目 [ibsgss/TcpQuality](https://github.com/ibsgss/TcpQuality) 的 `getNodes` 数据格式；可用环境变量 `THREE_NET_RETURN_POOL` 指定兼容 TSV 节点源。
 
-[AntPing](https://antping.com/) 当前可用于人工交叉复核国内 TCP 连通与路由追踪；脚本不调用其未公开网页接口，避免接口或页面改版再次造成批量失效。
+[AntPing](https://antping.com/) 继续仅用于人工交叉复核，不调用其未公开网页接口。
 
 ### VPS / Linux 一键执行（推荐）
 
@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.6 运营商定向选点版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.7 动态回程测点池版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
 
 ---
 
