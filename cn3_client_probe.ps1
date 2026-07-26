@@ -1,19 +1,26 @@
 <#
-LazyVPS CN3 Client Probe v3.0.0-open
+LazyVPS CN3 Client Probe v3.1.0-forward
 中国本地端 / Windows 客户端去程与代理体感测试脚本
 
 示例：
 powershell -ExecutionPolicy Bypass -File .\cn3_client_probe.ps1 -VpsHost 1.2.3.4 -Ports 22,443,8443 -Proxy http://127.0.0.1:7890
+powershell -ExecutionPolicy Bypass -File .\cn3_client_probe.ps1 -VpsHost 1.2.3.4 -Ports 443 -Carrier CT -Region 安徽 -City 合肥市 -EvidenceOut .\forward_evidence.json
 #>
 param(
     [string]$VpsHost = "",
     [int[]]$Ports = @(22),
     [string]$Proxy = "",
     [int]$PingCount = 10,
-    [string]$OutDir = ""
+    [string]$OutDir = "",
+    [string]$Carrier = "",
+    [string]$Region = "",
+    [string]$City = "",
+    [string]$SourceAsn = "",
+    [string]$SourceNetwork = "",
+    [string]$EvidenceOut = ""
 )
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "3.0.0-open"
+$Version = "3.1.0-forward"
 
 function NowStamp { return (Get-Date).ToString("yyyyMMdd_HHmmss") }
 function FitText([string]$Text, [int]$Width) {
@@ -108,6 +115,18 @@ function ScoreClient($Ping, $TcpRows, $ProxyRows) {
     if ($score -gt 100) { $score = 100 }
     return [Math]::Round($score,1)
 }
+function GetClientIdentity {
+    try {
+        $x = Invoke-RestMethod -Uri "https://ipwho.is/" -TimeoutSec 8
+        return [PSCustomObject]@{
+            Asn = $(if ($x.connection.asn) { "AS$($x.connection.asn)" } else { "" })
+            Network = $(if ($x.connection.isp) { [string]$x.connection.isp } elseif ($x.connection.org) { [string]$x.connection.org } else { "" })
+            City = $(if ($x.city) { [string]$x.city } else { "" })
+        }
+    } catch {
+        return [PSCustomObject]@{Asn=""; Network=""; City=""}
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($VpsHost)) { $VpsHost = Read-Host "请输入 VPS IP 或域名" }
 if ([string]::IsNullOrWhiteSpace($VpsHost)) { Write-Host "未输入 VPS 地址，退出。" -ForegroundColor Red; exit 1 }
@@ -130,7 +149,11 @@ $tcpRows = @()
 foreach ($p in $Ports) { $tcpRows += TestTcpPort -HostName $VpsHost -Port $p }
 
 $traceFile = Join-Path $OutDir "tracert_to_vps.txt"
-try { tracert -d $VpsHost | Out-File -Encoding UTF8 $traceFile } catch {}
+$traceText = ""
+try {
+    $traceText = (tracert -d $VpsHost | Out-String)
+    $traceText | Out-File -Encoding UTF8 $traceFile
+} catch {}
 
 $proxyRows = @()
 if (-not [string]::IsNullOrWhiteSpace($Proxy)) {
@@ -184,6 +207,67 @@ $md += "|---|---|---|---|"
 foreach ($r in $proxyRows) { $md += "| $($r.Name) | $($r.Status) | $($r.HttpCode) | $($r.LatencyMs) |" }
 $md | Out-File -Encoding UTF8 $report
 
+if (-not [string]::IsNullOrWhiteSpace($EvidenceOut)) {
+    $validCarriers = @("CT","CU","CM")
+    $validRegions = @("北京","上海","广东","安徽","江苏","浙江")
+    $Carrier = $Carrier.ToUpperInvariant()
+    if ($validCarriers -notcontains $Carrier) {
+        Write-Host "去程证据未生成：-Carrier 必须是 CT、CU 或 CM。" -ForegroundColor Red
+        exit 2
+    }
+    if ($validRegions -notcontains $Region) {
+        Write-Host "去程证据未生成：-Region 必须是北京、上海、广东、安徽、江苏或浙江。" -ForegroundColor Red
+        exit 2
+    }
+    $identity = GetClientIdentity
+    if ([string]::IsNullOrWhiteSpace($City)) { $City = $(if($identity.City){$identity.City}else{$Region}) }
+    if ([string]::IsNullOrWhiteSpace($SourceAsn)) { $SourceAsn = $identity.Asn }
+    if ([string]::IsNullOrWhiteSpace($SourceNetwork)) {
+        $SourceNetwork = $(if($identity.Network){$identity.Network}else{(@{CT="中国电信";CU="中国联通";CM="中国移动"})[$Carrier]})
+    }
+    $evidencePort = [int]$Ports[0]
+    $evidenceTcp = @()
+    1..5 | ForEach-Object {
+        $probe = TestTcpPort -HostName $VpsHost -Port $evidencePort
+        if ($probe.Status -eq "OK") { $evidenceTcp += [double]$probe.LatencyMs }
+        Start-Sleep -Milliseconds 180
+    }
+    $sample = [ordered]@{
+        carrier = $Carrier
+        region = $Region
+        city = $City
+        sourceAsn = $SourceAsn
+        sourceNetwork = $SourceNetwork
+        generated = (Get-Date).ToString("o")
+        route = $traceText
+        tcpAttempts = 5
+        tcpLatenciesMs = @($evidenceTcp)
+        targetReached = ($evidenceTcp.Count -gt 0)
+    }
+    $document = [ordered]@{
+        schema = "cn3-forward-evidence/v1"
+        generated = (Get-Date).ToString("o")
+        target = [ordered]@{host=$VpsHost; port=$evidencePort}
+        samples = @()
+    }
+    if (Test-Path $EvidenceOut) {
+        try {
+            $existing = Get-Content -Raw -Encoding UTF8 $EvidenceOut | ConvertFrom-Json
+            if ($existing.schema -eq "cn3-forward-evidence/v1" -and
+                [string]$existing.target.host -eq $VpsHost -and
+                [int]$existing.target.port -eq $evidencePort) {
+                $document.samples = @($existing.samples | Where-Object {
+                    -not ($_.carrier -eq $Carrier -and $_.region -eq $Region)
+                })
+            }
+        } catch {}
+    }
+    $document.samples += [PSCustomObject]$sample
+    $document.generated = (Get-Date).ToString("o")
+    $document | ConvertTo-Json -Depth 8 | Out-File -Encoding UTF8 $EvidenceOut
+    $EvidenceOut = (Resolve-Path $EvidenceOut).Path
+}
+
 Write-Host ""
 Write-Host "+--------------------------------------------------------------------------------+" -ForegroundColor Cyan
 Write-Host "|                 LazyVPS 中国本地端去程 / 代理体感 CMD 仪表盘                 |" -ForegroundColor Cyan
@@ -222,5 +306,8 @@ Write-Host "  - $summaryCsv"
 Write-Host "  - $tcpCsv"
 Write-Host "  - $proxyCsv"
 Write-Host "  - $traceFile"
+if (-not [string]::IsNullOrWhiteSpace($EvidenceOut)) {
+    Write-Host "  - $EvidenceOut（可由 3net-route.sh --forward-evidence 导入）"
+}
 Write-Host ""
 Write-Host "一句话：本地到 VPS 的去程评分 $score / $grade；搭配 VPS 端回程测试才是完整闭环。" -ForegroundColor Yellow
