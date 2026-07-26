@@ -3240,14 +3240,14 @@ def curl_get_json(
 
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", "replace").strip()
-        detail = re.sub(r"\\s+", " ", detail)[:160]
+        detail = re.sub(r"\s+", " ", detail)[:160]
         raise RuntimeError(
             f"上传网络失败（curl {completed.returncode}）"
             + (f"｜{detail}" if detail else "")
         )
 
     try:
-        response_body, status_text = completed.stdout.rsplit(b"\\n", 1)
+        response_body, status_text = completed.stdout.rsplit(b"\n", 1)
         status = int(status_text.strip())
     except (ValueError, TypeError) as exc:
         raise RuntimeError("上传接口返回格式异常；本地 HTML／JSON 已保留") from exc
