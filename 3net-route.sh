@@ -3321,7 +3321,11 @@ def curl_chunked_upload(
 
 def publish(report: dict[str, Any]) -> str:
     try:
-        result = curl_chunked_upload(\n            PUBLIC_REPORT_SYNC_API,\n            public_report_payload(report),\n            45,\n        )
+        result = curl_chunked_upload(
+            PUBLIC_REPORT_SYNC_API,
+            public_report_payload(report),
+            45,
+        )
         for key in ("url", "reportUrl", "report_url", "publicUrl"):
             if result.get(key):
                 return str(result[key])
