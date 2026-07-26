@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.3 SIX-REGION VERIFIED"
+VERSION="v0.9 RC4.2.4 CAPITAL-PROBE ROUTE-LABELS"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.3 六地区核验版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.4 省会探针路由注释版
 
 用法：
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六地区完整版.sh
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六地区完整版.sh --self-test
-  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六地区完整版.sh --target 203.55.99.88 --port 443
+  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh
+  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh --self-test
+  bash 中国三网VPS双程质量检测_v0.9_RC4.2_六省会完整版.sh --target 203.55.99.88 --port 443
 
 说明：
   本脚本直接在出口 VPS 上运行，不使用 SSH 密码或私钥。
   目标 IP 示例：203.55.99.88
   业务端口示例：443（Trojan／AnyTLS 等协议实际监听端口，不是 SSH 22）
-  去程：中国电信 AS4134／联通 AS4837／移动 AS9808 六地区远端探针 → 国内入口。
-  回程：当前出口 VPS → 北京／上海／广东／安徽／江苏／浙江三网十八组目标。
+  去程：中国电信 AS4134／联通 AS4837／移动 AS9808 六省会远端探针 → 国内入口。
+  回程：当前出口 VPS → 北京市／上海市／广州市／合肥市／南京市／杭州市三网十八组目标。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
   traceroute 跳点不回应只计为“路由回覆率”，不会伪装成业务丢包。
 EOF
@@ -97,7 +97,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.3 SIX-REGION VERIFIED")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.4 CAPITAL-PROBE ROUTE-LABELS")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
@@ -155,6 +155,70 @@ FORWARD_REGIONS = [
     ("浙江", "Hangzhou"),
 ]
 FORWARD_ASN = {"CT": 4134, "CU": 4837, "CM": 9808}
+CAPITALS = {
+    "北京": "北京市",
+    "上海": "上海市",
+    "广东": "广州市",
+    "安徽": "合肥市",
+    "江苏": "南京市",
+    "浙江": "杭州市",
+}
+
+
+def normalize_city(value: str) -> str:
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def backbone_labels(carrier: str, route_class: str, route: str) -> tuple[list[str], str]:
+    plain = route.replace("\r", "")
+    tags: list[str] = []
+
+    def add(label: str, patterns: list[str]) -> None:
+        if any(re.search(pattern, plain, re.I) for pattern in patterns) and label not in tags:
+            tags.append(label)
+
+    if carrier == "CT":
+        add("AS4809｜CN2 精品骨干", [r"AS4809", r"59\.43\."])
+        add("AS23764｜CTGNet 国际精品", [r"AS23764", r"CTGNet", r"69\.194\."])
+        add("AS4134｜ChinaNet 163 普通骨干", [r"AS4134", r"202\.97\."])
+        carrier_text = "电信"
+    elif carrier == "CU":
+        add("AS9929｜CUII 联通精品骨干", [r"AS9929", r"CUII", r"218\.105\.", r"210\.(51|52|53|78)\."])
+        add("AS10099｜CUG 联通国际网", [r"AS10099", r"CUG", r"202\.77\.", r"43\.252\.", r"61\.14\."])
+        add("AS4837｜China169 联通普通骨干", [r"AS4837", r"219\.158\."])
+        carrier_text = "联通"
+    else:
+        add("AS58807｜CMIN2 移动精品骨干", [r"AS58807", r"CMIN2", r"223\.118\.32\."])
+        add("AS58453｜CMI 移动普通国际网", [r"AS58453", r"CMI-INT", r"223\.(118|119)\."])
+        add("AS9808｜CMNET 移动国内骨干", [r"AS9808", r"CMNET", r"221\.183\.", r"111\.24\."])
+        carrier_text = "移动"
+
+    if not tags:
+        tags = [f"未识别{carrier_text}骨干｜可见跳点证据不足"]
+
+    joined = " → ".join(tags)
+    if "仅见" in route_class and "目的网" in route_class:
+        note = f"可见跳点只证明目的省会的{carrier_text}接入／交付网，未形成连续骨干证据，不能据此判定完整回程。"
+    elif route_class.startswith("INCONCLUSIVE"):
+        note = f"当前可见跳点未形成可复核的{carrier_text}骨干链路；保持证据不足，不按普通线或精品线扣分。"
+    elif "混合" in route_class or "GT" in route_class:
+        note = f"混合路由：{joined}；骨干切换顺序以本次 traceroute 可见跳点为准。"
+    elif any(word in route_class for word in ("GIA", "AS9929", "CMIN2")):
+        note = f"精品路由：{joined}；判定来自可见 ASN／特征 IP，不以延迟倒推线路。"
+    else:
+        note = f"非精品路由：{joined}；本次只确认普通／国际骨干，不标记为精品。"
+    return tags, note
+
+
+def add_route_labels(item: dict[str, Any]) -> dict[str, Any]:
+    tags, note = backbone_labels(
+        item["carrier"], item.get("class", "INCONCLUSIVE"), item.get("route", "")
+    )
+    item["backboneTags"] = tags
+    item["routeNote"] = note
+    region = item.get("region") or item.get("city") or ""
+    item["probeCapital"] = CAPITALS.get(region, region)
+    return item
 
 
 def visible_len(text: str) -> int:
@@ -514,19 +578,21 @@ def globalping_trace(target: str, port: int, carrier: str,
                      region: str, probe_city: str) -> dict[str, Any]:
     asn = FORWARD_ASN[carrier]
     errors: list[str] = []
+    # 只查指定省会，不允许全国探针代替省会样本。先用严格字段，
+    # 再用 Globalping 官方推荐的 magic 组合做同省会重试。
     location_modes = [
         (
-            f"{region}+ASN+家宽",
+            f"{region}省会+ASN+家宽",
             {"country": "CN", "city": probe_city, "asn": asn,
              "tags": ["eyeball-network"], "limit": 1},
         ),
         (
-            f"{region}+ASN",
+            f"{region}省会+ASN",
             {"country": "CN", "city": probe_city, "asn": asn, "limit": 1},
         ),
         (
-            "中国+ASN 备用",
-            {"country": "CN", "asn": asn, "tags": ["eyeball-network"], "limit": 1},
+            f"{region}省会+AS{asn} magic",
+            {"magic": f"{probe_city}+AS{asn}", "limit": 1},
         ),
     ]
     for mode, location in location_modes:
@@ -584,12 +650,19 @@ def globalping_trace(target: str, port: int, carrier: str,
             )
             value = score(rank, result_stats)
             asn_verified = source_asn == asn
-            region_verified = mode != "中国+ASN 备用"
-            verified = asn_verified and region_verified
-            if not region_verified:
+            actual_city = str(probe.get("city") or "")
+            city_verified = normalize_city(actual_city) == normalize_city(probe_city)
+            verified = asn_verified and city_verified
+            if not city_verified:
                 evidence = (
-                    f"指定地区无可用探针，实际降级到 {probe.get('city', '中国')} AS{source_asn}；"
-                    "本结果仅作同运营商参考，不纳入指定地区评分。"
+                    f"省会核对失败：请求 {CAPITALS.get(region, region)}（{probe_city}），"
+                    f"实际返回 {actual_city or '未知城市'} AS{source_asn}；"
+                    "该样本不纳入省会去程评分。"
+                ) + evidence
+            elif not asn_verified:
+                evidence = (
+                    f"运营商核对失败：省会城市正确，但实际 ASN 为 AS{source_asn}，"
+                    f"预期 AS{asn}；该样本不纳入评分。"
                 ) + evidence
             if not verified:
                 value = max(0, value - 15)
@@ -733,6 +806,22 @@ def self_test_regressions() -> None:
                 f"{label} 回归失败：期望 rank={expected_rank}，实际 rank={actual_rank}"
             )
 
+    tags, note = backbone_labels(
+        "CU", "INCONCLUSIVE｜仅见联通目的网", "1 219.158.10.1 AS4837"
+    )
+    if tags != ["AS4837｜China169 联通普通骨干"] or "交付网" not in note:
+        raise AssertionError("联通目的网标签回归失败：必须显示 AS4837 标签与中文交付网注释")
+
+    premium_tags, premium_note = backbone_labels(
+        "CU", "AS9929（CUII）",
+        "1 218.105.2.205 AS9929\n2 210.51.16.9 AS9929\n3 219.158.10.1 AS4837"
+    )
+    if "AS9929｜CUII 联通精品骨干" not in premium_tags or "精品路由" not in premium_note:
+        raise AssertionError("联通 AS9929 标签回归失败")
+
+    if normalize_city("Nanjing") != normalize_city("nanjing"):
+        raise AssertionError("省会城市标准化回归失败")
+
 
 def format_stats(data: dict[str, Any]) -> str:
     avg = data.get("avg")
@@ -758,7 +847,7 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
     exit_asn = origin_asn(exit_ip) if valid_public_ipv4(exit_ip) else ""
     if reached_samples:
         port_status = (
-            f"PASS｜{len(reached_samples)}/{len(forward)} 组六地区外部 TCP traceroute 到达入口"
+            f"PASS｜{len(reached_samples)}/{len(forward)} 组六省会外部 TCP traceroute 到达入口"
         )
     else:
         port_status = "INCONCLUSIVE｜探针未显示终点；不能据此判定端口关闭"
@@ -786,7 +875,7 @@ def representative_route(items: list[dict[str, Any]], direction: str) -> str:
     unique = sorted({str(x["class"]) for x in valid_items})
     if len(unique) == 1:
         return unique[0]
-    return f"六地区混合（{len(unique)} 类）"
+    return f"六省会混合（{len(unique)} 类）"
 
 
 def premium_route(carrier: str, item: dict[str, Any]) -> bool:
@@ -845,10 +934,12 @@ def show_forward(item: dict[str, Any], index: int, total: int) -> None:
         f"FORWARD [{index}/{total}] {carrier} / {CARRIER_NAME[carrier]} · {item.get('region', '中国')}去程",
         color,
     )
-    field("请求地区", item.get("region", "中国"), color)
+    field("请求省会", f"{item.get('probeCapital', item.get('region', '中国'))}｜{item.get('requestedCity', '')}", color)
     field("来源核对", ("PASS｜" if item["verified"] else "WARN｜") + item["access"], GREEN if item["verified"] else YELLOW)
     field("入口可达性", item.get("reachability", "INCONCLUSIVE"), GREEN if item.get("targetReached") else YELLOW)
     field("去程线路", item["class"], color)
+    field("骨干标签", " → ".join(item.get("backboneTags", [])), color)
+    field("中文路由注释", item.get("routeNote", ""), GRAY)
     field("去程质量", f"{format_stats(item['stats'])}｜{item['score']} 分", GREEN if item["score"] >= 75 else YELLOW if item["score"] >= 50 else RED)
     field("判定证据", item["evidence"], GRAY)
 
@@ -858,11 +949,16 @@ def show_return(item: dict[str, Any], index: int, total: int) -> None:
     color = CARRIER_COLOR[carrier]
     valid = int(item.get("rank", 0)) > 0
     status = item.get("reachability", "INCONCLUSIVE")
-    field(
-        f"[{index}/{total}] {carrier} {item['city']}",
-        f"{item['class']}｜{format_stats(item['stats'])}｜{item['score']} 分｜{status}",
-        color if valid else YELLOW,
+    banner(
+        f"RETURN [{index}/{total}] {carrier} / {CARRIER_NAME[carrier]} · {item.get('probeCapital', item['city'])}回程",
+        color,
     )
+    field("省会目标", f"{item.get('probeCapital', item['city'])}｜{item.get('probeIp') or item.get('host')}", color)
+    field("回程线路", item["class"], color if valid else YELLOW)
+    field("骨干标签", " → ".join(item.get("backboneTags", [])), color)
+    field("中文路由注释", item.get("routeNote", ""), GRAY)
+    field("回程质量", f"{format_stats(item['stats'])}｜{item['score']} 分｜{status}", color if valid else YELLOW)
+    field("判定证据", item.get("evidence", ""), GRAY)
 
 
 def write_report(report: dict[str, Any]) -> tuple[Path, Path]:
@@ -893,15 +989,15 @@ document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
 document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.score}} 分 ${{g.stars}}</div><div>去程：${{E(g.forwardRoute)}}（${{g.forwardScore}}；有效 ${{E(g.forwardValid)}}）</div><div>回程：${{E(g.returnRoute)}}（${{g.returnScore}}；有效 ${{E(g.returnValid)}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
-document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六地区双程证据</h2><table><thead><tr><th>方向／地区</th><th>线路</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.class)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{x.city}}</td><td>${{E(x.class)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
+document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} 六省会双程证据</h2><table><thead><tr><th>方向／省会</th><th>线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
   const tabs=':::: tabs\\n'+['CT','CU','CM'].map(c=>{{
     const g=R.grades.find(x=>x.carrier===c);
     const forwards=R.forward.filter(x=>x.carrier===c);
     const returns=R.returns.filter(x=>x.carrier===c);
-    const forwardRows=forwards.map(x=>`- 去程（${{x.region}}→VPS）：${{x.class}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
-    const returnRows=returns.map(x=>`- 回程（VPS→${{x.city}}）：${{x.class}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
+    const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
+    const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
     return `::: tab-item ${{names[c]}}\n综合：${{g.score}} 分 ${{g.stars}}｜去程有效 ${{g.forwardValid}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
@@ -933,7 +1029,10 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "p95": s.get("p95"), "jitter": s.get("jitter"), "stddev": None,
             "loss": s.get("loss"),
             "success": f"{s.get('success', 0)}/{s.get('expected', 0)}",
-            "routeHops": 0, "timeoutHops": 0, "backboneTags": [],
+            "routeHops": 0, "timeoutHops": 0,
+            "backboneTags": item.get("backboneTags", []),
+            "routeNote": item.get("routeNote", ""),
+            "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("region", ""), "")),
             "reachability": item.get("reachability", "INCONCLUSIVE"),
         }
 
@@ -958,15 +1057,18 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "p95": s.get("p95"), "jitter": s.get("jitter"), "stddev": None,
                 "loss": s.get("loss"), "success": f"{s.get('success', 0)}/{s.get('expected', 0)}",
                 "routeHops": item.get("routeHops", 0),
-                "timeoutHops": 0, "backboneTags": [],
+                "timeoutHops": 0,
+                "backboneTags": item.get("backboneTags", []),
+                "routeNote": item.get("routeNote", ""),
+                "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("city", ""), "")),
                 "reachability": item.get("reachability", "INCONCLUSIVE"),
             })
         forward_flat = {
-            "region": "六地区汇总", "label": "六地区远端实测 → VPS",
-            "access": "北京／上海／广东／安徽／江苏／浙江",
+            "region": "六省会汇总", "label": "六省会远端实测 → VPS",
+            "access": "北京市／上海市／广州市／合肥市／南京市／杭州市",
             "publicIp": "", "verified": len(valid_forward_items) == len(forward_items),
             "route": grade_item["forwardRoute"],
-            "evidence": f"六地区去程共 {len(forward_items)} 组",
+            "evidence": f"六省会去程共 {len(forward_items)} 组",
             "score": grade_item["forwardScore"],
             "stars": stars(grade_item["forwardScore"]),
             "avg": average([x["stats"].get("avg") for x in valid_forward_items]),
@@ -976,7 +1078,11 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "jitter": average([x["stats"].get("jitter") for x in valid_forward_items]),
             "stddev": None, "loss": None,
             "success": f"{len(valid_forward_items)}/{len(forward_items)}",
-            "routeHops": 0, "timeoutHops": 0, "backboneTags": [],
+            "routeHops": 0, "timeoutHops": 0,
+            "backboneTags": sorted({
+                tag for x in valid_forward_items for tag in x.get("backboneTags", [])
+            }),
+            "routeNote": "六个省会分别列示骨干标签与中文路由注释；汇总不覆盖单省证据。",
             "reachability": (
                 f"PASS｜{len(valid_forward_items)}/{len(forward_items)} 组指定地区探针到达入口"
                 if valid_forward_items
@@ -1002,7 +1108,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         "target": report["target"]["host"], "targetPort": report["target"]["port"],
         "returnSshHost": report["exit"]["host"], "selfTest": report["selfTest"],
         "mode": report["mode"],
-        "matrix": "北京／上海／广东／安徽／江苏／浙江 × 三网去程＋回程（36 组）",
+        "matrix": "北京市／上海市／广州市／合肥市／南京市／杭州市 × 三网去程＋回程（36 组）",
         "methodology": report["methodology"],
         "bgp": {"asn": report["dedicatedLine"]["exitAsn"],
                 "provider": report["exit"]["identity"], "location": ""},
@@ -1044,7 +1150,7 @@ def main() -> int:
     field("当前出口 VPS", f"{mask_ip(exit_ip)}｜{exit_identity or '本机原生执行'}", GREEN)
     field("认证方式", "VPS 本机原生执行｜不使用 SSH／密码／私钥", GREEN)
     field("入口核对方式", "由中国三网外部 TCP traceroute 核对；不从出口反连 NAT 入口", CYAN)
-    field("测试地区", "北京／上海／广东／安徽／江苏／浙江", MAGENTA)
+    field("测试地区", "北京市／上海市／广州市／合肥市／南京市／杭州市", MAGENTA)
 
     forward: list[dict[str, Any]] = []
     forward_total = len(FORWARD_REGIONS) * 3
@@ -1060,8 +1166,9 @@ def main() -> int:
                     f"{region} AS{FORWARD_ASN[carrier]} → {mask_ip(target)}:{port}",
                     CARRIER_COLOR[carrier],
                 )
-                field("探针状态", "正在请求 Globalping 六地区远端 TCP traceroute……", GRAY)
+                field("探针状态", "正在请求 Globalping 六省会远端 TCP traceroute……", GRAY)
                 item = globalping_trace(target, port, carrier, region, probe_city)
+            item = add_route_labels(item)
             forward.append(item)
             show_forward(item, forward_index, forward_total)
 
@@ -1078,13 +1185,14 @@ def main() -> int:
     return_total = sum(len(items) for items in PROBES.values())
     banner("RETURN PROBE / 出口 VPS 原生三网十八组回程", CYAN)
     field("执行位置", mask_ip(exit_ip), GREEN)
-    field("执行方式", "traceroute TCP/80；仅有效路由跳点参与判定，目标端口不响应不计业务丢包", GRAY)
+    field("执行方式", "六省会运营商目标 traceroute TCP/80；仅可见 ASN／特征 IP 判定骨干，目标端口不响应不计业务丢包", GRAY)
     returns: list[dict[str, Any]] = []
     index = 0
     for carrier in ("CT", "CU", "CM"):
         for city, host in PROBES[carrier]:
             index += 1
             item = self_test_return(carrier, city, host) if SELF_TEST else return_probe(carrier, city, host)
+            item = add_route_labels(item)
             returns.append(item)
             show_return(item, index, return_total)
 
@@ -1112,7 +1220,7 @@ def main() -> int:
         "selfTest": SELF_TEST,
         "target": {"host": mask_ip(target), "port": port, "role": "国内入口"},
         "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "出口 VPS 本机"},
-        "methodology": "Globalping 在北京／上海／广东／安徽／江苏／浙江调用中国电信 AS4134／联通 AS4837／移动 AS9808 远端探针，对国内入口协议业务端口执行十八组 TCP traceroute；无法取得地区探针时明确降级为同 ASN 中国探针，不把降级样本伪装成指定地区。出口 VPS 本机对相同六地区三网十八组明确运营商 IP 执行原生 traceroute；DNS 失败或无有效跳点标记为 INCONCLUSIVE 并排除评分，不伪报 100% 业务丢包，Cymru DNS 补查可见 IP Origin ASN。NAT／端口映射隐藏的入口至出口专线内段单列为不可见，不强判线路等级。",
+        "methodology": "Globalping 严格按北京市／上海市／广州市／合肥市／南京市／杭州市调用中国电信 AS4134／联通 AS4837／移动 AS9808 省会远端探针，对国内入口协议业务端口执行十八组 TCP traceroute；每组必须同时核对实际返回城市与 ASN，找不到省会探针即标记 INCONCLUSIVE，不允许全国或跨省探针代替。出口 VPS 本机对相同六省会三网十八组明确运营商 IP 执行原生 traceroute；DNS 失败或无有效跳点标记为 INCONCLUSIVE 并排除评分，不伪报 100% 业务丢包，Cymru DNS 补查可见 IP Origin ASN。NAT／端口映射隐藏的入口至出口专线内段单列为不可见，不强判线路等级。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
