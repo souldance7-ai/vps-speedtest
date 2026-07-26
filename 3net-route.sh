@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.12 FINAL-MATRIX-INTEGRITY"
+VERSION="v0.9 RC4.2.13 PROVINCE-LATENCY-HEATMAP"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.12 FINAL 矩阵完整性封版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.13 省份延迟热图版
 
 用法：
   bash 3net-route.sh
@@ -24,8 +24,9 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   去程：优先读取中国本地端主动实测证据；缺项才使用 Globalping 同省远端探针。
   同省无探针时：一次收集中国境内同运营商多探针快照，按地区分配并避免重复。
   全国参考与指定地区分开统计，不会把 REFERENCE-PASS 写成指定地区 PASS。
-  NOT-TESTED 与复用探针不计分；矩阵不完整时标记 PARTIAL，不给正式总分／星级。
-  报告分开显示有效样本表现、矩阵覆盖率与正式评分资格。
+  NOT-TESTED 与复用探针不计入指定省份矩阵；全国参考不会补足省份覆盖。
+  最终结论以双程线路类型为主，不再输出总分／星级。
+  CMD、HTML 与 JSON 均列出各省实测 AVG／P95、相对热度百分比及绿黄橙红渐层。
   回程：当前出口 VPS → 对应地区三网固定／动态目标。
   net.sh／TcpQuality 的节点均是 VPS→中国回程目标，不会被冒充为中国→VPS 去程。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
@@ -114,7 +115,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.12 FINAL-MATRIX-INTEGRITY")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.13 PROVINCE-LATENCY-HEATMAP")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
@@ -1634,10 +1635,10 @@ def self_test_regressions() -> None:
         raise AssertionError("存在复用探针的部分矩阵不得取得正式评分资格")
     if (
         no_duplicate_grade["score"] is not None
-        or no_duplicate_grade["stars"] != "未评级"
+        or no_duplicate_grade["stars"] != "不使用评分"
         or no_duplicate_grade["matrixStatus"] != "PARTIAL"
     ):
-        raise AssertionError("部分矩阵必须显示 PARTIAL、无正式分数及星级")
+        raise AssertionError("部分矩阵必须显示 PARTIAL，且本版不得输出分数或星级")
     if no_duplicate_grade["sampleScore"] <= 0:
         raise AssertionError("部分矩阵仍应保留有效样本表现")
 
@@ -1676,7 +1677,11 @@ def self_test_regressions() -> None:
         "stars": "☆☆☆☆☆",
     }
     failure_grade = grade("CT", failed_forwards, full_returns)
-    if not failure_grade["ratingEligible"] or failure_grade["matrixStatus"] != "COMPLETE":
+    if (
+        not failure_grade["matrixComplete"]
+        or failure_grade["ratingEligible"]
+        or failure_grade["matrixStatus"] != "COMPLETE"
+    ):
         raise AssertionError("独立探针已执行的失败样本仍应完成矩阵")
     if failure_grade["forwardFailures"] != 1:
         raise AssertionError("独立探针未接通必须计为一次真实失败")
@@ -1742,6 +1747,179 @@ def format_stats(data: dict[str, Any]) -> str:
         f"P95 {p95 if p95 is not None else 'N/A'} ms｜"
         f"JITTER {jitter if jitter is not None else 'N/A'} ms｜LOSS {loss_text}"
     )
+
+
+def latency_band(avg: float) -> tuple[str, int, str]:
+    """Return an absolute RTT band, severity index and web colour."""
+    if avg <= 80:
+        return "≤80 ms", 0, "#38e87b"
+    if avg <= 130:
+        return "81–130 ms", 1, "#8ee63f"
+    if avg <= 180:
+        return "131–180 ms", 2, "#f5df4d"
+    if avg <= 230:
+        return "181–230 ms", 3, "#ff9f43"
+    return ">230 ms", 4, "#ff4d5e"
+
+
+def latency_visual_eligible(item: dict[str, Any], direction: str) -> tuple[bool, str]:
+    avg = item.get("stats", {}).get("avg")
+    if not isinstance(avg, (int, float)):
+        return False, "未取得有效延迟"
+    if direction == "Forward":
+        if national_reference(item):
+            return False, "仅全国参考，不冒充指定省份"
+        if not item.get("verified") or item.get("selectionScope") == "NO_PROBE":
+            return False, "未取得指定省份探针"
+        if not item.get("targetReached"):
+            return False, "已实测但目标未接通"
+    elif not str(item.get("probeIp") or "").strip():
+        return False, "未取得回程目标"
+    return True, ""
+
+
+def annotate_latency_visuals(
+    forward: list[dict[str, Any]],
+    returns: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attach honest per-province RTT heat data without converting it to a score."""
+    heatmap: dict[str, Any] = {
+        "policy": "ROUTE_CLASS_FIRST｜AVG/P95 + RELATIVE_HEAT｜NO_SCORE",
+        "legend": (
+            "相对热度 0% 为本次同方向最快、100% 为最慢；"
+            "颜色同时受绝对 RTT 区间约束，避免整组都慢时仍显示绿色。"
+        ),
+        "absoluteBands": [
+            {"range": "≤80 ms", "color": "#38e87b"},
+            {"range": "81–130 ms", "color": "#8ee63f"},
+            {"range": "131–180 ms", "color": "#f5df4d"},
+            {"range": "181–230 ms", "color": "#ff9f43"},
+            {"range": ">230 ms", "color": "#ff4d5e"},
+        ],
+        "forward": [],
+        "return": [],
+    }
+    for direction, items, key in (
+        ("Forward", forward, "forward"),
+        ("Return", returns, "return"),
+    ):
+        eligible: list[dict[str, Any]] = []
+        for item in items:
+            ok, reason = latency_visual_eligible(item, direction)
+            if ok:
+                eligible.append(item)
+            else:
+                item["latencyVisual"] = {
+                    "measured": False,
+                    "avgMs": item.get("stats", {}).get("avg"),
+                    "p95Ms": item.get("stats", {}).get("p95"),
+                    "relativeHeat": None,
+                    "absoluteBand": "N/A",
+                    "color": "#596579",
+                    "reason": reason,
+                }
+        values = [float(x["stats"]["avg"]) for x in eligible]
+        low = min(values) if values else 0.0
+        high = max(values) if values else 0.0
+        for item in eligible:
+            avg = float(item["stats"]["avg"])
+            relative_heat = (
+                50 if math.isclose(low, high)
+                else round((avg - low) * 100 / (high - low))
+            )
+            band, absolute_severity, absolute_color = latency_band(avg)
+            relative_severity = min(4, max(0, relative_heat // 20))
+            severity = max(absolute_severity, relative_severity)
+            colors = ("#38e87b", "#8ee63f", "#f5df4d", "#ff9f43", "#ff4d5e")
+            visual = {
+                "measured": True,
+                "avgMs": round(avg, 1),
+                "p95Ms": item.get("stats", {}).get("p95"),
+                "relativeHeat": relative_heat,
+                "absoluteBand": band,
+                "color": colors[severity],
+                "absoluteColor": absolute_color,
+                "reason": "",
+            }
+            item["latencyVisual"] = visual
+        for item in items:
+            region = (
+                item.get("region", "中国")
+                if direction == "Forward"
+                else item.get("city", item.get("probeCapital", "中国"))
+            )
+            heatmap[key].append({
+                "carrier": item["carrier"],
+                "region": region,
+                **item["latencyVisual"],
+            })
+    return heatmap
+
+
+def latency_ansi_color(visual: dict[str, Any]) -> str:
+    if not visual.get("measured"):
+        return GRAY
+    palette = {
+        "#38e87b": "\033[38;5;82m",
+        "#8ee63f": "\033[38;5;118m",
+        "#f5df4d": "\033[38;5;226m",
+        "#ff9f43": "\033[38;5;208m",
+        "#ff4d5e": "\033[38;5;196m",
+    }
+    return palette.get(str(visual.get("color")), WHITE)
+
+
+def latency_visual_text(visual: dict[str, Any], compact: bool = False) -> str:
+    if not visual.get("measured"):
+        return f"N/A｜{visual.get('reason', '未测')}"
+    heat = int(visual.get("relativeHeat", 0))
+    filled = min(10, max(1, math.ceil(heat / 10)))
+    bar = "▰" * filled + "▱" * (10 - filled)
+    if compact:
+        return f"{visual['avgMs']}ms｜热度 {heat}% {bar}"
+    return (
+        f"AVG {visual['avgMs']} ms｜P95 {visual.get('p95Ms', 'N/A')} ms｜"
+        f"相对热度 {heat}% {bar}｜绝对区间 {visual['absoluteBand']}"
+    )
+
+
+def show_latency_heatmap(
+    forward: list[dict[str, Any]],
+    returns: list[dict[str, Any]],
+) -> None:
+    banner("PROVINCE LATENCY / 各省实测延迟热图（非评分）", MAGENTA)
+    field(
+        "图例",
+        "0%＝本次同方向最快｜100%＝最慢｜颜色同时受绝对 RTT 区间约束",
+        GRAY,
+    )
+    for carrier in ("CT", "CU", "CM"):
+        banner(f"{CARRIER_NAME[carrier]}｜线路判定优先，延迟热度辅助", CARRIER_COLOR[carrier])
+        forward_by_region = {
+            str(x.get("region")): x
+            for x in forward if x["carrier"] == carrier
+        }
+        return_by_region = {
+            str(x.get("city")): x
+            for x in returns if x["carrier"] == carrier
+        }
+        for region, _ in FORWARD_REGIONS:
+            f_visual = forward_by_region.get(region, {}).get(
+                "latencyVisual", {"measured": False, "reason": "未测"}
+            )
+            r_visual = return_by_region.get(region, {}).get(
+                "latencyVisual", {"measured": False, "reason": "未测"}
+            )
+            field(
+                f"{region} 去程",
+                latency_visual_text(f_visual),
+                latency_ansi_color(f_visual),
+            )
+            field(
+                f"{region} 回程",
+                latency_visual_text(r_visual),
+                latency_ansi_color(r_visual),
+            )
 
 
 def dedicated_line_assessment(target: str, port: int, exit_ip: str,
@@ -1894,13 +2072,15 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
     else:
         sample_score = 0
 
-    rating_eligible = (
-        len(measured_forwards) == len(forward_items)
+    regional_measured_forwards = [
+        x for x in measured_forwards if not national_reference(x)
+    ]
+    matrix_complete = (
+        len(regional_measured_forwards) == len(forward_items)
         and len(measured_returns) == len(return_items)
     )
-    overall: int | None = sample_score if rating_eligible else None
-    score_basis = "FULL_MATRIX" if rating_eligible else "PARTIAL_NO_RATING"
-    matrix_status = "COMPLETE" if rating_eligible else "PARTIAL"
+    score_basis = "DISABLED｜ROUTE_CLASS_PLUS_PROVINCE_LATENCY_HEATMAP"
+    matrix_status = "COMPLETE" if matrix_complete else "PARTIAL"
     measurement_coverage = round(
         (len(measured_forwards) + len(measured_returns))
         / max(1, len(forward_items) + len(return_items)),
@@ -1949,18 +2129,20 @@ def grade(carrier: str, forwards: list[dict[str, Any]],
         "returnPremium": f"{return_premium}/{len(valid_returns)}",
         "bidirectionalPremium": bidirectional_premium,
         "scoreBasis": score_basis,
+        "ratingPolicy": "NO_SCORE_OR_STARS",
         "matrixStatus": matrix_status,
-        "ratingEligible": rating_eligible,
+        "matrixComplete": matrix_complete,
+        "ratingEligible": False,
         "ratingReason": (
-            "完整独立矩阵，具备正式评分资格"
-            if rating_eligible else
-            "矩阵存在 NOT-TESTED 或复用探针，仅显示样本表现"
+            "本版取消总分与星级；完整矩阵仍只用于确认省份覆盖"
+            if matrix_complete else
+            "指定省份去程或回程矩阵不完整；全国参考不会补足省份覆盖"
         ),
         "evidenceCoverage": measurement_coverage,
         "measurementCoverage": measurement_coverage,
         "scorableCoverage": scorable_coverage,
-        "score": overall,
-        "stars": stars(overall) if overall is not None else "未评级",
+        "score": None,
+        "stars": "不使用评分",
     }
 
 
@@ -1978,7 +2160,7 @@ def show_forward(item: dict[str, Any], index: int, total: int) -> None:
     field("去程线路", item["class"], color)
     field("骨干标签", " → ".join(item.get("backboneTags", [])), color)
     field("中文路由注释", item.get("routeNote", ""), GRAY)
-    field("去程质量", f"{format_stats(item['stats'])}｜{item['score']} 分", GREEN if item["score"] >= 75 else YELLOW if item["score"] >= 50 else RED)
+    field("去程延迟", format_stats(item["stats"]), color)
     field("判定证据", item["evidence"], GRAY)
 
 
@@ -1999,7 +2181,7 @@ def show_return(item: dict[str, Any], index: int, total: int) -> None:
         field("多协议路径", "、".join(item["observedClasses"]), GRAY)
     field("骨干标签", " → ".join(item.get("backboneTags", [])), color)
     field("中文路由注释", item.get("routeNote", ""), GRAY)
-    field("回程质量", f"{format_stats(item['stats'])}｜{item['score']} 分｜{status}", color if valid else YELLOW)
+    field("回程延迟", f"{format_stats(item['stats'])}｜{status}", color if valid else YELLOW)
     field("判定证据", item.get("evidence", ""), GRAY)
 
 
@@ -2018,31 +2200,45 @@ def write_report(report: dict[str, Any]) -> tuple[Path, Path]:
 *{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top,#12213c,var(--bg) 42%);color:var(--text);font:14px/1.6 "Microsoft YaHei",system-ui,sans-serif}}
 .wrap{{max-width:1280px;margin:30px auto;padding:0 18px}}header,.panel{{border:1px solid #2458aa;background:linear-gradient(145deg,rgba(17,28,48,.98),rgba(7,11,18,.98));box-shadow:0 18px 50px #0008;margin-bottom:18px}}
 header{{padding:28px}}h1{{margin:0;color:#71dcff;letter-spacing:2px}}.sub{{color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}}.panel{{padding:18px;border-top:3px solid var(--line)}}.panel.ct{{border-top-color:var(--ct)}}.panel.cu{{border-top-color:var(--cu)}}.panel.cm{{border-top-color:var(--cm)}}
-h2{{margin:0 0 12px;font-size:18px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #26364f;text-align:left;vertical-align:top}}th{{color:#8ca7d5}}.score{{font-size:28px;color:#ffe16a}}.toolbar{{display:flex;gap:10px;margin:12px 0}}button{{background:#173e78;color:white;border:1px solid #3672c8;padding:8px 14px;cursor:pointer}}pre{{white-space:pre-wrap;color:#b8c5db;max-height:260px;overflow:auto}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}}}
+h2{{margin:0 0 12px;font-size:18px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #26364f;text-align:left;vertical-align:top}}th{{color:#8ca7d5}}.route-verdict{{font-size:20px;color:#ffe16a;margin-bottom:8px}}.toolbar{{display:flex;gap:10px;margin:12px 0}}button{{background:#173e78;color:white;border:1px solid #3672c8;padding:8px 14px;cursor:pointer}}pre{{white-space:pre-wrap;color:#b8c5db;max-height:260px;overflow:auto}}.heat{{display:inline-block;min-width:190px;padding:7px 10px;border-radius:7px;color:#07101c;font-weight:700;background:linear-gradient(90deg,var(--heat),color-mix(in srgb,var(--heat) 35%,#101827))}}.heat.na{{color:#aab5c7;background:#273143}}.heat small{{display:block;font-weight:500;opacity:.82}}.legend{{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 16px}}.legend span{{padding:4px 9px;border-radius:999px;color:#07101c;font-weight:700}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}.heat{{min-width:150px}}}}
 </style></head><body><div class="wrap">
 <header><h1>CHINA 3NET ROUTE LAB</h1><div class="sub" id="meta"></div><div class="toolbar"><button id="copy">复制为 NodeSeek 格式</button><button onclick="window.print()">打印／另存 PDF</button><button id="json">下载 JSON</button></div></header>
-<section class="panel" id="topology"></section><div class="grid" id="cards"></div><div id="details"></div></div>
+<section class="panel" id="topology"></section><div class="grid" id="cards"></div><section class="panel" id="heatmap"></section><div id="details"></div></div>
 <script>const R={embedded};
 const E=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 document.getElementById('meta').textContent=R.version+'｜入口 '+R.target.host+':'+R.target.port+'｜出口 '+R.exit.host+'｜'+R.generated;
 const names={{CT:'中国电信',CU:'中国联通',CM:'中国移动'}};
+const heatCell=x=>{{
+  const v=x.latencyVisual||{{measured:false,reason:'未测'}};
+  if(!v.measured)return `<span class="heat na">N/A<small>${{E(v.reason||'未测')}}</small></span>`;
+  return `<span class="heat" style="--heat:${{E(v.color)}}">AVG ${{E(v.avgMs)}} ms｜热度 ${{E(v.relativeHeat)}}%<small>P95 ${{E(v.p95Ms)}} ms｜绝对区间 ${{E(v.absoluteBand)}}</small></span>`;
+}};
 document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2><table><tbody>
 <tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部入口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
 <tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
-<tr><th>矩阵状态</th><td>${{E((R.matrixAssessment||{{}}).status||'N/A')}}</td><th>正式评分资格</th><td>${{(R.matrixAssessment||{{}}).ratingEligible?'具备':'不具备｜PARTIAL 不评级'}}</td></tr>
+<tr><th>矩阵状态</th><td>${{E((R.matrixAssessment||{{}}).status||'N/A')}}</td><th>呈现原则</th><td>线路判定优先｜省份延迟热图｜不使用总分／星级</td></tr>
 <tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
-document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="score">${{g.ratingEligible?`${{g.score}} 分 ${{g.stars}}`:`PARTIAL｜未评级`}}</div><div>有效样本表现：${{g.sampleScore}} 分（非正式总分）</div><div>矩阵：${{E(g.matrixStatus)}}｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%</div><div>去程：${{E(g.forwardRoute)}}（样本 ${{g.forwardScore}}；测量 ${{E(g.forwardMeasured)}}｜有效 ${{E(g.forwardValid)}}｜指定地区 ${{E(g.forwardRegional)}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜失败 ${{g.forwardFailures||0}}）</div><div>回程：${{E(g.returnRoute)}}（样本 ${{g.returnScore}}；测量 ${{E(g.returnMeasured)}}｜有效 ${{E(g.returnValid)}}｜失败 ${{g.returnFailures||0}}）</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
-document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} ${{E(R.matrixLabel||'多地区')}}双程证据</h2><table><thead><tr><th>方向／地区</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>评分</th><th>质量</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{x.score}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
+document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="route-verdict">去程 ${{E(g.forwardRoute)}} ↔ 回程 ${{E(g.returnRoute)}}</div><div>矩阵：${{E(g.matrixStatus)}}｜指定地区去程 ${{E(g.forwardRegional)}}｜回程有效 ${{E(g.returnValid)}}</div><div>测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%</div><div>全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜参考不补足省份矩阵</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
+const bands=((R.latencyHeatmap||{{}}).absoluteBands||[]).map(b=>`<span style="background:${{E(b.color)}}">${{E(b.range)}}</span>`).join('');
+const heatRows=['CT','CU','CM'].map(c=>{{
+  const fs=R.forward.filter(x=>x.carrier===c),rs=R.returns.filter(x=>x.carrier===c);
+  return fs.map(f=>{{
+    const r=rs.find(x=>x.city===f.region)||{{latencyVisual:{{measured:false,reason:'无对应回程'}}}};
+    return `<tr><td>${{names[c]}}</td><td>${{E(f.region)}}</td><td>${{heatCell(f)}}</td><td>${{heatCell(r)}}</td><td>${{E(f.class)}} ↔ ${{E(r.class||'N/A')}}</td></tr>`;
+  }}).join('');
+}}).join('');
+document.getElementById('heatmap').innerHTML=`<h2>各省实测延迟热图</h2><div class="sub">${{E((R.latencyHeatmap||{{}}).legend||'')}}</div><div class="legend">${{bands}}</div><table><thead><tr><th>运营商</th><th>地区</th><th>去程</th><th>回程</th><th>双程线路</th></tr></thead><tbody>${{heatRows}}</tbody></table>`;
+document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} ${{E(R.matrixLabel||'多地区')}}双程证据</h2><table><thead><tr><th>方向／地区</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>延迟热度</th><th>原始质量数据</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{heatCell(x)}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{heatCell(x)}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
   const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
   const tabs=':::: tabs\\n'+['CT','CU','CM'].map(c=>{{
     const g=R.grades.find(x=>x.carrier===c);
     const forwards=R.forward.filter(x=>x.carrier===c);
     const returns=R.returns.filter(x=>x.carrier===c);
-    const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS N/A｜${{x.score}} 分`).join('\\n');
-    const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜注释 ${{x.routeNote||'N/A'}}｜AVG ${{x.stats.avg??'N/A'}} ms｜P95 ${{x.stats.p95??'N/A'}} ms｜JITTER ${{x.stats.jitter??'N/A'}} ms｜LOSS ${{x.stats.loss??'N/A'}}%｜${{x.score}} 分`).join('\\n');
-    const rating=g.ratingEligible?`${{g.score}} 分 ${{g.stars}}`:`PARTIAL｜未评级`;
-    return `::: tab-item ${{names[c]}}\n正式评分：${{rating}}｜有效样本表现 ${{g.sampleScore}} 分｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%｜去程测量 ${{g.forwardMeasured}}／指定地区 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程测量 ${{g.returnMeasured}}／有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
+    const visual=x=>x.latencyVisual?.measured?`AVG ${{x.latencyVisual.avgMs}} ms｜P95 ${{x.latencyVisual.p95Ms}} ms｜相对热度 ${{x.latencyVisual.relativeHeat}}%｜${{x.latencyVisual.absoluteBand}}`:`N/A｜${{x.latencyVisual?.reason||'未测'}}`;
+    const forwardRows=forwards.map(x=>`- 去程（${{x.probeCapital||x.region}}→VPS）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜${{visual(x)}}｜注释 ${{x.routeNote||'N/A'}}`).join('\\n');
+    const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜${{visual(x)}}｜LOSS ${{x.stats.loss??'N/A'}}%｜注释 ${{x.routeNote||'N/A'}}`).join('\\n');
+    return `::: tab-item ${{names[c]}}\n线路判定：去程 ${{g.forwardRoute}} ↔ 回程 ${{g.returnRoute}}｜矩阵 ${{g.matrixStatus}}｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%｜指定地区去程 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}｜不使用总分／星级\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
   return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
 }}
@@ -2075,7 +2271,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "nationalProbeReused": bool(item.get("nationalProbeReused")),
             "probeFingerprint": item.get("probeFingerprint", ""),
             "route": item["class"], "evidence": item["evidence"],
-            "score": item["score"], "stars": item["stars"],
+            "score": None, "stars": "不使用评分",
             "avg": s.get("avg"), "min": s.get("minimum"), "max": s.get("maximum"),
             "p95": s.get("p95"), "jitter": s.get("jitter"), "stddev": None,
             "loss": s.get("loss"),
@@ -2086,6 +2282,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("region", ""), "")),
             "probeHealth": item.get("probeHealth", ""),
             "reachability": item.get("reachability", "INCONCLUSIVE"),
+            "latencyVisual": item.get("latencyVisual", {}),
         }
 
     carriers: list[dict[str, Any]] = []
@@ -2120,7 +2317,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "fallbackUsed": bool(item.get("fallbackUsed")),
                 "route": item["class"], "evidence": item["evidence"],
                 "observedClasses": item.get("observedClasses", []),
-                "score": item["score"], "stars": item["stars"],
+                "score": None, "stars": "不使用评分",
                 "avg": s.get("avg"), "min": s.get("minimum"), "max": s.get("maximum"),
                 "p95": s.get("p95"), "jitter": s.get("jitter"), "stddev": None,
                 "loss": s.get("loss"), "success": f"{s.get('success', 0)}/{s.get('expected', 0)}",
@@ -2131,6 +2328,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("city", ""), "")),
                 "probeHealth": item.get("probeHealth", ""),
                 "reachability": item.get("reachability", "INCONCLUSIVE"),
+                "latencyVisual": item.get("latencyVisual", {}),
             })
         forward_flat = {
             "region": f"{MATRIX_LABEL}汇总",
@@ -2140,8 +2338,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "verified": len(regional_forward_items) == len(forward_items),
             "route": grade_item["forwardRoute"],
             "evidence": f"{MATRIX_LABEL}去程共 {len(forward_items)} 组",
-            "score": grade_item["forwardScore"],
-            "stars": "仅样本",
+            "score": None,
+            "stars": "不使用评分",
             "avg": average([x["stats"].get("avg") for x in valid_forward_items]),
             "min": average([x["stats"].get("minimum") for x in valid_forward_items]),
             "max": average([x["stats"].get("maximum") for x in valid_forward_items]),
@@ -2168,22 +2366,24 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         }
         carriers.append({
             "id": carrier, "name": carrier_names[carrier],
-            "route": grade_item["returnRoute"], "score": grade_item["score"],
-            "stars": grade_item["stars"], "probeCount": len(probes),
+            "route": grade_item["returnRoute"], "score": None,
+            "stars": "不使用评分", "probeCount": len(probes),
             "routeTypes": len({
                 x["class"] for x in return_items if int(x.get("rank", 0)) > 0
             }),
             "forward": forward_flat, "forwardRoute": grade_item["forwardRoute"],
             "forwardProbes": forward_probes,
-            "forwardScore": grade_item["forwardScore"],
-            "returnScore": grade_item["returnScore"],
-            "sampleScore": grade_item["sampleScore"],
+            "forwardScore": grade_item.get("forwardScore"),
+            "returnScore": grade_item.get("returnScore"),
+            "sampleScore": grade_item.get("sampleScore"),
             "scoreBasis": grade_item["scoreBasis"],
             "evidenceCoverage": grade_item["evidenceCoverage"],
             "measurementCoverage": grade_item["measurementCoverage"],
             "scorableCoverage": grade_item["scorableCoverage"],
             "matrixStatus": grade_item["matrixStatus"],
+            "matrixComplete": grade_item["matrixComplete"],
             "ratingEligible": grade_item["ratingEligible"],
+            "ratingPolicy": grade_item["ratingPolicy"],
             "ratingReason": grade_item["ratingReason"],
             "forwardMeasured": grade_item["forwardMeasured"],
             "forwardRegional": grade_item["forwardRegional"],
@@ -2196,19 +2396,15 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "returnFailures": grade_item["returnFailures"],
             "bidirectional": grade_item["bidirectionalPremium"], "probes": probes,
         })
-    rating_eligible = all(x["ratingEligible"] for x in report["grades"])
-    final_sample_score = round(statistics.mean(
-        x["sampleScore"] for x in report["grades"]
-    ))
-    final_score: int | None = final_sample_score if rating_eligible else None
+    matrix_complete = all(x["matrixComplete"] for x in report["grades"])
     forward_regional_total = sum(
         int(str(x["forwardRegional"]).split("/", 1)[0])
         for x in report["grades"]
     )
     final_title = (
-        "三网完整矩阵正式判定"
-        if rating_eligible else
-        f"PARTIAL｜部分矩阵不评级｜指定地区去程 "
+        "三网完整矩阵｜线路判定＋省份延迟热图"
+        if matrix_complete else
+        f"PARTIAL｜指定省份矩阵未完整｜指定地区去程 "
         f"{forward_regional_total}/{EXPECTED_PER_DIRECTION}"
     )
     return {
@@ -2223,15 +2419,19 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         "bgp": {"asn": report["dedicatedLine"]["exitAsn"],
                 "provider": report["exit"]["identity"], "location": ""},
         "final": {
-            "score": final_score,
-            "stars": stars(final_score) if final_score is not None else "未评级",
-            "sampleScore": final_sample_score,
-            "ratingEligible": rating_eligible,
-            "matrixStatus": "COMPLETE" if rating_eligible else "PARTIAL",
+            "score": None,
+            "stars": "不使用评分",
+            "sampleScore": None,
+            "ratingEnabled": False,
+            "ratingEligible": False,
+            "matrixComplete": matrix_complete,
+            "presentationPolicy": "ROUTE_CLASS_FIRST｜PROVINCE_LATENCY_HEATMAP",
+            "matrixStatus": "COMPLETE" if matrix_complete else "PARTIAL",
             "title": final_title,
             "elapsed": "N/A",
         },
         "carriers": carriers,
+        "latencyHeatmap": report.get("latencyHeatmap", {}),
         "matrixAssessment": report.get("matrixAssessment", {}),
         "dedicatedLine": report["dedicatedLine"],
     }
@@ -2353,6 +2553,7 @@ def main() -> int:
             returns.append(item)
             show_return(item, index, return_total)
 
+    latency_heatmap = annotate_latency_visuals(forward, returns)
     grades = [grade(c, forward, returns) for c in ("CT", "CU", "CM")]
     measured_total = sum(
         int(item["forwardMeasured"].split("/", 1)[0])
@@ -2364,12 +2565,12 @@ def main() -> int:
         + int(item["returnValid"].split("/", 1)[0])
         for item in grades
     )
-    matrix_rating_eligible = (
-        measured_total == TOTAL_MATRIX_GROUPS
-        and all(item["ratingEligible"] for item in grades)
+    matrix_complete = (
+        all(item["matrixComplete"] for item in grades)
+        and measured_total == TOTAL_MATRIX_GROUPS
     )
     matrix_assessment = {
-        "status": "COMPLETE" if matrix_rating_eligible else "PARTIAL",
+        "status": "COMPLETE" if matrix_complete else "PARTIAL",
         "completed": f"{measured_total}/{TOTAL_MATRIX_GROUPS}",
         "scorable": f"{scorable_total}/{TOTAL_MATRIX_GROUPS}",
         "measurementCoverage": round(
@@ -2378,18 +2579,21 @@ def main() -> int:
         "scorableCoverage": round(
             scorable_total / max(1, TOTAL_MATRIX_GROUPS), 3
         ),
-        "ratingEligible": matrix_rating_eligible,
+        "matrixComplete": matrix_complete,
+        "ratingEnabled": False,
+        "ratingEligible": False,
+        "presentationPolicy": "ROUTE_CLASS_FIRST｜PROVINCE_LATENCY_HEATMAP｜NO_SCORE",
         "ratingReason": (
-            "全部格子均由独立探针执行，具备正式评分资格"
-            if matrix_rating_eligible else
-            "存在 NOT-TESTED 或复用探针；未完成格不算失败，整份报告不评级"
+            "指定省份去程与回程全部完成；本版仍不生成总分或星级"
+            if matrix_complete else
+            "指定省份矩阵未完成；全国参考不会补足省份覆盖"
         ),
     }
     if SELF_TEST:
         self_test_regressions()
         if not all(item["bidirectionalPremium"] for item in grades):
             raise AssertionError("离线精品双程样本未通过严格双程判定")
-    banner("FINAL VERDICT / 三网双程综合判定", CYAN)
+    banner("FINAL VERDICT / 三网双程线路判定", CYAN)
     for item in grades:
         color = CARRIER_COLOR[item["carrier"]]
         premium_text = "精品双程 PASS" if item["bidirectionalPremium"] else "精品双程未证实"
@@ -2401,27 +2605,28 @@ def main() -> int:
             f"复用参考 {item['forwardSharedReference']}｜失败 {item['forwardFailures']}〕｜"
             f"回程 {item['returnRoute']}〔测量 {item['returnMeasured']}｜"
             f"有效 {item['returnValid']}｜失败 {item['returnFailures']}〕｜"
-            f"样本表现 {item['sampleScore']} 分｜"
             f"测量覆盖 {round(item['measurementCoverage'] * 100)}%｜"
             f"{premium_text}｜"
-            + (
-                f"正式评分 {item['score']} 分｜{item['stars']}"
-                if item["ratingEligible"] else
-                "PARTIAL｜正式评分 N/A｜未评级"
-            ),
+            f"矩阵 {item['matrixStatus']}｜不使用总分／星级",
             color,
         )
     field(
         "矩阵完整性",
         f"{matrix_assessment['status']}｜完成 {matrix_assessment['completed']}｜"
         f"可判定 {matrix_assessment['scorable']}｜"
-        + (
-            "具备正式评分资格"
-            if matrix_assessment["ratingEligible"] else
-            "不具备正式评分资格"
-        ),
-        GREEN if matrix_assessment["ratingEligible"] else YELLOW,
+        + ("指定省份完整" if matrix_assessment["matrixComplete"] else "指定省份未完整"),
+        GREEN if matrix_assessment["matrixComplete"] else YELLOW,
     )
+    show_latency_heatmap(forward, returns)
+
+    # 评分只保留在运行期供旧分类回归使用；用户报告与公开载荷不再输出
+    # 样本分、总分或星级，避免延迟和骨干线路被一个抽象数字覆盖。
+    for item in forward + returns:
+        item.pop("score", None)
+        item.pop("stars", None)
+    for item in grades:
+        for key in ("forwardScore", "returnScore", "sampleScore", "score", "stars"):
+            item.pop(key, None)
 
     report = {
         "version": VERSION,
@@ -2439,14 +2644,23 @@ def main() -> int:
             "clientActive": true_forward_count,
             "total": len(forward),
         },
-        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，一次收集中国境内同运营商名称及各省网 ASN 的多探针共享快照；北上广与扩展模式使用相同池规则，按实际城市和地区 ASN 优先分配并避免重复。全国参考只证明该运营商网络到入口的线路与可达性，不冒充指定省份；复用同一全国探针不重复计入覆盖、评分或成功数，也不能满足精品双程的地区覆盖要求。仍无探针时标记 NOT-TESTED，不得写成入口不通。只有独立探针实际执行的格子才进入样本表现；实际执行但未接通／无可判路由的格子以 0 分计为失败。NOT-TESTED 与复用参考完全排除。未完成全部矩阵时统一标记 PARTIAL，仅显示有效样本表现、测量覆盖率与可判定证据覆盖率，不生成正式总分或星级。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
+        "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，一次收集中国境内同运营商名称及各省网 ASN 的多探针共享快照；北上广与扩展模式使用相同池规则，按实际城市和地区 ASN 优先分配并避免重复。全国参考只证明该运营商网络到入口的线路与可达性，不冒充指定省份，也不能补足指定省份矩阵。仍无探针时标记 NOT-TESTED，不得写成入口不通。完整矩阵必须由指定省份去程探针与对应省份回程目标实际执行；实际执行但未接通保留为真实失败，NOT-TESTED 与复用参考不冒充失败。最终结论以去回程骨干线路类型为主，不生成总分或星级；各省实测 AVG／P95 以相对热度百分比和绿黄橙红渐层呈现，全国参考不进入省份延迟热图。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
         "forward": forward,
         "returns": returns,
         "grades": grades,
+        "latencyHeatmap": latency_heatmap,
         "matrixAssessment": matrix_assessment,
         "dedicatedLine": dedicated_line,
         "privacy": "报告中的入口与出口 IPv4 均只保留前两段。",
     }
+    if SELF_TEST:
+        public_payload = public_report_payload(report)
+        if (
+            public_payload["final"].get("score") is not None
+            or public_payload["final"].get("stars") != "不使用评分"
+            or not public_payload.get("latencyHeatmap", {}).get("forward")
+        ):
+            raise AssertionError("公开报告载荷必须使用省份延迟热图，且不得恢复总分／星级")
     html_path, json_path = write_report(report)
     banner("REPORT / 报告输出", MAGENTA)
     field("HTML 报告", html_path, GREEN)
@@ -2457,7 +2671,7 @@ def main() -> int:
         if public_url:
             field("公共报告", public_url, GREEN)
     else:
-        field("SELF-TEST", "PASS｜离线分类、评分、排版与报告生成完成", GREEN)
+        field("SELF-TEST", "PASS｜离线分类、延迟热图、排版与报告生成完成", GREEN)
     field("隐私", f"入口 {mask_ip(target)}｜出口 {mask_ip(exit_ip)}；无 SSH 凭据", CYAN)
     return 0
 
