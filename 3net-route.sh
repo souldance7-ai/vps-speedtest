@@ -18,7 +18,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
 
 说明：
   本脚本直接在被测 VPS 上运行，自动识别当前 VPS 公网 IPv4，不要求输入中国入口 IP。
-  业务端口示例：443（Trojan／AnyTLS 等协议实际监听端口，不是 SSH 22）
+  业务端口示例：443（Trojan／AnyTLS／REALITY 等 TCP 协议实际监听端口，不是 SSH 22）
+  UDP-only 协议端口不能作为本脚本的 TCP 业务端口核对目标。
   --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
@@ -434,7 +435,7 @@ def ask_target(detected_ip: str) -> tuple[str, int]:
         TARGET = detected_ip
     field("当前 VPS IPv4", mask_ip(TARGET), CYAN)
     field("协议端口示例", "443", GREEN)
-    field("重要提醒", "这里填写 Trojan／AnyTLS／Hysteria 等协议实际监听端口，不是 SSH 登录端口 22", YELLOW)
+    field("重要提醒", "填写 Trojan／AnyTLS／REALITY 等 TCP 业务端口，不是 SSH 22；UDP-only 端口不适用", YELLOW)
     field("IP 输入", "已自动识别；普通 VPS 本机检测无需填写中国入口 IP", GREEN)
     while not valid_public_ipv4(TARGET):
         TARGET = input("自动识别失败，请输入当前 VPS 的公网 IPv4：").strip()
@@ -455,7 +456,7 @@ def ask_target(detected_ip: str) -> tuple[str, int]:
 
 def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int = 25) -> Any:
     data = None
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.12", "Accept": "application/json"}
+    headers = {"User-Agent": f"3net-route-detector/{VERSION}", "Accept": "application/json"}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -468,7 +469,7 @@ ASN_CACHE: dict[str, str] = {}
 
 
 def http_text(url: str, timeout: int = 25) -> str:
-    headers = {"User-Agent": "3net-route-detector/0.9-RC4.2.12", "Accept": "text/plain,*/*"}
+    headers = {"User-Agent": f"3net-route-detector/{VERSION}", "Accept": "text/plain,*/*"}
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return response.read().decode("utf-8-sig", "replace")
