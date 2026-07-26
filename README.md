@@ -1,25 +1,29 @@
 # LazyVPS VPS 测速正式 v1.0
 
 
-## 独立工具：沪日专线／IX-style 三层检测
+## 独立工具：中国三网映射入口／专线同流双程检测 v1.0.0
 
-`ix-route.sh` 是与 `3net-route.sh` 完全独立的专线检测器，适用于“上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”架构。名称中的 IX-style 不代表已经证明经过某个 IXP。
+`ix-route.sh` 与 `3net-route.sh` 完全独立，适用于“中国用户 → 中国侧公网入口 → NAT／IPLC／IEPL／中转隐藏内段 → 出口 VPS”架构。
 
-### 在日本出口 VPS 一键执行
+正式版不再用“出口 VPS → 中国公共目标”的默认公网 traceroute 冒充专线回程。每组回程均复用去程的同一中国探针、同一入口和同一业务端口，确认 TCP 回应返回；若能提供或自动识别入口端私网对端，再额外验证出口→入口私网对端的同路径内段回程。
+
+### 在出口 VPS 一键执行完整六地区 × 三网
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/ix-route.sh?ver=IX0.1")
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh") --full
 ```
 
-交互输入示例：
+脚本会依次引导输入：
 
-- 上海公网入口：`211.136.162.184`
-- 协议业务端口：`10101`（AnyTLS）或 `10102`（Trojan），不是 SSH `22`／管理端口 `10100`
-- 预期日本公网出口：`114.111.176.37`
-- 日本端专线内网：`172.16.2.101`
-- 上海端专线内网对端：已知时填写；未知直接回车，纯内段结果显示 N/A
+- 中国侧公网入口 IPv4
+- 协议业务端口（不是 SSH／管理端口）
+- 预期公网出口（未知可留空）
+- 出口端专线内网 IPv4（未知可留空）
+- 入口端专线内网对端（未知可留空；脚本会尝试从活动连接识别）
 
-默认测试上海、安徽、江苏、浙江 × 中国电信／联通／移动；加 `--full` 扩展北京和广东。报告把入口接入、专线纯内段、日本出口分开判定。探针失败、DNS 失败或缺少内网对端不会被写成 100% LOSS。
+`--full` 生成18组去程＋对应18组同流返回。所有用户相关入口、出口、私网对端及客户端实测 IPv4 在 JSON、HTML、Markdown 与公共页中只保留前两段。
+
+[完整使用说明与判定边界](IX_ROUTE_GUIDE.md) · [查看脚本](ix-route.sh)
 
 ---
 
@@ -123,7 +127,7 @@ ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh http
 示例：
 
 ```cmd
-ssh root@103.97.200.42 "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
 ```
 
 > Windows CMD 不要直接执行 `bash <(curl ...)`，那是 Linux Bash 语法。

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.10 RC1"
+VERSION="v1.0.0"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,30 +14,30 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.10 RC1
+中国三网映射入口／专线双程质量检测 v1.0.0
 
 用途：
-  专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
+  独立检测“中国用户 → 中国侧公网入口 → NAT／IPLC／IEPL／中转隐藏内段 → 出口 VPS”。
   本脚本与 3net-route.sh 完全独立，不共用评分或报告。
 
-推荐：在日本出口 VPS 上执行
-  bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/ix-route.sh)
+推荐：在出口 VPS 上执行完整六地区 × 三网双程测试
+  bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh) --full
 
 非交互示例：
-  bash ix-route.sh --entry 211.136.162.184 --port 10103 \
-    --expected-exit 87.86.87.231 --local-private 172.16.2.101
+  bash ix-route.sh --entry 你的中国侧入口IPv4 --port 业务端口 \
+    --expected-exit 预期出口IPv4 --local-private 出口端内网IPv4 --full
 
 默认北上广三网双程；完整六地区三网：
-  bash ix-route.sh --entry 211.136.162.184 --port 10103 --full
+  bash ix-route.sh --entry 你的中国侧入口IPv4 --port 业务端口 --full
 
 可选参数：
-  --entry IP             上海／中国侧公网入口
+  --entry IP             中国侧公网入口
   --port PORT            协议业务端口，不是 SSH 22 或管理端口
-  --expected-exit IP     预期日本公网出口
-  --local-private IP     日本端专线内网 IP
-  --peer IP              上海端专线内网对端；未知可留空
+  --expected-exit IP     预期公网出口
+  --local-private IP     出口端专线内网 IP
+  --peer IP              入口端专线内网对端；未知可留空
   --client-verified-exit IP
-                        中国客户端连接 Mieru 后实测到的出口；匹配时确认真实握手
+                        中国客户端连接协议后实测到的出口；Mieru 可进一步核对握手
   --full                 在固定北上广基础上加入安徽、江苏、浙江 × 三网
   --no-publish           只生成本地 HTML／JSON／Markdown，不上传 Chain 3Net
   --self-test            离线自检，不发起网络探测
@@ -45,12 +45,13 @@ usage() {
 
 判定边界：
   入口 TCP traceroute 到达，只证明入口端口经映射后的 TCP 路径可达。
-  不要求供应商未交付的上海内网对端 IP；入口可达、本机监听、私网地址与路由会形成映射链证据。
-  只有确实知道上海内网对端 IP 时，才额外测量专线纯内段 RTT／抖动／丢包。
+  不要求供应商未交付的入口内网对端 IP；入口可达、本机监听、私网地址与路由会形成映射链证据。
+  只有确实知道入口内网对端 IP 时，才额外测量专线纯内段 RTT／抖动／丢包。
   自动识别 Mieru mita 服务、版本、运行状态、端口监听与 NTP。
-  只有提供中国客户端实测出口且与日本出口一致时，才确认 Mieru 真实握手 PASS。
+  只有提供中国客户端实测出口且与出口 VPS 一致时，才确认 Mieru 真实握手 PASS。
   DNS、探针或权限失败一律显示 N/A，不会换算成 100% LOSS。
-  北京、上海、广州固定列入三网去程与日本出口回程；--full 再加入合肥、南京、杭州。
+  北京、上海、广州固定列入三网去程与出口 VPS 回程；--full 再加入合肥、南京、杭州。
+  本地与公共报告会把用户输入、自动识别的出口及内网 IPv4 统一脱敏为前两段。
   报告保存到“Chain 3Net”目录，并生成 HTML／JSON／Markdown；上传成功必须显示公共网址。
 EOF
 }
@@ -108,7 +109,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.10 RC1")
+VERSION = os.environ.get("IX_VERSION", "v1.0.0")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -120,7 +121,6 @@ SELF_TEST = os.environ.get("IX_SELF_TEST") == "1"
 NO_PUBLISH = os.environ.get("IX_NO_PUBLISH") == "1"
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 GLOBALPING_PROBES_API = "https://api.globalping.io/v1/probes"
-ICMP_TARGETS_API = "https://raw.githubusercontent.com/spiritLHLS/icmp_targets/main/nodes.json"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
 PUBLIC_REPORT_ROOT = "https://china-3net-route-report.souldance4.chatgpt.site"
 
@@ -153,27 +153,6 @@ FULL_REGIONS = [
     ("江苏", "Nanjing"),
     ("浙江", "Hangzhou"),
 ]
-RETURN_TARGETS = {
-    "CT": {
-        "北京": "219.141.136.10", "上海": "202.96.209.133",
-        "广东": "202.96.128.86", "安徽": "61.132.163.68",
-        "江苏": "218.2.2.2", "浙江": "202.101.172.35",
-    },
-    "CU": {
-        "北京": "202.106.50.1", "上海": "210.22.70.3",
-        "广东": "210.21.196.6", "安徽": "218.104.78.2",
-        "江苏": "58.240.53.78", "浙江": "221.12.1.227",
-    },
-    "CM": {
-        "北京": "221.179.155.161", "上海": "211.136.112.200",
-        "广东": "211.139.129.222", "安徽": "211.138.180.2",
-        "江苏": "221.131.143.69", "浙江": "112.13.113.199",
-    },
-}
-CAPITALS = {
-    "北京": "北京市", "上海": "上海市", "广东": "广州市",
-    "安徽": "合肥市", "江苏": "南京市", "浙江": "杭州市",
-}
 CITY_CANDIDATES = {
     # 省会优先；省会没有目标运营商探针时，逐一尝试同省常见机房城市。
     # 北京、上海为直辖市，没有可合法冒充的“同省其他城市”。
@@ -261,8 +240,6 @@ MAX_PROVINCE_REFERENCE_ATTEMPTS = 1
 MAX_CROSS_PROVINCE_ATTEMPTS = 2
 PROBE_INVENTORY: list[dict[str, Any]] | None = None
 PROBE_INVENTORY_ERROR = ""
-ICMP_TARGETS_CACHE: list[dict[str, Any]] | None = None
-ICMP_TARGETS_ERROR = ""
 
 
 def line(char: str = "═", color: str = BLUE) -> None:
@@ -304,26 +281,60 @@ def mask_ip(value: str) -> str:
     return f"{parts[0]}.{parts[1]}.*.*"
 
 
+def privacy_scrub(value: Any, sensitive_ips: list[str]) -> Any:
+    """Mask user-specific IPv4 values everywhere before any report is written/uploaded."""
+    replacements = {
+        ip: mask_ip(ip)
+        for ip in sensitive_ips
+        if valid_ipv4(ip) and mask_ip(ip) != "N/A"
+    }
+    sensitive_prefixes = {
+        ".".join(ip.split(".")[:2])
+        for ip in replacements
+    }
+    if isinstance(value, dict):
+        return {key: privacy_scrub(item, sensitive_ips) for key, item in value.items()}
+    if isinstance(value, list):
+        return [privacy_scrub(item, sensitive_ips) for item in value]
+    if isinstance(value, tuple):
+        return tuple(privacy_scrub(item, sensitive_ips) for item in value)
+    if isinstance(value, str):
+        for raw, masked in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
+            value = value.replace(raw, masked)
+        def mask_related(match: re.Match[str]) -> str:
+            ip = match.group(0)
+            try:
+                parsed = ipaddress.ip_address(ip)
+            except ValueError:
+                return ip
+            prefix = ".".join(ip.split(".")[:2])
+            if prefix in sensitive_prefixes or parsed.is_private:
+                return mask_ip(ip)
+            return ip
+        value = re.sub(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", mask_related, value)
+        return value
+    return value
+
+
 def ask_inputs() -> tuple[str, int, str, str, str]:
     global ENTRY_IP, PORT_TEXT, EXPECTED_EXIT, LOCAL_PRIVATE, REMOTE_PEER
     if SELF_TEST:
-        return "211.136.162.184", 10103, "87.86.87.231", "172.16.2.101", ""
+        return "203.0.113.10", 443, "198.51.100.20", "10.0.0.10", ""
 
-    section("INPUT GUIDE / 沪日专线目标输入", MAGENTA)
-    field("本线架构", "中国用户 → 211.136.162.184:10103 → 隐藏专线 → 172.16.2.101 → 87.86.87.231")
-    field("入口 IP 示例", "211.136.162.184", CYAN)
-    field("协议端口示例", "10103 Mieru TCP（10100 是 SSH 管理端口）", GREEN)
-    field("重要提醒", "填写业务端口；不要填 SSH 22，也不要把管理端口 10100 当业务端口", YELLOW)
-    field("日本出口示例", "87.86.87.231（114.111.176.37 是供应商外部／NAT 地址）", GREEN)
-    field("日本内网示例", "172.16.2.101；上海内网对端未知可直接回车", CYAN)
+    section("INPUT GUIDE / 公用专项目标输入", MAGENTA)
+    field("检测架构", "中国用户 → 中国侧公网入口:业务端口 → 隐藏内段 → 出口 VPS")
+    field("入口 IP", "填写你要验证的中国侧公网入口 IPv4", CYAN)
+    field("协议端口", "填写实际业务端口；不是 SSH 22 或管理端口", GREEN)
+    field("预期出口", "填写本机应呈现的公网出口 IPv4；未知可留空", GREEN)
+    field("出口端内网", "有专线／NAT 内网时填写；没有或未知可留空", CYAN)
 
     while not valid_ipv4(ENTRY_IP, public=True):
-        ENTRY_IP = input("请输入上海／中国侧公网入口 IPv4〔例 211.136.162.184〕：").strip()
+        ENTRY_IP = input("请输入中国侧公网入口 IPv4：").strip()
         if not valid_ipv4(ENTRY_IP, public=True):
             print(RED + "  IPv4 无效，请重新输入。" + RESET)
     while True:
         if not PORT_TEXT:
-            PORT_TEXT = input("请输入协议业务端口〔本线 10103；不是 SSH 22／10100〕：").strip()
+            PORT_TEXT = input("请输入协议业务端口〔不是 SSH 22／管理端口〕：").strip()
         try:
             port = int(PORT_TEXT)
             if 1 <= port <= 65535:
@@ -333,17 +344,21 @@ def ask_inputs() -> tuple[str, int, str, str, str]:
         print(RED + "  端口无效，请输入 1～65535。" + RESET)
         PORT_TEXT = ""
     if not EXPECTED_EXIT:
-        EXPECTED_EXIT = input("请输入预期日本公网出口 IP〔本线 87.86.87.231；未知可回车〕：").strip()
+        EXPECTED_EXIT = input("请输入预期公网出口 IPv4〔未知可回车〕：").strip()
     if EXPECTED_EXIT and not valid_ipv4(EXPECTED_EXIT, public=True):
         print(YELLOW + "  预期出口格式无效，本项按 N/A 处理。" + RESET)
         EXPECTED_EXIT = ""
     if not LOCAL_PRIVATE:
-        LOCAL_PRIVATE = input("请输入日本端专线内网 IP〔例 172.16.2.101；未知可回车〕：").strip()
+        LOCAL_PRIVATE = input("请输入出口端专线内网 IPv4〔未知可回车〕：").strip()
     if LOCAL_PRIVATE and not valid_ipv4(LOCAL_PRIVATE):
-        print(YELLOW + "  日本端内网 IP 格式无效，本项按 N/A 处理。" + RESET)
+        print(YELLOW + "  出口端内网 IP 格式无效，本项按 N/A 处理。" + RESET)
         LOCAL_PRIVATE = ""
+    if not REMOTE_PEER:
+        REMOTE_PEER = input(
+            "请输入入口端专线内网对端 IPv4〔未知可回车；脚本会尝试从活动连接识别〕："
+        ).strip()
     if REMOTE_PEER and not valid_ipv4(REMOTE_PEER):
-        print(YELLOW + "  上海内网对端格式无效，纯内段测试按 N/A 处理。" + RESET)
+        print(YELLOW + "  入口内网对端格式无效，纯内段测试按 N/A 处理。" + RESET)
         REMOTE_PEER = ""
     return ENTRY_IP, port, EXPECTED_EXIT, LOCAL_PRIVATE, REMOTE_PEER
 
@@ -451,6 +466,40 @@ def listener_status(port: int) -> dict[str, Any]:
     return {"status": "PASS", "evidence": " | ".join(matched[:3])}
 
 
+def detect_private_peer(port: int, local_addresses_seen: list[str]) -> tuple[str, str]:
+    """Find a private peer on an active socket using the tested business port."""
+    if SELF_TEST:
+        return "10.0.0.1", "SELF_TEST_ACTIVE_SOCKET"
+    if not shutil.which("ss"):
+        return "", "N/A｜系统无 ss，无法从活动连接识别私网对端"
+    output = run(["ss", "-Hnt"], 8)
+    candidates: list[str] = []
+    for row in output.splitlines():
+        if "ESTAB" not in row:
+            continue
+        endpoints = re.findall(
+            r"(?<![\d.])((?:\d{1,3}\.){3}\d{1,3}):(\d+)(?!\d)",
+            row,
+        )
+        if len(endpoints) < 2:
+            continue
+        local_ip, local_port = endpoints[-2]
+        peer_ip, peer_port = endpoints[-1]
+        if int(local_port) != port and int(peer_port) != port:
+            continue
+        for candidate in (peer_ip, local_ip):
+            if (
+                valid_ipv4(candidate, public=False)
+                and candidate not in local_addresses_seen
+                and not candidate.startswith("127.")
+                and candidate not in candidates
+            ):
+                candidates.append(candidate)
+    if not candidates:
+        return "", "N/A｜业务端口当前无可识别的私网 ESTABLISHED 对端"
+    return candidates[0], f"AUTO_ESTABLISHED｜业务端口 {port} 活动私网对端"
+
+
 def mieru_service(port: int) -> dict[str, Any]:
     """Identify the local Mieru server without reading or exposing credentials."""
     if SELF_TEST:
@@ -503,7 +552,7 @@ def handshake_verdict(
     service: dict[str, Any],
     chain: dict[str, str],
 ) -> dict[str, str]:
-    if client_exit and not valid_ipv4(client_exit, public=True):
+    if client_exit and not SELF_TEST and not valid_ipv4(client_exit, public=True):
         return {"status": "N/A", "reason": "中国客户端实测出口格式无效"}
     if not client_exit:
         return {
@@ -514,13 +563,13 @@ def handshake_verdict(
         return {
             "status": "FAIL",
             "reason": (
-                f"客户端实测 {mask_ip(client_exit)}，与日本端实际／预期出口不一致"
+                f"客户端实测 {mask_ip(client_exit)}，与出口 VPS 实际／预期出口不一致"
             ),
         }
     if service.get("status") != "PASS":
         return {
             "status": "INCONCLUSIVE",
-            "reason": "客户端出口一致，但日本端 mita 服务状态未确认",
+            "reason": "客户端出口一致，但出口 VPS 的 mita 服务状态未确认",
         }
     if chain.get("status") != "PASS":
         return {
@@ -529,7 +578,7 @@ def handshake_verdict(
         }
     return {
         "status": "PASS",
-        "reason": "中国客户端经 Mieru 连接后出口与日本端实际／预期出口一致",
+        "reason": "中国客户端经 Mieru 连接后出口与出口 VPS 实际／预期出口一致",
     }
 
 
@@ -891,66 +940,27 @@ def no_probe_error(detail: str) -> bool:
     ))
 
 
-def dynamic_return_targets(carrier: str, region: str, primary: str) -> tuple[list[str], str]:
-    """Build a province/carrier target pool using oneclickvirt's maintained data source."""
-    global ICMP_TARGETS_CACHE, ICMP_TARGETS_ERROR
-    if SELF_TEST:
-        return [primary], "SELF_TEST_PRIMARY"
-    if ICMP_TARGETS_CACHE is None:
-        try:
-            data = http_json(ICMP_TARGETS_API, timeout=25)
-            if not isinstance(data, list):
-                raise RuntimeError("省级三网目标接口未返回列表")
-            ICMP_TARGETS_CACHE = [x for x in data if isinstance(x, dict)]
-        except Exception as exc:
-            ICMP_TARGETS_CACHE = []
-            ICMP_TARGETS_ERROR = f"{type(exc).__name__}: {exc}"
-    province_names = {
-        "北京": {"北京", "北京市"},
-        "上海": {"上海", "上海市"},
-        "广东": {"广东", "广东省"},
-        "安徽": {"安徽", "安徽省"},
-        "江苏": {"江苏", "江苏省"},
-        "浙江": {"浙江", "浙江省"},
-    }
-    isp_codes = {"CT": "ct", "CU": "cu", "CM": "cm"}
-    candidates = [primary]
-    for row in ICMP_TARGETS_CACHE:
-        if (
-            str(row.get("province") or "") not in province_names[region]
-            or str(row.get("isp_code") or "").lower() != isp_codes[carrier]
-            or str(row.get("ip_version") or "").lower() != "v4"
-        ):
-            continue
-        for value in str(row.get("ips") or "").split(","):
-            value = value.strip()
-            if valid_ipv4(value, public=True) and value not in candidates:
-                candidates.append(value)
-                if len(candidates) >= 3:
-                    break
-        if len(candidates) >= 3:
-            break
-    source = (
-        "STATIC_PRIMARY+DYNAMIC_PROVINCE_BACKUP"
-        if len(candidates) > 1
-        else f"STATIC_PRIMARY_ONLY{('｜' + ICMP_TARGETS_ERROR) if ICMP_TARGETS_ERROR else ''}"
-    )
-    return candidates, source
-
 
 def ping_peer(peer: str, count: int = 20) -> dict[str, Any]:
     if not peer:
         return {
             "status": "N/A",
-            "reason": "未提供上海端专线内网对端 IP，无法测量纯内段",
+            "reason": "未提供且未自动识别入口端专线内网对端 IP，无法测量同路径内段回程",
             "stats": summarize([], count),
             "route": "",
+            "routeLookup": "",
+            "pathModel": "PRIVATE_PEER_SAME_PATH",
         }
     if not shutil.which("ping"):
         return {
             "status": "N/A", "reason": "系统无 ping",
             "stats": summarize([], count), "route": "",
+            "routeLookup": "", "pathModel": "PRIVATE_PEER_SAME_PATH",
         }
+    route_lookup = (
+        run(["ip", "-4", "route", "get", peer], 8)
+        if shutil.which("ip") else ""
+    )
     output = run(["ping", "-n", "-c", str(count), "-W", "2", "-i", "0.2", peer], count * 3)
     values = [float(x) for x in re.findall(r"time[=<]([\d.]+)\s*ms", output)]
     stats = summarize(values, count)
@@ -966,6 +976,8 @@ def ping_peer(peer: str, count: int = 20) -> dict[str, Any]:
         "reason": "" if values else "内网对端未响应 ICMP；可能禁 Ping，不能直接判定专线中断",
         "stats": stats,
         "route": route,
+        "routeLookup": route_lookup,
+        "pathModel": "PRIVATE_PEER_SAME_PATH",
     }
 
 
@@ -1035,6 +1047,68 @@ def same_probe_tcp_check(entry: str, port: int, measurement_id: str) -> dict[str
             "measurementId": "",
             "reason": f"TCP 业务端口复核异常 {type(exc).__name__}: {exc}",
         }
+
+
+def same_flow_return_from_probe(probe: dict[str, Any], entry: str, port: int) -> dict[str, Any]:
+    """Build reverse evidence from the exact forward probe and TCP endpoint.
+
+    This is intentionally not a VPS→China public traceroute.  The returned TCP
+    response is observed at the same China probe that sent the forward request,
+    so the endpoint, port, carrier probe and measurement context stay aligned.
+    Reverse hop-by-hop routing is not observable from this API and is never
+    fabricated.
+    """
+    check = probe.get("tcpPortCheck") or {}
+    measurement_id = str(probe.get("forwardMeasurementId") or "")
+    if measurement_id and check.get("status") == "NOT_NEEDED" and not SELF_TEST:
+        check = same_probe_tcp_check(entry, port, measurement_id)
+        probe["tcpPortCheck"] = check
+    trace_reply = bool(probe.get("traceTargetReached"))
+    tcp_reply = check.get("status") == "PASS"
+    status = "PASS" if trace_reply or tcp_reply else (
+        "N/A" if probe.get("status") in {"N/A", "NO_PROBE"} else "INCONCLUSIVE"
+    )
+    latency = (
+        check.get("latency")
+        if tcp_reply and (check.get("latency") or {}).get("avg") is not None
+        else probe.get("latency") or summarize([], 0)
+    )
+    if tcp_reply:
+        reason = (
+            f"同一探针、同一入口、同一业务端口取得 TCP 返回 "
+            f"{check.get('received', 0)}/3；只确认同流返回可达，不虚构反向逐跳路由"
+        )
+    elif trace_reply:
+        reason = (
+            "同一探针的 TCP traceroute 已收到入口终点回应；"
+            "返回可达已确认，反向逐跳路由不可见"
+        )
+    else:
+        reason = (
+            f"{check.get('reason') or probe.get('reason') or '未取得同流返回证据'}；"
+            "不改用出口 VPS 的默认公网路由代替"
+        )
+    return {
+        "carrier": probe.get("carrier") or "",
+        "carrierName": probe.get("carrierName") or "",
+        "requestedRegion": probe.get("requestedRegion") or "",
+        "probeRegion": probe.get("probeRegion") or "",
+        "probeCity": probe.get("probeCity") or "",
+        "probeAsn": probe.get("probeAsn") or 0,
+        "probeNetwork": probe.get("probeNetwork") or "",
+        "sourceClass": probe.get("sourceClass") or "NONE",
+        "regionFidelity": probe.get("regionFidelity") or "UNVERIFIED",
+        "entry": mask_ip(entry),
+        "port": port,
+        "status": status,
+        "latency": latency,
+        "tcpResponses": int(check.get("received") or (1 if trace_reply else 0)),
+        "forwardMeasurementId": measurement_id,
+        "returnMeasurementId": str(check.get("measurementId") or ""),
+        "pathModel": "SAME_PROBE_SAME_ENTRY_SAME_PORT",
+        "reverseRouteVisible": False,
+        "reason": reason,
+    }
 
 
 def forward_sample_status(
@@ -1331,6 +1405,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 "status": status,
                 "targetReached": reached,
                 "traceTargetReached": trace_reached,
+                "forwardMeasurementId": str(measurement_id),
                 "tcpPortCheck": tcp_check,
                 "latency": latency,
                 "route": "\n".join(route_lines),
@@ -1412,6 +1487,7 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
         "status": "NO_PROBE" if all_unavailable else "N/A",
         "targetReached": False,
         "traceTargetReached": False,
+        "forwardMeasurementId": "",
         "tcpPortCheck": {
             "status": "N/A",
             "received": 0,
@@ -1469,17 +1545,26 @@ def self_test_probe(carrier: str, region: str, city: str, index: int) -> dict[st
         "status": "PASS" if reached else "INCONCLUSIVE",
         "targetReached": reached,
         "traceTargetReached": reached,
+        "forwardMeasurementId": f"self-test-forward-{index}",
         "tcpPortCheck": {
-            "status": "NOT_NEEDED" if reached else "INCONCLUSIVE",
-            "received": 0,
-            "reason": "SELF-TEST",
+            "status": "PASS" if reached else "INCONCLUSIVE",
+            "received": 3 if reached else 0,
+            "measurementId": f"self-test-return-{index}",
+            "latency": {
+                "status": "PASS" if reached else "N/A",
+                "avg": round(18.5 + index * 1.7, 1) if reached else None,
+                "p95": round(20.5 + index * 1.7, 1) if reached else None,
+                "jitter": 1.1 if reached else None,
+                "loss": None, "received": 3 if reached else 0, "sent": 3,
+            },
+            "reason": "SELF-TEST 同探针同端口返回" if reached else "SELF-TEST 未取得返回",
         },
         "latency": {
             "status": "PASS", "avg": round(18.0 + index * 1.7, 1),
             "p95": round(20.0 + index * 1.7, 1), "jitter": 1.2,
             "loss": None, "received": 3, "sent": 3,
         },
-        "route": "01 10.0.0.1 1.0ms\n02 211.136.162.184 25.0ms",
+        "route": f"01 10.0.0.1 1.0ms\n02 {ENTRY_IP or '203.0.113.10'} 25.0ms",
         "reason": "" if reached else "SELF-TEST 模拟未显示终点",
     }
 
@@ -1584,176 +1669,6 @@ def selection_self_test() -> None:
         PROBE_INVENTORY_ERROR = saved_error
 
 
-def route_hop_count(route: str) -> int:
-    return sum(
-        1 for row in route.splitlines()
-        if re.search(r"^\s*\d+\s+(?:\d{1,3}\.){3}\d{1,3}(?:\s|$)", row)
-    )
-
-
-def traceroute_rtts(route: str) -> list[float]:
-    values: list[float] = []
-    for row in route.splitlines():
-        if re.search(r"^\s*\d+\s+", row):
-            values.extend(float(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*ms", row))
-    return values
-
-
-def return_route_label(carrier: str, route: str) -> tuple[str, list[str], str]:
-    patterns = {
-        "CT": [
-            ("CN2 GIA／CN2", [r"59\.43\."], "AS4809｜CN2 精品骨干"),
-            ("ChinaNet 163", [r"202\.97\."], "AS4134｜ChinaNet 163 普通骨干"),
-        ],
-        "CU": [
-            ("CUII AS9929", [r"218\.105\.", r"210\.(51|52|53|78)\."], "AS9929｜CUII 联通精品骨干"),
-            ("China169 AS4837", [r"219\.158\."], "AS4837｜China169 联通普通骨干"),
-        ],
-        "CM": [
-            ("CMIN2", [r"223\.118\.32\."], "AS58807｜CMIN2 移动精品骨干"),
-            ("CMI／CMNET", [r"223\.(118|119)\.", r"221\.183\.", r"111\.24\."], "AS58453／AS9808｜移动普通骨干"),
-        ],
-    }
-    matched = [
-        (label, tag) for label, expressions, tag in patterns[carrier]
-        if any(re.search(expression, route, re.I) for expression in expressions)
-    ]
-    if not matched:
-        return (
-            "INCONCLUSIVE｜可见跳点证据不足",
-            ["未识别骨干｜不按普通线或精品线强判"],
-            "仅确认日本出口到目标运营商公网地址的可见路由；缺少特征跳点时保持证据不足。",
-        )
-    labels = [x[0] for x in matched]
-    tags = [x[1] for x in matched]
-    return (
-        " → ".join(labels),
-        tags,
-        "线路标签来自可见特征 IP；中间节点不回应不作为端到端业务丢包。",
-    )
-
-
-def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
-    """Trace VPS→China return paths with protocol fallback and province target fallback.
-
-    Inspired by oneclickvirt/backtrace: use repeated hop probes and alternate ICMP
-    targets. Unlike backtrace, targets remain return-path evidence only.
-    """
-    name, _, _ = CARRIERS[carrier]
-    candidates, target_source = dynamic_return_targets(carrier, region, host)
-    selected_host = host
-    selected_protocol = "SELF_TEST"
-    protocol_attempts: list[dict[str, Any]] = []
-    if SELF_TEST:
-        routes = {
-            "CT": "1 87.86.87.1 1.2 ms\n2 59.43.181.1 32.0 ms\n3 219.141.136.10 38.1 ms",
-            "CU": "1 87.86.87.1 1.1 ms\n2 219.158.8.1 41.0 ms\n3 202.106.50.1 45.2 ms",
-            "CM": "1 87.86.87.1 1.0 ms\n2 223.118.32.1 35.0 ms\n3 221.179.155.161 39.4 ms",
-        }
-        route = routes[carrier]
-        protocol_attempts.append({"host": host, "protocol": "SELF_TEST", "hops": 3, "identified": True})
-    elif shutil.which("traceroute") or shutil.which("tracepath"):
-        best: tuple[int, int, int, str, str, str] | None = None
-        for candidate in candidates:
-            methods: list[tuple[str, list[str]]] = []
-            if shutil.which("traceroute"):
-                # -q 3 follows backtrace's multi-sample idea without spawning three
-                # full traces for every one of the 36 matrix entries.
-                base = ["traceroute", "-n", "-q", "3", "-w", "2", "-m", "30"]
-                methods = [
-                    ("TCP", base + ["-T", "-p", "80", candidate]),
-                    ("ICMP", base + ["-I", candidate]),
-                    ("UDP", base + ["-U", "-p", "33434", candidate]),
-                ]
-            else:
-                methods = [("TRACEPATH", ["tracepath", "-n", "-m", "30", candidate])]
-            for protocol, command in methods:
-                candidate_route = run(command, 70)
-                candidate_hops = route_hop_count(candidate_route)
-                candidate_class, _, _ = return_route_label(carrier, candidate_route)
-                identified = not candidate_class.startswith("INCONCLUSIVE")
-                values = traceroute_rtts(candidate_route)
-                rtt_samples = len(values)
-                protocol_attempts.append({
-                    "host": candidate,
-                    "protocol": protocol,
-                    "hops": candidate_hops,
-                    "identified": identified,
-                    "routeClass": candidate_class,
-                    "rttSamples": rtt_samples,
-                })
-                rank = (
-                    1 if identified else 0,
-                    candidate_hops,
-                    rtt_samples,
-                    candidate,
-                    protocol,
-                    candidate_route,
-                )
-                if best is None or rank[:3] > best[:3]:
-                    best = rank
-                # TCP is closest to the Mieru business path. Only fall back when
-                # TCP does not expose a known backbone or enough valid hops.
-                if protocol == "TCP" and identified and candidate_hops >= 3:
-                    break
-                if protocol != "TCP" and identified and candidate_hops >= 3:
-                    break
-            if best is not None and best[0] and best[1] >= 3:
-                break
-        if best is None:
-            route = ""
-        else:
-            selected_host = best[3]
-            selected_protocol = best[4]
-            route = best[5]
-    else:
-        return {
-            "carrier": carrier, "carrierName": name, "region": region,
-            "capital": CAPITALS[region], "host": host, "primaryHost": host,
-            "targetSource": target_source, "targetCandidates": candidates,
-            "selectedProtocol": "N/A", "protocolAttempts": [],
-            "status": "N/A",
-            "route": "", "routeHops": 0, "routeClass": "N/A",
-            "backboneTags": [], "routeNote": "系统无 traceroute／tracepath",
-            "latency": summarize([], 0), "reason": "缺少回程路由工具；不换算为 100% 丢包",
-        }
-    hops = route_hop_count(route)
-    if not hops:
-        return {
-            "carrier": carrier, "carrierName": name, "region": region,
-            "capital": CAPITALS[region], "host": selected_host, "primaryHost": host,
-            "targetSource": target_source, "targetCandidates": candidates,
-            "selectedProtocol": selected_protocol,
-            "protocolAttempts": protocol_attempts,
-            "status": "INCONCLUSIVE",
-            "route": route, "routeHops": 0, "routeClass": "回程无有效跳点",
-            "backboneTags": [], "routeNote": "TCP／ICMP／UDP均未取得有效跳点；不等于业务中断",
-            "latency": summarize([], 0), "reason": "多协议 traceroute 无有效回覆；不换算为 100% 丢包",
-        }
-    values = traceroute_rtts(route)
-    latency = summarize(values[-9:], len(values[-9:])) if values else summarize([], 0)
-    latency["loss"] = None
-    route_class, tags, note = return_route_label(carrier, route)
-    identified_runs = sum(bool(x.get("identified")) for x in protocol_attempts)
-    return {
-        "carrier": carrier, "carrierName": name, "region": region,
-        "capital": CAPITALS[region], "host": selected_host, "primaryHost": host,
-        "targetSource": target_source, "targetCandidates": candidates,
-        "selectedProtocol": selected_protocol,
-        "protocolAttempts": protocol_attempts,
-        "identifiedAttempts": identified_runs,
-        "status": "PASS",
-        "route": route, "routeHops": hops, "routeClass": route_class,
-        "backboneTags": tags,
-        "routeNote": note + f" 实际采用 {selected_protocol}；协议冲突时以可见跳点证据为准。",
-        "latency": latency,
-        "reason": (
-            f"取得 {hops} 个有效回程跳点；采用 {selected_protocol}，"
-            f"{identified_runs}/{len(protocol_attempts)} 次协议／目标尝试识别到骨干；"
-            f"使用 {'固定主测点' if selected_host == host else '省级三网动态备援点'}"
-        ),
-    }
-
 
 def quality_label(internal: dict[str, Any]) -> str:
     stats = internal.get("stats") or {}
@@ -1763,7 +1678,7 @@ def quality_label(internal: dict[str, Any]) -> str:
     loss = float(stats.get("loss") or 0)
     jitter = float(stats.get("jitter") or 0)
     if avg <= 45 and loss == 0 and jitter <= 5:
-        return "优秀｜符合沪日低时延专线特征"
+        return "优秀｜符合低时延专线特征"
     if avg <= 70 and loss <= 1 and jitter <= 10:
         return "良好｜可作为稳定中转"
     if avg <= 100 and loss <= 3:
@@ -1778,21 +1693,21 @@ def mapping_chain(access: dict[str, Any], listener: dict[str, Any], local_status
     if reachable > 0 and listener.get("status") == "PASS" and local_status == "PASS":
         return {
             "status": "PASS",
-            "reason": "中国省级在线探针可达入口业务端口＋日本私网主机同端口监听＋本机私网地址吻合",
+            "reason": "中国省级在线探针可达入口业务端口＋出口端私网主机同端口监听＋本机私网地址吻合",
         }
     if reachable > 0 and listener.get("status") == "PASS":
         return {
             "status": "PARTIAL",
-            "reason": "入口端口可达且日本端监听，但日本私网地址未核对",
+            "reason": "入口端口可达且出口端监听，但出口端私网地址未核对",
         }
     if reachable > 0:
         return {
             "status": "INCONCLUSIVE",
-            "reason": "入口端口可达，但日本端未确认同端口监听",
+            "reason": "入口端口可达，但出口端未确认同端口监听",
         }
     return {
         "status": "N/A",
-        "reason": "缺少足够的入口与日本端关联证据",
+        "reason": "缺少足够的入口与出口端关联证据",
     }
 
 
@@ -1802,18 +1717,18 @@ def markdown_report(report: dict[str, Any]) -> str:
     identity = report["exitIdentity"]
     listener = report["listener"]
     lines = [
-        f"# 沪日专线／IX-style Mieru 四层质量检测报告",
+        f"# 中国三网映射入口／专线双程质量检测报告",
         "",
         f"- 版本：{report['version']}",
         f"- 时间：{report['generated']}",
-        f"- 上海入口：`{report['entry']['masked']}:{report['entry']['port']}`",
-        f"- 日本出口：`{mask_ip(identity.get('ip', ''))}` / {identity.get('asn') or 'N/A'} / {identity.get('org') or 'N/A'}",
+        f"- 中国侧入口：`{report['entry']['masked']}:{report['entry']['port']}`",
+        f"- 出口 VPS：`{identity.get('ipMasked') or mask_ip(identity.get('ip', ''))}` / {identity.get('asn') or 'N/A'} / {identity.get('org') or 'N/A'}",
         f"- 测试矩阵：{report['matrix']}",
         "",
         "## 结论",
         "",
         (
-            f"- 上海入口端到端 TCP：{access['status']}（运营商可达 "
+            f"- 中国侧入口端到端 TCP：{access['status']}（运营商可达 "
             f"{access.get('carrierReachable', access['pass'])}/{access['total']}，"
             f"原省精确 {access['pass']}/{access['total']}，省级可达 "
             f"{access.get('reachable', access['pass'])}/{access['total']}，"
@@ -1822,18 +1737,18 @@ def markdown_report(report: dict[str, Any]) -> str:
             f"INCONCLUSIVE {access['inconclusive']}，"
             f"NO_PROBE {access.get('noProbe', 0)}，N/A {access['na']}）"
         ),
-        f"- 日本端业务监听：{listener['status']} — {listener['evidence']}",
+        f"- 出口端业务监听：{listener['status']} — {listener['evidence']}",
         f"- Mieru／Mita 服务：{report['mieruService']['status']} — {report['mieruService']['evidence']}",
         f"- Mieru 真实握手：{report['protocolHandshake']['status']} — {report['protocolHandshake']['reason']}",
-        f"- 上海→日本端口映射链：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
+        f"- 入口→出口端口映射链：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
         f"- 专线纯内段（可选）：{internal['status']} — {quality_label(internal)}",
-        f"- 日本出口一致性：{report['exitMatch']['status']} — {report['exitMatch']['reason']}",
+        f"- 出口公网一致性：{report['exitMatch']['status']} — {report['exitMatch']['reason']}",
         "",
         "## 四层判定边界",
         "",
         "1. 中国探针到入口业务端口的 TCP traceroute 到达，表示入口映射后的 TCP 路径可达。",
-        "2. 入口端口可达、日本端同端口监听及私网地址吻合，作为端口映射链证据，但不冒充协议认证成功。",
-        "3. 只有供应商确实提供上海内网对端时，才额外统计纯内段 Ping RTT／P95／抖动／丢包。",
+        "2. 入口端口可达、出口端同端口监听及私网地址吻合，作为端口映射链证据，但不冒充协议认证成功。",
+        "3. 只有供应商确实提供入口内网对端时，才额外统计纯内段 Ping RTT／P95／抖动／丢包。",
         "4. 自动识别 mita 服务；只有中国客户端连接后实测出口一致，真实握手才为 PASS。",
         "5. traceroute 中间跳点不回应、DNS 或探针失败不记作 100% 业务丢包。",
         "6. “IX-style”是工具名称，不等于已证明经过某个 IXP。",
@@ -1856,28 +1771,32 @@ def markdown_report(report: dict[str, Any]) -> str:
         )
     lines.extend([
         "",
-        "## 日本出口至北上广／六地三网回程",
+        "## 同探针／同入口／同端口返回确认",
         "",
-        "| 地区 | 运营商 | 公网目标 | 可见跳点 | RTT | 路由标签 | 状态 |",
+        "| 省级任务 | 运营商 | 实际探针 | TCP 返回 | RTT | 路径模型 | 状态 |",
         "|---|---|---|---:|---:|---|---|",
     ])
     for item in report["returns"]:
         latency = item.get("latency") or {}
         rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
         lines.append(
-            f"| {item['capital']} | {item['carrierName']} | `{item['host']}` | "
-            f"{item['routeHops']} | {rtt} | {item['routeClass']} | {item['status']} |"
+            f"| {item['requestedRegion']} | {item['carrierName']} | "
+            f"{item.get('probeRegion') or 'N/A'}／{item.get('probeCity') or 'N/A'} | "
+            f"{item.get('tcpResponses', 0)} | {rtt} | "
+            f"同探针同入口同端口；反向逐跳不可见 | {item['status']} |"
         )
     stats = internal.get("stats") or {}
     lines.extend([
         "",
         "## 映射链与专线纯内段",
         "",
-        f"- 日本端内网：`{report['localPrivate']['masked']}`；本机存在：{report['localPrivate']['status']}",
-        f"- 上海端内网对端：`{report['remotePeer']['masked']}`",
+        f"- 出口端内网：`{report['localPrivate']['masked']}`；本机存在：{report['localPrivate']['status']}",
+        f"- 入口端内网对端：`{report['remotePeer']['masked']}`",
+        f"- 私网对端来源：{report['remotePeer'].get('source') or 'N/A'}",
         f"- 映射链证据：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
         f"- 默认路由：`{report['networkContext']['defaultRoute']}`",
-        f"- 到上海入口路由：`{report['networkContext']['entryRoute']}`",
+        f"- 到中国侧入口路由：`{report['networkContext']['entryRoute']}`",
+        f"- 到私网对端路由：`{internal.get('routeLookup') or 'N/A'}`",
         f"- 平均 RTT：{stats.get('avg') if stats.get('avg') is not None else 'N/A'} ms",
         f"- P95：{stats.get('p95') if stats.get('p95') is not None else 'N/A'} ms",
         f"- 抖动：{stats.get('jitter') if stats.get('jitter') is not None else 'N/A'} ms",
@@ -1895,7 +1814,7 @@ def write_html(report: dict[str, Any], path: Path) -> None:
     embedded = json.dumps(report, ensure_ascii=False).replace("</", "<\\/")
     path.write_text(f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Chain 3Net｜沪日专线 Mieru 四层质量报告</title>
+<title>Chain 3Net｜中国三网映射入口／专线双程质量报告</title>
 <style>
 :root{{--bg:#07111f;--panel:#0d1b2d;--line:#1e3a56;--text:#e6f2ff;--muted:#8da8c4;--cyan:#35d9ff;--green:#42e39a;--yellow:#ffd166;--red:#ff657a}}
 *{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top,#102a46 0,#07111f 45%);color:var(--text);font:14px/1.55 Inter,"Microsoft YaHei",sans-serif}}
@@ -1907,13 +1826,13 @@ header{{padding:25px;margin-bottom:18px}}h1{{margin:0;color:var(--cyan);letter-s
 table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}}th{{color:var(--muted)}}code{{color:#a9efff}}button{{background:#0e7490;color:white;border:0;border-radius:8px;padding:9px 13px;cursor:pointer;margin-right:8px}}
 .note{{color:var(--muted)}}@media(max-width:850px){{.grid{{grid-template-columns:1fr 1fr}}main{{padding:14px}}}}@media print{{body{{background:white;color:#111}}header,.panel{{box-shadow:none;background:white}}}}
 </style></head><body><main>
-<header><h1>CHAIN 3NET · 沪日专线 MIERU 四层质量报告</h1><div class="sub" id="meta"></div>
+<header><h1>CHAIN 3NET · 中国三网映射入口／专线双程质量报告</h1><div class="sub" id="meta"></div>
 <div style="margin-top:14px"><button id="json">下载 JSON</button><button onclick="window.print()">打印／另存 PDF</button></div></header>
 <section class="panel"><h2>TOPOLOGY / 实际业务拓扑</h2><div class="topology" id="topology"></div></section>
 <div class="grid" id="cards"></div>
-<section class="panel"><h2>MIERU / 日本端服务证据</h2><table id="mieru"></table></section>
+<section class="panel"><h2>MIERU / 出口端可选服务证据</h2><table id="mieru"></table></section>
 <section class="panel"><h2>FORWARD / 省级任务三网去程</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际省／城市</th><th>来源类型</th><th>选点层级</th><th>实际网络／ASN</th><th>代表性</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div><p class="note">省会无探针时先扫描同省全部在线城市；同省运营商机房／未分类运营商网络可作为运营商去程证据并明确标注非家宽。全省仍无指定运营商时，才使用跨省同运营商测点；终点到达标为 PASS_FALLBACK 并计入运营商可达，但不计入原省精准覆盖。NO_PROBE 不代表线路中断或 100% 丢包。</p></section>
-<section class="panel"><h2>RETURN / 日本出口至北上广固定三网回程</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>目标</th><th>跳点</th><th>RTT</th><th>路由标签</th><th>骨干证据</th><th>状态</th></tr></thead><tbody id="returnRows"></tbody></table></div></section>
+<section class="panel"><h2>RETURN / 同探针同入口同端口返回确认</h2><div style="overflow:auto"><table><thead><tr><th>省级任务</th><th>运营商</th><th>实际探针</th><th>入口</th><th>返回证据</th><th>RTT</th><th>路径模型</th><th>状态</th><th>说明</th></tr></thead><tbody id="returnRows"></tbody></table></div><p class="note">回程复用去程的同一中国探针、同一入口和同一业务端口；确认 TCP 回应返回该探针。反向逐跳路径不可见，不以出口 VPS 的默认公网 traceroute 冒充专线回程。</p></section>
 <section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
 </main><script>
 const R={embedded}; const E=s=>String(s??'N/A').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
@@ -1921,20 +1840,20 @@ const metric=(v,suffix='')=>v===null||v===undefined||v===''?'N/A':`${{E(v)}}${{s
 const badge=(label,obj)=>`<article class="card"><span>${{E(label)}}</span><strong class="${{E(obj.status)}}">${{E(obj.status)}}</strong><small>${{E(obj.reason||obj.evidence||'')}}</small></article>`;
 document.getElementById('meta').textContent=`${{R.generated}} · ${{R.version}} · ${{R.matrix}}`;
 document.getElementById('topology').innerHTML=[
-`<div class="node">中国 Mieru 客户端</div>`,`<b class="arrow">→</b>`,
-`<div class="node">上海入口<br><code>${{E(R.entry.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
+`<div class="node">中国客户端／探针</div>`,`<b class="arrow">→</b>`,
+`<div class="node">中国侧入口<br><code>${{E(R.entry.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
 `<div class="node">隐藏专线／映射链</div>`,`<b class="arrow">→</b>`,
-`<div class="node">日本 Mita<br><code>${{E(R.localPrivate.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
-`<div class="node">日本出口<br><code>${{E(R.exitIdentity.ipMasked)}}</code></div>`].join('');
+`<div class="node">出口端服务<br><code>${{E(R.localPrivate.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
+`<div class="node">出口 VPS<br><code>${{E(R.exitIdentity.ipMasked)}}</code></div>`].join('');
 document.getElementById('cards').innerHTML=[
-badge('上海入口接入',{{status:R.access.status,reason:`运营商可达 ${{R.access.carrierReachable??R.access.pass}}/${{R.access.total}} · 原省精确 ${{R.access.pass}}/${{R.access.total}} · 跨省同运营商降级 ${{R.access.crossProvinceFallback??0}}`}}),
-badge('上海→日本映射链',R.mappingChain),badge('Mieru 真实握手',R.protocolHandshake),badge('日本出口一致性',R.exitMatch)].join('');
+badge('中国侧入口接入',{{status:R.access.status,reason:`运营商可达 ${{R.access.carrierReachable??R.access.pass}}/${{R.access.total}} · 原省精确 ${{R.access.pass}}/${{R.access.total}} · 跨省同运营商降级 ${{R.access.crossProvinceFallback??0}}`}}),
+badge('入口→出口映射链',R.mappingChain),badge('Mieru 真实握手',R.protocolHandshake),badge('出口公网一致性',R.exitMatch)].join('');
 const M=R.mieruService;
 document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="${{E(M.status)}}">${{E(M.status)}}</td><th>版本</th><td>${{E(M.version)}}</td></tr>
 <tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
 <tr><th>NTP</th><td>${{E(M.ntp)}}</td><th>端口监听</th><td class="${{E(R.listener.status)}}">${{E(R.listener.status)}} · ${{E(R.listener.evidence)}}</td></tr>`;
 document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.displayRegion||p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}${{p.sourceClass==='CROSS_PROVINCE_CARRIER_FALLBACK'?'<br><small>跨省最后备援</small>':p.capitalPreferred===false?'<br><small>同省备选</small>':''}}</td><td>${{E(p.sourceClass||'N/A')}}</td><td>${{E(p.selectionTier||'N/A')}}</td><td>${{E(p.probeNetwork||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td>${{p.carrierRepresentative?'本省运营商有效':p.sourceClass==='CROSS_PROVINCE_CARRIER_FALLBACK'?'同运营商可达／非原省代表':'省内第三方参考'}}</td><td>${{p.targetReached?'到达':'未确认'}}${{p.traceTargetReached===false&&p.targetReached?'<br><small>同探针 TCP 复核</small>':''}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
-document.getElementById('returnRows').innerHTML=R.returns.map(p=>`<tr><td>${{E(p.capital)}}</td><td>${{E(p.carrierName)}}</td><td><code>${{E(p.host)}}</code><br><small>${{p.primaryHost&&p.host!==p.primaryHost?'省级动态备援':'固定主测点'}}</small></td><td>${{p.routeHops?E(p.routeHops):'N/A'}}</td><td>${{metric(p.latency?.avg,' ms')}}</td><td>${{E(p.routeClass)}}</td><td>${{E((p.backboneTags||[]).join(' → '))}}<br><small>${{E(p.routeNote)}}</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td></tr>`).join('');
+document.getElementById('returnRows').innerHTML=R.returns.map(p=>`<tr><td>${{E(p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeRegion||'N/A')}}／${{E(p.probeCity||'N/A')}}<br><small>AS${{E(p.probeAsn||'N/A')}}</small></td><td><code>${{E(p.entry)}}:${{E(p.port)}}</code></td><td>${{E(p.tcpResponses||0)}} 次 TCP 回应</td><td>${{metric(p.latency?.avg,' ms')}}</td><td>同探针同入口同端口<br><small>反向逐跳不可见</small></td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
 document.getElementById('method').textContent=R.methodology;
 document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='ix-route-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
 </script></body></html>""", encoding="utf-8")
@@ -1957,7 +1876,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             latency = item.get("latency") or {}
             flat.append({
                 "region": item["requestedRegion"],
-                "label": f"{item['requestedRegion']} {carrier_names[carrier]} → 上海入口",
+                "label": f"{item['requestedRegion']} {carrier_names[carrier]} → 中国侧入口",
                 "access": item.get("mode") or "N/A",
                 "publicIp": "",
                 "verified": bool(
@@ -1966,7 +1885,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                     and item.get("provinceVerified")
                     and item.get("targetReached")
                 ),
-                "route": "Mieru TCP 上海入口接入",
+                "route": "TCP 中国侧入口接入",
                 "evidence": (
                     f"实际省市 {item.get('probeRegion') or 'N/A'}／"
                     f"{item.get('probeCity') or 'N/A'}；"
@@ -1992,7 +1911,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "routeHops": len(item.get("route", "").splitlines()),
                 "timeoutHops": 0,
                 "backboneTags": (
-                    ["Mieru TCP", "上海映射入口"]
+                    ["TCP 业务端口", "中国侧映射入口"]
                     + (
                         ["同探针 TCP 业务端口复核"]
                         if item.get("targetReached")
@@ -2009,7 +1928,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 ),
             })
         summary = {
-            "region": "入口接入汇总", "label": "中国三网 → 上海 Mieru 入口",
+            "region": "入口接入汇总", "label": "中国三网 → 中国侧业务入口",
             "access": report["matrix"], "publicIp": "",
             "verified": all(
                 x.get("carrierRepresentative")
@@ -2017,7 +1936,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 and x.get("provinceVerified")
                 for x in items
             ) if items else False,
-            "route": "Mieru TCP 上海入口接入",
+            "route": "TCP 中国侧入口接入",
             "evidence": (
                 f"运营商可达 {len(carrier_reached)}/{len(items)}；"
                 f"原省精确 {len(passed)}/{len(items)}；"
@@ -2035,7 +1954,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "min": None, "max": None, "p95": None, "jitter": None,
             "stddev": None, "loss": None,
             "success": f"{len(carrier_reached)}/{len(items)}", "routeHops": 0,
-            "timeoutHops": 0, "backboneTags": ["Mieru TCP", "专线映射链"],
+            "timeoutHops": 0, "backboneTags": ["TCP 业务端口", "专线映射链"],
             "reachability": report["access"]["status"],
         }
         return_items = [x for x in report["returns"] if x["carrier"] == carrier]
@@ -2045,35 +1964,36 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         for item in return_items:
             latency = item.get("latency") or {}
             return_probes.append({
-                "city": item["capital"], "host": item["host"], "ip": item["host"],
-                "route": item["routeClass"], "evidence": item["reason"],
+                "city": item["requestedRegion"],
+                "host": item["entry"], "ip": item["entry"],
+                "route": "同探针同入口同端口返回", "evidence": item["reason"],
                 "score": 100 if item["status"] == "PASS" else 0,
                 "stars": "★★★★★" if item["status"] == "PASS" else "☆☆☆☆☆",
                 "avg": latency.get("avg"), "min": None, "max": None,
                 "p95": latency.get("p95"), "jitter": latency.get("jitter"),
                 "stddev": None, "loss": None,
                 "success": "1/1" if item["status"] == "PASS" else "0/1",
-                "routeHops": item["routeHops"], "timeoutHops": 0,
-                "backboneTags": item.get("backboneTags", []),
-                "routeNote": item.get("routeNote", ""),
-                "probeCapital": item["capital"],
-                "targetSource": item.get("targetSource", "STATIC_PRIMARY"),
-                "primaryHost": item.get("primaryHost", item["host"]),
+                "routeHops": 0, "timeoutHops": 0,
+                "backboneTags": ["SAME_PROBE", "SAME_ENTRY", "SAME_PORT"],
+                "routeNote": "确认 TCP 返回；反向逐跳不可见，不以默认公网路由补写",
+                "probeCapital": item["requestedRegion"],
+                "targetSource": "FORWARD_MEASUREMENT_REUSE",
+                "primaryHost": item["entry"],
                 "reachability": item["status"],
             })
         overall_score = round(score * 0.5 + return_score * 0.5)
         carriers.append({
             "id": carrier, "name": carrier_names[carrier],
-            "route": "日本出口 → 北上广／六地运营商公网目标",
+            "route": "同一中国探针 ↔ 同一中国侧入口业务端口",
             "score": overall_score,
             "stars": "★★★★★" if overall_score >= 80 else "★★★☆☆",
             "probeCount": len(return_probes),
-            "routeTypes": len({x["routeClass"] for x in return_items}),
+            "routeTypes": 1 if return_items else 0,
             "forward": summary,
-            "forwardRoute": "Mieru TCP 上海入口接入",
+            "forwardRoute": "TCP 中国侧入口接入",
             "forwardProbes": flat, "forwardScore": score,
             "returnScore": return_score,
-            "bidirectional": False,
+            "bidirectional": True,
             "probes": return_probes,
         })
     final_score = round(statistics.mean(x["score"] for x in carriers))
@@ -2081,8 +2001,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         "version": report["version"], "generated": report["generated"],
         "target": report["entry"]["masked"], "targetPort": report["entry"]["port"],
         "returnSshHost": report["exitIdentity"]["ipMasked"],
-        "selfTest": False, "mode": "沪日专线 Mieru 四层验证",
-        "matrix": report["matrix"] + "（北上广固定三网去程＋日本出口回程）",
+        "selfTest": False, "mode": "中国三网映射入口／专线四层验证",
+        "matrix": report["matrix"] + "（同探针同入口同端口；不另走出口默认公网）",
         "methodology": report["methodology"],
         "bgp": {
             "asn": report["exitIdentity"].get("asn") or "N/A",
@@ -2099,9 +2019,9 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         },
         "carriers": carriers,
         "dedicatedLine": {
-            "topology": "中国客户端→上海公网入口→隐藏专线→日本 Mita→日本公网出口",
+            "topology": "中国客户端→中国侧公网入口→隐藏内段→出口 VPS→公网出口",
             "entry": f"{report['entry']['masked']}:{report['entry']['port']}",
-            "entryAsn": "中国移动映射入口",
+            "entryAsn": "中国侧映射入口｜以各探针实际 ASN 证据为准",
             "exit": report["exitIdentity"]["ipMasked"],
             "exitAsn": report["exitIdentity"].get("asn") or "N/A",
             "portStatus": report["mappingChain"]["status"],
@@ -2124,12 +2044,14 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             },
             "protocolHandshake": report["protocolHandshake"],
             "returns": [{
-                "carrier": x["carrier"], "capital": x["capital"],
-                "host": x["host"], "status": x["status"],
-                "primaryHost": x.get("primaryHost", x["host"]),
-                "targetSource": x.get("targetSource", "STATIC_PRIMARY"),
-                "routeClass": x["routeClass"], "routeHops": x["routeHops"],
-                "selectedProtocol": x.get("selectedProtocol", "N/A"),
+                "carrier": x["carrier"], "requestedRegion": x["requestedRegion"],
+                "probeRegion": x.get("probeRegion") or "",
+                "probeCity": x.get("probeCity") or "",
+                "entry": x["entry"], "port": x["port"], "status": x["status"],
+                "targetSource": "FORWARD_MEASUREMENT_REUSE",
+                "pathModel": x["pathModel"],
+                "reverseRouteVisible": False,
+                "tcpResponses": x["tcpResponses"],
                 "latency": x["latency"],
             } for x in report["returns"]],
             "internal": {
@@ -2181,24 +2103,27 @@ def main() -> int:
         selection_self_test()
     client_verified_exit = CLIENT_VERIFIED_EXIT
     if SELF_TEST and not client_verified_exit:
-        client_verified_exit = "87.86.87.231"
+        client_verified_exit = "198.51.100.20"
     print(BLUE + "\n  ═══════════════════════════════════════════════════════════════" + RESET)
-    print(CYAN + f"  IX-ROUTE {VERSION} · 沪日专线／Mieru 双程四层验证" + RESET)
+    print(CYAN + f"  IX-ROUTE {VERSION} · 中国三网同流双程／专线四层验证" + RESET)
     print(BLUE + "  ═══════════════════════════════════════════════════════════════" + RESET)
 
     section("TOPOLOGY / 检测拓扑", CYAN)
     field("中国公网入口", f"{mask_ip(entry)}:{port}", CYAN)
     field("业务端口", f"{port}（协议业务端口；不是 SSH）", GREEN)
-    field("日本预期出口", mask_ip(expected_exit), GREEN)
-    field("日本端内网", mask_ip(local_private), CYAN)
-    field("上海内网对端", mask_ip(remote_peer), MAGENTA)
-    field("测试边界", "入口接入、映射链、Mieru 服务／握手、日本出口；纯内段为附加项", YELLOW)
+    field("预期公网出口", mask_ip(expected_exit), GREEN)
+    field("出口端内网", mask_ip(local_private), CYAN)
+    field("入口内网对端", mask_ip(remote_peer), MAGENTA)
+    field("测试边界", "同探针同端口返回、映射链、可选 Mieru 握手、出口公网；不以默认公网路由冒充回程", YELLOW)
 
     identity = (
-        {"ip": "87.86.87.231", "asn": "AS9999", "org": "SELF-TEST JP", "country": "Japan", "city": "Tokyo"}
+        {"ip": "198.51.100.20", "asn": "AS9999", "org": "SELF-TEST", "country": "Test", "city": "Lab"}
         if SELF_TEST else public_identity()
     )
-    addresses = ["172.16.2.101", "127.0.0.1"] if SELF_TEST else local_addresses()
+    addresses = ["10.0.0.10", "127.0.0.1"] if SELF_TEST else local_addresses()
+    peer_source = "USER_PROVIDED" if remote_peer else ""
+    if not remote_peer:
+        remote_peer, peer_source = detect_private_peer(port, addresses)
     local_status = (
         "PASS" if local_private and local_private in addresses
         else "N/A" if not local_private
@@ -2210,13 +2135,13 @@ def main() -> int:
     )
     mieru = mieru_service(port)
     net_context = (
-        {"defaultRoute": "default via 172.16.2.1 dev eth0", "entryRoute": "211.136.162.184 via 172.16.2.1 dev eth0"}
+        {"defaultRoute": "default via 10.0.0.254 dev eth0", "entryRoute": "203.0.113.10 via 10.0.0.254 dev eth0"}
         if SELF_TEST else network_context(entry)
     )
     if not expected_exit:
-        exit_match = {"status": "N/A", "reason": "未提供预期日本出口"}
+        exit_match = {"status": "N/A", "reason": "未提供预期公网出口"}
     elif identity.get("ip") == expected_exit:
-        exit_match = {"status": "PASS", "reason": "本机公网出口与预期日本出口一致"}
+        exit_match = {"status": "PASS", "reason": "本机公网出口与预期出口一致"}
     elif not identity.get("ip"):
         exit_match = {"status": "N/A", "reason": "公网出口识别失败"}
     else:
@@ -2225,7 +2150,7 @@ def main() -> int:
             "reason": f"本机实际 {mask_ip(identity['ip'])}，与预期 {mask_ip(expected_exit)} 不一致",
         }
 
-    section("LAYER 1 / 中国三网到上海入口", CYAN)
+    section("LAYER 1 / 中国三网到中国侧入口", CYAN)
     regions = FULL_REGIONS if FULL else CORE_REGIONS
     field("模式", "完整六地区 × 三网双程" if FULL else "北上广固定三地区 × 三网双程")
     field("业务丢包口径", "TCP traceroute 只判到达／未确认；中间跳点不回不算 LOSS", YELLOW)
@@ -2240,6 +2165,8 @@ def main() -> int:
                 self_test_probe(carrier, region, city, index)
                 if SELF_TEST else globalping_probe(entry, port, carrier, region, city)
             )
+            same_flow_return = same_flow_return_from_probe(item, entry, port)
+            item["sameFlowReturn"] = same_flow_return
             probes.append(item)
             latency = item.get("latency") or {}
             shown_rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
@@ -2252,22 +2179,30 @@ def main() -> int:
                 ),
                 result_color,
             )
+            return_color = GREEN if same_flow_return["status"] == "PASS" else YELLOW
+            field(
+                "同流返回",
+                f"{same_flow_return['status']}｜同探针同入口同端口｜"
+                f"TCP 响应 {same_flow_return['tcpResponses']}｜反向逐跳不虚构",
+                return_color,
+            )
 
-    section("LAYER 1B / 日本出口到北上广三网回程", CYAN)
-    field("回程口径", "日本出口 → 各省会运营商公网目标；TCP traceroute 可见路由，不把跳点沉默算丢包", YELLOW)
-    returns: list[dict[str, Any]] = []
-    return_index = 0
-    for region, _ in regions:
-        for carrier, (carrier_name, _, color) in CARRIERS.items():
-            return_index += 1
-            host = RETURN_TARGETS[carrier][region]
-            field(f"[{return_index}/{total}]", f"日本出口 → {CAPITALS[region]} {carrier_name} {host}", color)
-            item = return_probe(carrier, region, host)
-            returns.append(item)
-            latency = item.get("latency") or {}
-            shown_rtt = f"{latency['avg']} ms" if latency.get("avg") is not None else "N/A"
-            result_color = GREEN if item["status"] == "PASS" else YELLOW
-            field("结果", f"{item['status']}｜{item.get('selectedProtocol', 'N/A')}｜{item['routeClass']}｜RTT {shown_rtt}", result_color)
+    section("LAYER 1B / 同探针同端口返回确认", CYAN)
+    field(
+        "回程口径",
+        "复用每一组去程的同一中国探针、同一入口和同一业务端口；"
+        "确认 TCP 回应返回，不另测出口 VPS→中国公共目标",
+        YELLOW,
+    )
+    returns: list[dict[str, Any]] = [
+        item["sameFlowReturn"] for item in probes
+    ]
+    return_pass = sum(item["status"] == "PASS" for item in returns)
+    field(
+        "同流返回汇总",
+        f"PASS {return_pass}/{len(returns)}｜反向逐跳路由不可见，不用普通公网 traceroute 补写",
+        GREEN if return_pass else YELLOW,
+    )
 
     access = {
         "total": total,
@@ -2315,24 +2250,29 @@ def main() -> int:
         else "N/A"
     )
 
-    section("LAYER 2 / 上海→日本映射链与可选纯内段", MAGENTA)
-    field("日本内网本机核对", local_status, GREEN if local_status == "PASS" else YELLOW)
-    field("日本业务端口监听", listener["status"], GREEN if listener["status"] == "PASS" else YELLOW)
+    section("LAYER 2 / 入口→出口映射链与同路径内段回程", MAGENTA)
+    field("出口内网本机核对", local_status, GREEN if local_status == "PASS" else YELLOW)
+    field("出口业务端口监听", listener["status"], GREEN if listener["status"] == "PASS" else YELLOW)
     chain = mapping_chain(access, listener, local_status)
     field("端口映射链证据", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
     field("本机默认路由", net_context["defaultRoute"], CYAN)
-    field("到上海入口路由", net_context["entryRoute"], CYAN)
+    field("到中国侧入口路由", net_context["entryRoute"], CYAN)
+    field("私网对端来源", peer_source or "N/A", MAGENTA)
+    field("入口私网对端", mask_ip(remote_peer), MAGENTA)
     internal = (
         {
             "status": "N/A",
-            "reason": "SELF-TEST 未提供内网对端，用于验证 N/A 逻辑",
+            "reason": "SELF-TEST 同路径私网对端未执行真实 ICMP",
             "stats": summarize([], 20),
             "route": "",
+            "routeLookup": "10.0.0.1 dev eth0 src 10.0.0.10",
+            "pathModel": "PRIVATE_PEER_SAME_PATH",
         }
         if SELF_TEST else ping_peer(remote_peer)
     )
-    field("纯内段附加测试", internal["status"], GREEN if internal["status"] == "PASS" else YELLOW)
-    field("纯内段附加评级", quality_label(internal), CYAN)
+    field("同路径内段回程", internal["status"], GREEN if internal["status"] == "PASS" else YELLOW)
+    field("私网路由核对", internal.get("routeLookup") or "N/A", CYAN)
+    field("内段附加评级", quality_label(internal), CYAN)
 
     section("LAYER 3 / Mieru 服务与真实握手", MAGENTA)
     field("Mieru／Mita 识别", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)
@@ -2347,7 +2287,7 @@ def main() -> int:
     )
     field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
 
-    section("LAYER 4 / 日本出口公网", GREEN)
+    section("LAYER 4 / 出口公网", GREEN)
     field("实际公网出口", mask_ip(identity.get("ip", "")), GREEN)
     field("ASN／运营商", f"{identity.get('asn') or 'N/A'}｜{identity.get('org') or 'N/A'}")
     field("位置", f"{identity.get('country') or 'N/A'} {identity.get('city') or ''}")
@@ -2357,13 +2297,16 @@ def main() -> int:
     report = {
         "version": VERSION,
         "generated": generated.isoformat(timespec="seconds"),
-        "mode": "HURI_MIERU_DEDICATED_LINE_FOUR_LAYER",
-        "matrix": "六地区 × 三网双程（36组）" if FULL else "北上广 × 三网双程（18组）",
+        "mode": "CN3_SAME_FLOW_DEDICATED_LINE_FOUR_LAYER",
+        "matrix": (
+            "六地区 × 三网（18去程＋18同流返回）"
+            if FULL else "北上广 × 三网（9去程＋9同流返回）"
+        ),
         "entry": {"masked": mask_ip(entry), "port": port},
         "exitIdentity": {**identity, "ipMasked": mask_ip(identity.get("ip", ""))},
         "exitMatch": exit_match,
         "localPrivate": {"masked": mask_ip(local_private), "status": local_status},
-        "remotePeer": {"masked": mask_ip(remote_peer)},
+        "remotePeer": {"masked": mask_ip(remote_peer), "source": peer_source or "N/A"},
         "networkContext": net_context,
         "listener": listener,
         "mieruService": mieru,
@@ -2374,17 +2317,21 @@ def main() -> int:
         "returns": returns,
         "protocolHandshake": handshake,
         "clientVerifiedExit": mask_ip(client_verified_exit),
+        "privacy": "入口、出口、内网对端及客户端实测 IPv4 仅保留前两段；公共报告不保存原值。",
         "methodology": (
             "中国侧使用 Globalping 指定中国电信、联通、移动完整运营商 ASN 家族，"
-            "对上海入口业务端口执行 TCP traceroute；北京、上海、广州固定列入，"
-            "--full 再扩展合肥、南京与杭州。日本出口同时对相同城市的三网公网目标执行"
-            "TCP traceroute，作为真实可见的回程证据；不把中间跳点沉默当作业务丢包。"
-            "日本出口本机核对公网 IP、业务监听、本机内网地址、"
-            "默认路由及到上海入口的路由；入口可达且日本端同端口监听、私网地址吻合时，"
+            "对中国侧入口业务端口执行 TCP traceroute；北京、上海、广州固定列入，"
+            "--full 再扩展合肥、南京与杭州。每一组回程均复用同一 Globalping 探针、"
+            "同一入口与同一业务端口，以 TCP 返回回应确认同流返回可达；"
+            "反向逐跳路由无法从该测量端观察，因此不虚构，也不再使用出口 VPS 默认公网路由"
+            "探测其他中国公共目标来冒充本专线回程。"
+            "出口 VPS 本机核对公网 IP、业务监听、本机内网地址、"
+            "默认路由及到中国侧入口的路由；入口可达且出口端同端口监听、私网地址吻合时，"
             "给出端口映射链证据；自动识别 mita 版本、运行状态、端口与 NTP。"
-            "只有中国客户端连接 Mieru 后实测出口与日本端实际／预期出口一致，"
-            "才把真实握手判为 PASS。供应商确实提供上海内网对端时，才用 20 次 ICMP 与 "
-            "MTR／traceroute 增测专线纯内段。"
+            "只有中国客户端连接 Mieru 后实测出口与出口端实际／预期出口一致，"
+            "才把真实握手判为 PASS。供应商提供入口内网对端，或业务端口存在可识别的"
+            "私网 ESTABLISHED 对端时，才用 20 次 ICMP、路由查找与 MTR／traceroute"
+            "增测出口→入口私网对端的同路径内段回程。"
             "去程先读取 Globalping 在线探针清单，再按省会运营商家宽、省内任意城市运营商家宽、"
             "省内运营商数据中心、省内运营商未分类网络、省内其他数据中心五级筛选；"
             "行政区核对严格按 Globalping state、省市映射、唯一坐标范围依次判定；"
@@ -2397,14 +2344,33 @@ def main() -> int:
             "同时保留“完整末跳未显示”的事实。Globalping magic 请求的 limit 位于请求最外层；"
             "测量使用严格 country+city+ASN+tag 参数；只有确认所有合法候选均无在线探针才记 NO_PROBE，"
             "结构化 no_probes_found 与其他 API 422 分开处理。"
-            "回程参考 oneclickvirt/backtrace 的备援策略：每省每运营商保留固定主测点，"
-            "主测点骨干证据不足时，从每日更新的省级三网 ICMP 目标池选择最多两个备援地址；"
-            "每个目标先以 TCP 三探测追踪，证据不足时依次回退 ICMP 与 UDP，最大 30 跳、单跳等待 2 秒；"
-            "备援仅改变日本出口的回程目标，不会冒充中国侧去程来源。"
             "探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
             "不会换算为 100% 业务丢包。"
         ),
     }
+
+    report = privacy_scrub(
+        report,
+        [
+            entry,
+            expected_exit,
+            identity.get("ip", ""),
+            local_private,
+            remote_peer,
+            client_verified_exit,
+        ],
+    )
+    if SELF_TEST:
+        payload_check = public_report_payload(report)
+        if len(payload_check.get("carriers") or []) != 3:
+            raise AssertionError("公共报告三网结构不完整")
+        for carrier_payload in payload_check["carriers"]:
+            if len(carrier_payload.get("forwardProbes") or []) != 6:
+                raise AssertionError("公共报告去程必须为每网六组")
+            if len(carrier_payload.get("probes") or []) != 6:
+                raise AssertionError("公共报告同流返回必须为每网六组")
+            if carrier_payload.get("route") != "同一中国探针 ↔ 同一中国侧入口业务端口":
+                raise AssertionError("公共报告仍残留默认公网回程口径")
 
     output_name = f"ix-route-report-{generated.strftime('%Y%m%d-%H%M%S')}"
     preferred_root = Path("/root") if os.geteuid() == 0 else Path.cwd()
@@ -2425,7 +2391,7 @@ def main() -> int:
 
     section("FINAL / 四层独立结论", CYAN)
     field(
-        "上海入口接入",
+        "中国侧入口接入",
         (
             f"{access['status']}｜运营商可达 {access['carrierReachable']}/{access['total']} "
             f"({access['carrierCoverage']}%)｜原省精确 {access['pass']}/{access['total']} "
@@ -2436,12 +2402,12 @@ def main() -> int:
         GREEN if access["status"] == "PASS" else YELLOW,
     )
     return_pass = sum(x["status"] == "PASS" for x in returns)
-    field("北上广／六地回程", f"PASS {return_pass}/{len(returns)}｜N/A/未确认不计 100% LOSS", GREEN if return_pass else YELLOW)
-    field("上海→日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
-    field("专线纯内段附加项", quality_label(internal), GREEN if internal["status"] == "PASS" else YELLOW)
+    field("同探针同端口返回", f"PASS {return_pass}/{len(returns)}｜不另走出口默认公网路由", GREEN if return_pass else YELLOW)
+    field("入口→出口映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
+    field("同路径私网回程", quality_label(internal), GREEN if internal["status"] == "PASS" else YELLOW)
     field("Mieru／Mita 服务", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)
     field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
-    field("日本出口公网", f"{exit_match['status']}｜{mask_ip(identity.get('ip', ''))}", GREEN if exit_match["status"] == "PASS" else YELLOW)
+    field("出口公网", f"{exit_match['status']}｜{mask_ip(identity.get('ip', ''))}", GREEN if exit_match["status"] == "PASS" else YELLOW)
     field("HTML 网页", str(html_path), GREEN)
     field("Markdown 报告", str(md_path), GREEN)
     field("JSON 数据", str(json_path), GREEN)
