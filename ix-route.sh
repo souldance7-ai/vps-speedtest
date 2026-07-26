@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.4 RC1"
+VERSION="v0.5 RC2"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
@@ -14,7 +14,7 @@ NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 四层质量检测 v0.4 RC1
+沪日专线／IX-style 四层质量检测 v0.5 RC2
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -108,7 +108,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.4 RC1")
+VERSION = os.environ.get("IX_VERSION", "v0.5 RC2")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
@@ -171,6 +171,45 @@ RETURN_TARGETS = {
 CAPITALS = {
     "北京": "北京市", "上海": "上海市", "广东": "广州市",
     "安徽": "合肥市", "江苏": "南京市", "浙江": "杭州市",
+}
+CARRIER_ASN_FAMILIES = {
+    "CT": {4134, 4812, 4816},
+    "CU": {4837, 4808, 17621, 17622, 17623, 17816},
+    "CM": {
+        9808, 24445, 56040, 56041, 56042, 56044, 56046, 56047,
+        56048, 56050, 56055, 56056, 56057, 56058,
+    },
+}
+CARRIER_NETWORK_HINTS = {
+    "CT": ("chinanet", "china telecom", "telecom"),
+    "CU": ("china unicom", "china169", "unicom"),
+    "CM": ("china mobile", "mobile communications", "mobile communica"),
+}
+CARRIER_MAGIC = {
+    "CT": "China Telecom", "CU": "China Unicom", "CM": "China Mobile",
+}
+PROVINCE_CITIES = {
+    "北京": ("Beijing",),
+    "上海": ("Shanghai",),
+    "广东": ("Guangzhou", "Shenzhen", "Foshan", "Dongguan"),
+    "安徽": ("Hefei", "Wuhu", "Bengbu"),
+    "江苏": ("Nanjing", "Suzhou", "Wuxi", "Changzhou", "Xuzhou"),
+    "浙江": ("Hangzhou", "Ningbo", "Wenzhou", "Shaoxing", "Jiaxing"),
+}
+REGION_ACCESS_ASNS = {
+    "CT": {
+        "北京": (4134,), "上海": (4134, 4812), "广东": (4134, 4816),
+        "安徽": (4134,), "江苏": (4134,), "浙江": (4134,),
+    },
+    "CU": {
+        "北京": (4808, 4837), "上海": (17621, 4837),
+        "广东": (17622, 4837), "安徽": (4837,),
+        "江苏": (4837,), "浙江": (17623, 4837),
+    },
+    "CM": {
+        "北京": (56048, 9808), "上海": (9808,), "广东": (9808,),
+        "安徽": (9808,), "江苏": (9808,), "浙江": (9808,),
+    },
 }
 
 
@@ -266,6 +305,59 @@ def http_json(url: str, method: str = "GET", payload: Any = None, timeout: int =
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode())
+
+
+ASN_CACHE: dict[str, str] = {}
+
+
+def origin_asn(ip: str) -> str:
+    if ip in ASN_CACHE:
+        return ASN_CACHE[ip]
+    if not valid_ipv4(ip, public=True) or not shutil.which("dig"):
+        return ""
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    try:
+        output = subprocess.check_output(
+            ["dig", "+short", "TXT", f"{reversed_ip}.origin.asn.cymru.com"],
+            text=True, timeout=4, stderr=subprocess.DEVNULL,
+        )
+        match = re.search(r'"?\s*(\d+)\s*\|', output)
+        result = f"AS{match.group(1)}" if match else ""
+    except Exception:
+        result = ""
+    ASN_CACHE[ip] = result
+    return result
+
+
+def enrich_route(route: str, maximum: int = 24) -> str:
+    seen: set[str] = set()
+    evidence: list[str] = []
+    for ip in re.findall(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)", route):
+        if ip in seen or not valid_ipv4(ip, public=True):
+            continue
+        seen.add(ip)
+        asn = origin_asn(ip)
+        if asn:
+            evidence.append(f"{ip} {asn}")
+        if len(seen) >= maximum:
+            break
+    return route + ("\n@@ASN_EVIDENCE " + " | ".join(evidence) if evidence else "")
+
+
+def normalize_city(value: str) -> str:
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def probe_matches_carrier(probe: dict[str, Any], carrier: str) -> bool:
+    try:
+        probe_asn = int(probe.get("asn") or 0)
+    except (TypeError, ValueError):
+        probe_asn = 0
+    network = str(probe.get("network") or "").lower()
+    return (
+        probe_asn in CARRIER_ASN_FAMILIES[carrier]
+        or any(hint in network for hint in CARRIER_NETWORK_HINTS[carrier])
+    )
 
 
 def public_identity() -> dict[str, str]:
@@ -502,30 +594,26 @@ def ping_peer(peer: str, count: int = 20) -> dict[str, Any]:
 
 def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str) -> dict[str, Any]:
     name, asn, _ = CARRIERS[carrier]
-    attempts = [
-        (
-            f"{CAPITALS[region]}+AS{asn}+家宽",
-            {"country": "CN", "city": city, "asn": asn, "tags": ["eyeball-network"], "limit": 1},
-        ),
-        (
-            f"{CAPITALS[region]}+AS{asn}",
-            {"country": "CN", "city": city, "asn": asn, "limit": 1},
-        ),
-        (
-            f"{CAPITALS[region]}+AS{asn} magic",
-            {"magic": f"{city}+AS{asn}", "limit": 1},
-        ),
-    ]
+    attempts: list[tuple[str, list[str]]] = []
+    for city_index, candidate_city in enumerate(PROVINCE_CITIES[region]):
+        magic_values = [f"{candidate_city}+{CARRIER_MAGIC[carrier]}"]
+        magic_values.extend(
+            f"{candidate_city}+AS{candidate_asn}"
+            for candidate_asn in REGION_ACCESS_ASNS[carrier][region]
+        )
+        scope = "省会直测" if city_index == 0 else f"同省备用 {candidate_city}"
+        attempts.append((scope, magic_values))
     errors: list[str] = []
-    for mode, location in attempts:
+    for mode, magic_values in attempts:
         try:
             created = http_json(
                 GLOBALPING_API,
                 "POST",
                 {
+                    "limit": min(8, max(1, len(magic_values))),
                     "target": entry,
                     "type": "traceroute",
-                    "locations": [location],
+                    "locations": [{"magic": value} for value in magic_values],
                     "measurementOptions": {"protocol": "TCP", "port": port},
                 },
             )
@@ -542,19 +630,36 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                     raise RuntimeError(f"API 状态 {result.get('status')}")
             if not result or result.get("status") != "finished":
                 raise TimeoutError("等待远端结果超时")
-            item = next(
-                (x for x in result.get("results", []) if x.get("result", {}).get("status") == "finished"),
-                None,
-            )
+            candidate_city = magic_values[0].split("+", 1)[0]
+            candidates = [
+                x for x in result.get("results", [])
+                if (
+                    x.get("result", {}).get("status") == "finished"
+                    and normalize_city(str((x.get("probe") or {}).get("city") or ""))
+                    == normalize_city(candidate_city)
+                    and probe_matches_carrier(x.get("probe") or {}, carrier)
+                )
+            ]
+            candidates.sort(key=lambda x: (
+                int((x.get("probe") or {}).get("asn") or 0) != asn,
+                "eyeball-network" not in ((x.get("probe") or {}).get("tags") or []),
+            ))
+            item = candidates[0] if candidates else None
             if not item:
-                raise RuntimeError("无有效探针结果")
+                visible = "、".join(
+                    (
+                        f"{(x.get('probe') or {}).get('city', '未知城市')} "
+                        f"AS{(x.get('probe') or {}).get('asn', 0)} "
+                        f"{(x.get('probe') or {}).get('network', '未知网络')}"
+                    )
+                    for x in result.get("results", [])
+                )
+                raise RuntimeError(f"无同城市同运营商探针；返回 {visible or '空'}")
             probe = item.get("probe") or {}
             source_asn = int(probe.get("asn") or 0)
             actual_city = str(probe.get("city") or "")
-            city_verified = re.sub(r"[^a-z]", "", actual_city.lower()) == re.sub(
-                r"[^a-z]", "", city.lower()
-            )
-            asn_verified = source_asn == asn
+            city_verified = normalize_city(actual_city) == normalize_city(candidate_city)
+            asn_verified = probe_matches_carrier(probe, carrier)
             route_lines: list[str] = []
             target_rtts: list[float] = []
             last_rtts: list[float] = []
@@ -594,14 +699,24 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
                 "probeAsn": source_asn,
                 "asnVerified": asn_verified,
                 "cityVerified": city_verified,
+                "selectionScope": "CAPITAL" if mode == "省会直测" else "PROVINCE_FALLBACK",
                 "status": status,
                 "targetReached": reached,
                 "latency": latency,
                 "route": "\n".join(route_lines),
-                "reason": "；".join(reasons),
+                "reason": (
+                    (
+                        f"省会 {CAPITALS[region]} 无可用探针，"
+                        f"退到同省 {actual_city}；未跨省。"
+                    )
+                    if mode != "省会直测"
+                    else f"省会 {CAPITALS[region]} 定向探针命中。"
+                ) + "；".join(reasons),
             }
         except Exception as exc:
-            errors.append(f"{mode}: {type(exc).__name__}: {exc}")
+            errors.append(
+                f"{mode}〔{'、'.join(magic_values)}〕: {type(exc).__name__}: {exc}"
+            )
     return {
         "carrier": carrier,
         "carrierName": name,
@@ -611,11 +726,15 @@ def globalping_probe(entry: str, port: int, carrier: str, region: str, city: str
         "probeAsn": 0,
         "asnVerified": False,
         "cityVerified": False,
-        "status": "N/A",
+        "selectionScope": "NO_PROBE",
+        "status": "NO_PROBE",
         "targetReached": False,
         "latency": summarize([], 0),
         "route": "",
-        "reason": "；".join(errors),
+        "reason": (
+            "已先查省会，再查同省城市；未跨省替代。"
+            + "；".join(errors)
+        ),
     }
 
 
@@ -631,6 +750,7 @@ def self_test_probe(carrier: str, region: str, city: str, index: int) -> dict[st
         "probeAsn": asn,
         "asnVerified": True,
         "cityVerified": True,
+        "selectionScope": "CAPITAL",
         "status": "PASS" if reached else "INCONCLUSIVE",
         "targetReached": reached,
         "latency": {
@@ -658,23 +778,34 @@ def traceroute_rtts(route: str) -> list[float]:
     return values
 
 
-def return_route_label(carrier: str, route: str) -> tuple[str, list[str], str]:
+def matching_hop_count(route: str, patterns: list[str]) -> int:
+    return sum(
+        1 for row in route.splitlines()
+        if re.search(r"^\s*\d+\s+", row)
+        and any(re.search(pattern, row, re.I) for pattern in patterns)
+    )
+
+
+def return_route_label(carrier: str, route: str) -> tuple[str, list[str], str, int]:
     patterns = {
         "CT": [
-            ("CN2 GIA／CN2", [r"59\.43\."], "AS4809｜CN2 精品骨干"),
-            ("ChinaNet 163", [r"202\.97\."], "AS4134｜ChinaNet 163 普通骨干"),
+            ("CN2 GIA／CN2", [r"AS4809", r"59\.43\."], "AS4809｜CN2 精品骨干", 5),
+            ("ChinaNet 163", [r"AS4134", r"202\.97\."], "AS4134｜ChinaNet 163 普通骨干", 2),
         ],
         "CU": [
-            ("CUII AS9929", [r"218\.105\.", r"210\.(51|52|53|78)\."], "AS9929｜CUII 联通精品骨干"),
-            ("China169 AS4837", [r"219\.158\."], "AS4837｜China169 联通普通骨干"),
+            ("CUII AS9929", [r"AS9929", r"218\.105\.", r"210\.(51|52|53|78)\."], "AS9929｜CUII 联通精品骨干", 5),
+            ("CUG AS10099", [r"AS10099", r"202\.77\.", r"43\.252\.", r"61\.14\."], "AS10099｜CUG 联通国际网", 3),
+            ("China169 AS4837", [r"AS4837", r"219\.158\."], "AS4837｜China169 联通普通骨干", 2),
         ],
         "CM": [
-            ("CMIN2", [r"223\.118\.32\."], "AS58807｜CMIN2 移动精品骨干"),
-            ("CMI／CMNET", [r"223\.(118|119)\.", r"221\.183\.", r"111\.24\."], "AS58453／AS9808｜移动普通骨干"),
+            ("CMIN2", [r"AS58807", r"223\.118\.32\."], "AS58807｜CMIN2 移动精品骨干", 5),
+            ("CMI 普通国际", [r"AS58453", r"223\.118\.(?!32\.)", r"223\.119\."], "AS58453｜CMI 移动普通国际网", 2),
+            ("CMNET 国内骨干", [r"AS9808", r"221\.183\.", r"111\.24\."], "AS9808｜CMNET 移动国内骨干", 2),
         ],
     }
     matched = [
-        (label, tag) for label, expressions, tag in patterns[carrier]
+        (label, tag, rank, expressions)
+        for label, expressions, tag, rank in patterns[carrier]
         if any(re.search(expression, route, re.I) for expression in expressions)
     ]
     if not matched:
@@ -682,13 +813,30 @@ def return_route_label(carrier: str, route: str) -> tuple[str, list[str], str]:
             "INCONCLUSIVE｜可见跳点证据不足",
             ["未识别骨干｜不按普通线或精品线强判"],
             "仅确认日本出口到目标运营商公网地址的可见路由；缺少特征跳点时保持证据不足。",
+            0,
         )
     labels = [x[0] for x in matched]
     tags = [x[1] for x in matched]
+    rank = max(x[2] for x in matched)
+    premium = any(x[2] == 5 for x in matched)
+    if not premium:
+        carrier_hops = max(matching_hop_count(route, x[3]) for x in matched)
+        if carrier_hops <= 1:
+            return (
+                f"INCONCLUSIVE｜仅见{CARRIERS[carrier][0]}目的网",
+                tags,
+                "单一运营商目的网投递跳点不能证明完整回程骨干；保留标签但不参与线路评分。",
+                0,
+            )
     return (
         " → ".join(labels),
         tags,
-        "线路标签来自可见特征 IP；中间节点不回应不作为端到端业务丢包。",
+        (
+            "精品骨干证据来自可见 ASN／特征 IP；普通目的网投递段不覆盖精品判定。"
+            if premium
+            else "非精品骨干证据来自至少两个可见运营商跳点；中间节点不回应不作为端到端业务丢包。"
+        ),
+        rank,
     )
 
 
@@ -697,22 +845,50 @@ def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
     if SELF_TEST:
         routes = {
             "CT": "1 87.86.87.1 1.2 ms\n2 59.43.181.1 32.0 ms\n3 219.141.136.10 38.1 ms",
-            "CU": "1 87.86.87.1 1.1 ms\n2 219.158.8.1 41.0 ms\n3 202.106.50.1 45.2 ms",
+            "CU": "1 87.86.87.1 1.1 ms\n2 218.105.2.205 39.0 ms\n3 219.158.8.1 41.0 ms\n4 202.106.50.1 45.2 ms",
             "CM": "1 87.86.87.1 1.0 ms\n2 223.118.32.1 35.0 ms\n3 221.179.155.161 39.4 ms",
         }
-        route = routes[carrier]
+        route = enrich_route(routes[carrier])
+        route_class, tags, note, route_rank = return_route_label(carrier, route)
+        transport = "SELF-TEST"
     elif shutil.which("traceroute"):
-        route = run(
-            ["traceroute", "-n", "-T", "-p", "80", "-q", "1", "-w", "1", "-m", "25", host],
-            40,
-        )
+        raw_candidates = [
+            ("TCP/443", run(
+                ["traceroute", "-n", "-T", "-p", "443", "-q", "1", "-w", "1", "-m", "25", host],
+                40,
+            )),
+            ("ICMP", run(
+                ["traceroute", "-n", "-I", "-q", "1", "-w", "1", "-m", "25", host],
+                40,
+            )),
+            ("UDP", run(
+                ["traceroute", "-n", "-q", "1", "-w", "1", "-m", "25", host],
+                40,
+            )),
+        ]
+        evaluated = []
+        for candidate_transport, raw_route in raw_candidates:
+            candidate_route = enrich_route(raw_route)
+            candidate_class, candidate_tags, candidate_note, candidate_rank = (
+                return_route_label(carrier, candidate_route)
+            )
+            evaluated.append((
+                candidate_rank, route_hop_count(raw_route), candidate_transport,
+                candidate_route, candidate_class, candidate_tags, candidate_note,
+            ))
+        (
+            route_rank, _, transport, route, route_class, tags, note
+        ) = max(evaluated, key=lambda x: (x[0], x[1]))
     elif shutil.which("tracepath"):
-        route = run(["tracepath", "-n", "-m", "25", host], 40)
+        transport = "TRACEPATH"
+        route = enrich_route(run(["tracepath", "-n", "-m", "25", host], 40))
+        route_class, tags, note, route_rank = return_route_label(carrier, route)
     else:
         return {
             "carrier": carrier, "carrierName": name, "region": region,
             "capital": CAPITALS[region], "host": host, "status": "N/A",
             "route": "", "routeHops": 0, "routeClass": "N/A",
+            "routeRank": 0, "routeScore": 0, "transport": "N/A",
             "backboneTags": [], "routeNote": "系统无 traceroute／tracepath",
             "latency": summarize([], 0), "reason": "缺少回程路由工具；不换算为 100% 丢包",
         }
@@ -722,19 +898,24 @@ def return_probe(carrier: str, region: str, host: str) -> dict[str, Any]:
             "carrier": carrier, "carrierName": name, "region": region,
             "capital": CAPITALS[region], "host": host, "status": "INCONCLUSIVE",
             "route": route, "routeHops": 0, "routeClass": "回程无有效跳点",
+            "routeRank": 0, "routeScore": 0, "transport": transport,
             "backboneTags": [], "routeNote": "未取得有效跳点，不等于业务中断",
             "latency": summarize([], 0), "reason": "traceroute 无有效回覆；不换算为 100% 丢包",
         }
     values = traceroute_rtts(route)
     latency = summarize(values[-3:], len(values[-3:])) if values else summarize([], 0)
     latency["loss"] = None
-    route_class, tags, note = return_route_label(carrier, route)
+    route_score = {5: 90, 3: 72, 2: 55}.get(route_rank, 0)
     return {
         "carrier": carrier, "carrierName": name, "region": region,
         "capital": CAPITALS[region], "host": host, "status": "PASS",
         "route": route, "routeHops": hops, "routeClass": route_class,
+        "routeRank": route_rank, "routeScore": route_score, "transport": transport,
         "backboneTags": tags, "routeNote": note, "latency": latency,
-        "reason": f"取得 {hops} 个有效回程跳点；RTT 仅取末段可见样本",
+        "reason": (
+            f"{transport} 取得 {hops} 个有效回程跳点；"
+            "三种协议先按骨干证据等级选择，等级相同才比较回覆跳数；RTT 仅取末段可见样本"
+        ),
     }
 
 
@@ -792,7 +973,7 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         "## 结论",
         "",
-        f"- 上海入口端到端 TCP：{access['status']}（PASS {access['pass']}/{access['total']}，INCONCLUSIVE {access['inconclusive']}，N/A {access['na']}）",
+        f"- 上海入口端到端 TCP：{access['status']}（PASS {access['pass']}/{access['total']}，INCONCLUSIVE {access['inconclusive']}，NO_PROBE {access.get('noProbe', 0)}，N/A {access['na']}）",
         f"- 日本端业务监听：{listener['status']} — {listener['evidence']}",
         f"- Mieru／Mita 服务：{report['mieruService']['status']} — {report['mieruService']['evidence']}",
         f"- Mieru 真实握手：{report['protocolHandshake']['status']} — {report['protocolHandshake']['reason']}",
@@ -924,6 +1105,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "region": item["requestedRegion"],
                 "label": f"{item['requestedRegion']} {carrier_names[carrier]} → 上海入口",
                 "access": item.get("mode") or "N/A",
+                "actualProbeCity": item.get("probeCity") or "",
+                "selectionScope": item.get("selectionScope") or "",
                 "publicIp": "",
                 "verified": bool(item.get("asnVerified") and item.get("cityVerified")),
                 "route": "Mieru TCP 上海入口接入",
@@ -958,15 +1141,23 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         }
         return_items = [x for x in report["returns"] if x["carrier"] == carrier]
         return_passed = [x for x in return_items if x["status"] == "PASS"]
-        return_score = round(len(return_passed) * 100 / len(return_items)) if return_items else 0
+        return_valid = [x for x in return_items if int(x.get("routeRank", 0)) > 0]
+        return_score = (
+            round(sum(int(x.get("routeScore", 0)) for x in return_items) / len(return_items))
+            if return_items else 0
+        )
         return_probes = []
         for item in return_items:
             latency = item.get("latency") or {}
             return_probes.append({
                 "city": item["capital"], "host": item["host"], "ip": item["host"],
                 "route": item["routeClass"], "evidence": item["reason"],
-                "score": 100 if item["status"] == "PASS" else 0,
-                "stars": "★★★★★" if item["status"] == "PASS" else "☆☆☆☆☆",
+                "score": int(item.get("routeScore", 0)),
+                "stars": (
+                    "★★★★★" if int(item.get("routeScore", 0)) >= 85
+                    else "★★★☆☆" if int(item.get("routeScore", 0)) >= 55
+                    else "☆☆☆☆☆"
+                ),
                 "avg": latency.get("avg"), "min": None, "max": None,
                 "p95": latency.get("p95"), "jitter": latency.get("jitter"),
                 "stddev": None, "loss": None,
@@ -975,9 +1166,11 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "backboneTags": item.get("backboneTags", []),
                 "routeNote": item.get("routeNote", ""),
                 "probeCapital": item["capital"],
+                "routeRank": int(item.get("routeRank", 0)),
+                "transport": item.get("transport", ""),
                 "reachability": item["status"],
             })
-        overall_score = round(score * 0.5 + return_score * 0.5)
+        overall_score = round(score * 0.3 + return_score * 0.7)
         carriers.append({
             "id": carrier, "name": carrier_names[carrier],
             "route": "日本出口 → 北上广／六地运营商公网目标",
@@ -989,6 +1182,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "forwardRoute": "Mieru TCP 上海入口接入",
             "forwardProbes": flat, "forwardScore": score,
             "returnScore": return_score,
+            "returnValid": f"{len(return_valid)}/{len(return_items)}",
+            "returnReachable": f"{len(return_passed)}/{len(return_items)}",
             "bidirectional": False,
             "probes": return_probes,
         })
@@ -1010,7 +1205,10 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         "final": {
             "score": final_score,
             "stars": "★★★★★" if final_score >= 80 else "★★★☆☆",
-            "title": f"Mieru 映射链 {report['mappingChain']['status']}",
+            "title": (
+                f"Mieru 映射链 {report['mappingChain']['status']}｜"
+                "分数含回程骨干证据，不以 traceroute 可达直接计 100"
+            ),
             "elapsed": "N/A",
         },
         "carriers": carriers,
@@ -1043,6 +1241,11 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
                 "carrier": x["carrier"], "capital": x["capital"],
                 "host": x["host"], "status": x["status"],
                 "routeClass": x["routeClass"], "routeHops": x["routeHops"],
+                "routeRank": x.get("routeRank", 0),
+                "routeScore": x.get("routeScore", 0),
+                "transport": x.get("transport", ""),
+                "backboneTags": x.get("backboneTags", []),
+                "routeNote": x.get("routeNote", ""),
                 "latency": x["latency"],
             } for x in report["returns"]],
             "internal": {
@@ -1178,12 +1381,13 @@ def main() -> int:
         "pass": sum(x["status"] == "PASS" for x in probes),
         "inconclusive": sum(x["status"] == "INCONCLUSIVE" for x in probes),
         "na": sum(x["status"] == "N/A" for x in probes),
+        "noProbe": sum(x["status"] == "NO_PROBE" for x in probes),
     }
     access["coverage"] = round(access["pass"] * 100 / total, 1) if total else 0.0
     access["status"] = (
         "PASS" if access["pass"] / total >= 0.8
         else "PARTIAL" if access["pass"] > 0
-        else "N/A" if access["na"] == total
+        else "N/A" if access["na"] + access["noProbe"] == total
         else "INCONCLUSIVE"
     )
 
@@ -1247,10 +1451,14 @@ def main() -> int:
         "protocolHandshake": handshake,
         "clientVerifiedExit": mask_ip(client_verified_exit),
         "methodology": (
-            "中国侧使用 Globalping 指定中国电信 AS4134、联通 AS4837、移动 AS9808，"
-            "对上海入口业务端口执行 TCP traceroute；北京、上海、广州固定列入，"
-            "--full 再扩展合肥、南京与杭州。日本出口同时对相同城市的三网公网目标执行"
-            "TCP traceroute，作为真实可见的回程证据；不把中间跳点沉默当作业务丢包。"
+            "中国侧不再随机扫描整座城市，也不把骨干 ASN 当成唯一探针 ASN；"
+            "每组先以省会＋运营商名称／省级接入 ASN 定向查找 Globalping 探针，"
+            "省会无探针时才退到同省其他城市，实际城市、ASN 与退选原因完整列示，绝不跨省替代。"
+            "北京、上海、广州固定列入，--full 再扩展合肥、南京与杭州。"
+            "日本出口对相同地区的三网公网目标同时执行 TCP/443、ICMP、UDP traceroute，"
+            "先选择 CN2／AS9929／CMIN2 等骨干证据等级最高的结果，等级相同才比较回覆跳数；"
+            "回程分数来自骨干等级与证据覆盖，不再把“有跳点回应”直接计为 100 分。"
+            "不把中间跳点沉默当作业务丢包。"
             "日本出口本机核对公网 IP、业务监听、本机内网地址、"
             "默认路由及到上海入口的路由；入口可达且日本端同端口监听、私网地址吻合时，"
             "给出端口映射链证据；自动识别 mita 版本、运行状态、端口与 NTP。"
@@ -1282,7 +1490,16 @@ def main() -> int:
     section("FINAL / 四层独立结论", CYAN)
     field("上海入口接入", f"{access['status']}｜PASS {access['pass']}/{access['total']}｜覆盖 {access['coverage']}%", GREEN if access["status"] == "PASS" else YELLOW)
     return_pass = sum(x["status"] == "PASS" for x in returns)
-    field("北上广／六地回程", f"PASS {return_pass}/{len(returns)}｜N/A/未确认不计 100% LOSS", GREEN if return_pass else YELLOW)
+    return_valid = sum(int(x.get("routeRank", 0)) > 0 for x in returns)
+    return_premium = sum(int(x.get("routeRank", 0)) == 5 for x in returns)
+    field(
+        "北上广／六地回程",
+        (
+            f"可达 {return_pass}/{len(returns)}｜骨干有效 {return_valid}/{len(returns)}｜"
+            f"精品证据 {return_premium}/{len(returns)}｜可达不直接计 100 分"
+        ),
+        GREEN if return_valid else YELLOW,
+    )
     field("上海→日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
     field("专线纯内段附加项", quality_label(internal), GREEN if internal["status"] == "PASS" else YELLOW)
     field("Mieru／Mita 服务", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)

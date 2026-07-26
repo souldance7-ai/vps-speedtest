@@ -8,7 +8,7 @@
 ### 在日本出口 VPS 一键执行
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/ix-route.sh?ver=IX0.1")
+    bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/ix-route.sh?ver=IX0.5-RC2")
 ```
 
 交互输入示例：
@@ -19,17 +19,17 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 - 日本端专线内网：`172.16.2.101`
 - 上海端专线内网对端：已知时填写；未知直接回车，纯内段结果显示 N/A
 
-默认测试上海、安徽、江苏、浙江 × 中国电信／联通／移动；加 `--full` 扩展北京和广东。报告把入口接入、专线纯内段、日本出口分开判定。探针失败、DNS 失败或缺少内网对端不会被写成 100% LOSS。
+默认测试北京、上海、广东 × 中国电信／联通／移动；加 `--full` 扩展安徽、江苏、浙江。v0.5 RC2 改为“省会＋运营商名称／省级接入 ASN”定向找探针；省会无探针时只允许退到同省城市，并标明实际城市与退选原因，禁止跨省替代。回程同时尝试 TCP/443、ICMP、UDP，先按骨干证据等级选择，等级相同才比较回覆跳数。回程分数来自 CN2／AS9929／CMIN2 等实际骨干证据，不再把“traceroute 有跳点”直接计为 100 分。
 
 ---
 
-## RC4.2.5 六省会测点健康检查版
+## RC4.2.6 运营商定向选点版
 
 适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京市、上海市、广州市、合肥市、南京市、杭州市六个省会，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
 
-RC4.2.5 修正 RC4.2.4 将 `limit` 错放进 Globalping `locations` 对象、导致大量 HTTP 422 的请求格式问题。新版先扫描北京市／上海市／广州市／合肥市／南京市／杭州市各省会当前全部在线探针，再按省级接入 ASN 家族与运营商名称筛选三网测点；上海联通 AS4808、广州联通 AS17622、北京移动 AS56048 等不再因“不是骨干 ASN”被误删。接入 ASN 只用于确认测点所属运营商，精品／普通线路仍严格按 traceroute 的实际骨干证据判定。
+RC4.2.6 不再先随机扫描整座城市；每个地区、每家运营商分别用省会＋运营商名称／省级接入 ASN 定向请求测点。省会没有在线探针时，才依次退到同省候选城市，并在 CMD、HTML、JSON、NodeSeek 标明 `CAPITAL` 或 `PROVINCE_FALLBACK`、实际城市和 ASN。上海联通 AS17621／AS4837、广州联通 AS17622、北京移动 AS56048 等省级接入网可用于确认测点身份，但精品／普通线路仍只按 traceroute 的实际骨干证据判定。
 
-去程每列新增 `ONLINE-EXACT`、`ONLINE-FAMILY`、`OFFLINE` 测点健康状态；找不到同省会同运营商探针时直接标记 `INCONCLUSIVE`，不使用武汉、西安、徐州等跨省探针代替。回程依次尝试 TCP/443、ICMP、UDP traceroute，采用有效回覆跳点最多的一组，避免目标未开放 TCP/80 时整组测不出来。CMD、HTML、JSON 与 NodeSeek 会同步显示测点健康、实际 ASN、骨干标签及中文路由注释。
+去程每列显示 `ONLINE-CAPITAL`、`ONLINE-PROVINCE-FALLBACK` 或 `OFFLINE`。北京、上海没有跨直辖市备用；广东、安徽、江苏、浙江只允许同省备用。回程依次尝试 TCP/443、ICMP、UDP traceroute，先选择骨干证据等级最高的一组，等级相同才采用回覆跳点更多者，避免普通路由覆盖 AS9929／CN2／CMIN2 证据。CMD、HTML、JSON 与 NodeSeek 同步显示测点健康、实际 ASN、骨干标签及中文路由注释。
 
 [AntPing](https://antping.com/) 当前可用于人工交叉复核国内 TCP 连通与路由追踪；脚本不调用其未公开网页接口，避免接口或页面改版再次造成批量失效。
 
@@ -56,7 +56,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.5 六省会测点健康检查版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.6 运营商定向选点版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
 
 ---
 
