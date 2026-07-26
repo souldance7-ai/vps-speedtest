@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.2 RC2"
+VERSION="v0.3 RC1"
 ENTRY_IP=""
 ENTRY_PORT=""
 EXPECTED_EXIT=""
 LOCAL_PRIVATE=""
 REMOTE_PEER=""
+CLIENT_VERIFIED_EXIT=""
 FULL=0
 SELF_TEST=0
+NO_PUBLISH=0
 
 usage() {
   cat <<'EOF'
-沪日专线／IX-style 三层质量检测 v0.2 RC2
+沪日专线／IX-style 四层质量检测 v0.3 RC1
 
 用途：
   专门检测“中国用户 → 上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”。
@@ -34,7 +36,10 @@ usage() {
   --expected-exit IP     预期日本公网出口
   --local-private IP     日本端专线内网 IP
   --peer IP              上海端专线内网对端；未知可留空
+  --client-verified-exit IP
+                        中国客户端连接 Mieru 后实测到的出口；匹配时确认真实握手
   --full                 北京、上海、广东、安徽、江苏、浙江 × 三网
+  --no-publish           只生成本地 HTML／JSON／Markdown，不上传 Chain 3Net
   --self-test            离线自检，不发起网络探测
   -h, --help             显示帮助
 
@@ -42,8 +47,10 @@ usage() {
   入口 TCP traceroute 到达，只证明入口端口经映射后的 TCP 路径可达。
   不要求供应商未交付的上海内网对端 IP；入口可达、本机监听、私网地址与路由会形成映射链证据。
   只有确实知道上海内网对端 IP 时，才额外测量专线纯内段 RTT／抖动／丢包。
-  没有协议凭据时不会伪装成 AnyTLS／Trojan／Mieru 真实握手成功。
+  自动识别 Mieru mita 服务、版本、运行状态、端口监听与 NTP。
+  只有提供中国客户端实测出口且与日本出口一致时，才确认 Mieru 真实握手 PASS。
   DNS、探针或权限失败一律显示 N/A，不会换算成 100% LOSS。
+  报告保存到“Chain 3Net”目录，并生成 HTML／JSON／Markdown 与公共网页。
 EOF
 }
 
@@ -54,7 +61,9 @@ while [[ $# -gt 0 ]]; do
     --expected-exit) EXPECTED_EXIT="${2:-}"; shift 2 ;;
     --local-private) LOCAL_PRIVATE="${2:-}"; shift 2 ;;
     --peer) REMOTE_PEER="${2:-}"; shift 2 ;;
+    --client-verified-exit) CLIENT_VERIFIED_EXIT="${2:-}"; shift 2 ;;
     --full) FULL=1; shift ;;
+    --no-publish) NO_PUBLISH=1; shift ;;
     --self-test) SELF_TEST=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[ERROR] 未知参数：$1"; usage; exit 2 ;;
@@ -72,14 +81,17 @@ export IX_ENTRY_PORT="$ENTRY_PORT"
 export IX_EXPECTED_EXIT="$EXPECTED_EXIT"
 export IX_LOCAL_PRIVATE="$LOCAL_PRIVATE"
 export IX_REMOTE_PEER="$REMOTE_PEER"
+export IX_CLIENT_VERIFIED_EXIT="$CLIENT_VERIFIED_EXIT"
 export IX_FULL="$FULL"
 export IX_SELF_TEST="$SELF_TEST"
+export IX_NO_PUBLISH="$NO_PUBLISH"
 
 # Python 程序从文件描述符 3 读取，stdin 保留给交互输入。
 python3 /dev/fd/3 3<<'PY'
 from __future__ import annotations
 
 import datetime as dt
+import html
 import ipaddress
 import json
 import math
@@ -90,19 +102,24 @@ import socket
 import statistics
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("IX_VERSION", "v0.2 RC2")
+VERSION = os.environ.get("IX_VERSION", "v0.3 RC1")
 ENTRY_IP = os.environ.get("IX_ENTRY_IP", "").strip()
 PORT_TEXT = os.environ.get("IX_ENTRY_PORT", "").strip()
 EXPECTED_EXIT = os.environ.get("IX_EXPECTED_EXIT", "").strip()
 LOCAL_PRIVATE = os.environ.get("IX_LOCAL_PRIVATE", "").strip()
 REMOTE_PEER = os.environ.get("IX_REMOTE_PEER", "").strip()
+CLIENT_VERIFIED_EXIT = os.environ.get("IX_CLIENT_VERIFIED_EXIT", "").strip()
 FULL = os.environ.get("IX_FULL") == "1"
 SELF_TEST = os.environ.get("IX_SELF_TEST") == "1"
+NO_PUBLISH = os.environ.get("IX_NO_PUBLISH") == "1"
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
+PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
+PUBLIC_REPORT_ROOT = "https://china-3net-route-report.souldance4.chatgpt.site"
 
 RESET = "\033[0m"
 GRAY = "\033[38;5;245m"
@@ -320,6 +337,88 @@ def listener_status(port: int) -> dict[str, Any]:
     if not matched:
         return {"status": "FAIL", "evidence": f"未发现 TCP／UDP {port} 监听"}
     return {"status": "PASS", "evidence": " | ".join(matched[:3])}
+
+
+def mieru_service(port: int) -> dict[str, Any]:
+    """Identify the local Mieru server without reading or exposing credentials."""
+    if SELF_TEST:
+        return {
+            "status": "PASS",
+            "binary": "mita",
+            "version": "mita 3.34.1 SELF-TEST",
+            "runtime": "RUNNING",
+            "systemd": "active",
+            "ntp": "PASS",
+            "port": port,
+            "evidence": "mita 3.34.1｜RUNNING｜systemd active｜NTP synchronized",
+        }
+    binary = shutil.which("mita") or ""
+    version = run([binary, "version"], 8) if binary else ""
+    status_text = run([binary, "status"], 8) if binary else ""
+    systemd = run(["systemctl", "is-active", "mita"], 8) if shutil.which("systemctl") else "N/A"
+    ntp_value = (
+        run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], 8)
+        if shutil.which("timedatectl") else "N/A"
+    )
+    running = bool(re.search(r"\bRUNNING\b|\brunning\b", status_text, re.I)) or systemd.strip() == "active"
+    ntp_status = "PASS" if ntp_value.strip().lower() in {"yes", "true", "1"} else "N/A"
+    if not binary:
+        result = "N/A"
+        evidence = "未找到 mita；本项不影响其他协议的入口与出口检测"
+    elif running:
+        result = "PASS"
+        short_version = next((x.strip() for x in version.splitlines() if x.strip()), "版本未知")
+        evidence = f"{short_version}｜RUNNING｜systemd {systemd or 'N/A'}｜NTP {ntp_status}"
+    else:
+        result = "FAIL"
+        evidence = f"已找到 mita，但未确认 RUNNING｜systemd {systemd or 'N/A'}"
+    return {
+        "status": result,
+        "binary": binary or "N/A",
+        "version": version or "N/A",
+        "runtime": status_text or "N/A",
+        "systemd": systemd or "N/A",
+        "ntp": ntp_status,
+        "port": port,
+        "evidence": evidence,
+    }
+
+
+def handshake_verdict(
+    client_exit: str,
+    expected_exit: str,
+    actual_exit: str,
+    service: dict[str, Any],
+    chain: dict[str, str],
+) -> dict[str, str]:
+    if client_exit and not valid_ipv4(client_exit, public=True):
+        return {"status": "N/A", "reason": "中国客户端实测出口格式无效"}
+    if not client_exit:
+        return {
+            "status": "N/A",
+            "reason": "尚未提供中国客户端连接 Mieru 后实测到的公网出口",
+        }
+    if client_exit != actual_exit or (expected_exit and client_exit != expected_exit):
+        return {
+            "status": "FAIL",
+            "reason": (
+                f"客户端实测 {mask_ip(client_exit)}，与日本端实际／预期出口不一致"
+            ),
+        }
+    if service.get("status") != "PASS":
+        return {
+            "status": "INCONCLUSIVE",
+            "reason": "客户端出口一致，但日本端 mita 服务状态未确认",
+        }
+    if chain.get("status") != "PASS":
+        return {
+            "status": "INCONCLUSIVE",
+            "reason": "客户端出口一致，但入口映射链证据尚不完整",
+        }
+    return {
+        "status": "PASS",
+        "reason": "中国客户端经 Mieru 连接后出口与日本端实际／预期出口一致",
+    }
 
 
 def percentile(values: list[float], ratio: float) -> float | None:
@@ -546,7 +645,7 @@ def markdown_report(report: dict[str, Any]) -> str:
     identity = report["exitIdentity"]
     listener = report["listener"]
     lines = [
-        f"# 沪日专线／IX-style 三层质量检测报告",
+        f"# 沪日专线／IX-style Mieru 四层质量检测报告",
         "",
         f"- 版本：{report['version']}",
         f"- 时间：{report['generated']}",
@@ -558,16 +657,18 @@ def markdown_report(report: dict[str, Any]) -> str:
         "",
         f"- 上海入口端到端 TCP：{access['status']}（PASS {access['pass']}/{access['total']}，INCONCLUSIVE {access['inconclusive']}，N/A {access['na']}）",
         f"- 日本端业务监听：{listener['status']} — {listener['evidence']}",
+        f"- Mieru／Mita 服务：{report['mieruService']['status']} — {report['mieruService']['evidence']}",
+        f"- Mieru 真实握手：{report['protocolHandshake']['status']} — {report['protocolHandshake']['reason']}",
         f"- 上海→日本端口映射链：{report['mappingChain']['status']} — {report['mappingChain']['reason']}",
         f"- 专线纯内段（可选）：{internal['status']} — {quality_label(internal)}",
         f"- 日本出口一致性：{report['exitMatch']['status']} — {report['exitMatch']['reason']}",
         "",
-        "## 三层判定边界",
+        "## 四层判定边界",
         "",
         "1. 中国探针到入口业务端口的 TCP traceroute 到达，表示入口映射后的 TCP 路径可达。",
         "2. 入口端口可达、日本端同端口监听及私网地址吻合，作为端口映射链证据，但不冒充协议认证成功。",
         "3. 只有供应商确实提供上海内网对端时，才额外统计纯内段 Ping RTT／P95／抖动／丢包。",
-        "4. 未提供协议种类与凭据时，AnyTLS／Trojan／Mieru 真实应用握手为 N/A。",
+        "4. 自动识别 mita 服务；只有中国客户端连接后实测出口一致，真实握手才为 PASS。",
         "5. traceroute 中间跳点不回应、DNS 或探针失败不记作 100% 业务丢包。",
         "6. “IX-style”是工具名称，不等于已证明经过某个 IXP。",
         "",
@@ -608,10 +709,184 @@ def markdown_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def write_html(report: dict[str, Any], path: Path) -> None:
+    embedded = json.dumps(report, ensure_ascii=False).replace("</", "<\\/")
+    path.write_text(f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>Chain 3Net｜沪日专线 Mieru 四层质量报告</title>
+<style>
+:root{{--bg:#07111f;--panel:#0d1b2d;--line:#1e3a56;--text:#e6f2ff;--muted:#8da8c4;--cyan:#35d9ff;--green:#42e39a;--yellow:#ffd166;--red:#ff657a}}
+*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top,#102a46 0,#07111f 45%);color:var(--text);font:14px/1.55 Inter,"Microsoft YaHei",sans-serif}}
+main{{max-width:1280px;margin:auto;padding:28px}}header,.panel{{background:rgba(13,27,45,.94);border:1px solid var(--line);border-radius:14px;box-shadow:0 14px 40px #0006}}
+header{{padding:25px;margin-bottom:18px}}h1{{margin:0;color:var(--cyan);letter-spacing:.06em}}.sub{{color:var(--muted);margin-top:7px}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}}
+.card{{padding:15px;border-radius:10px;background:#091827;border:1px solid var(--line)}}.card span{{display:block;color:var(--muted)}}.card strong{{display:block;margin-top:8px;font-size:18px}}
+.PASS{{color:var(--green)}}.FAIL{{color:var(--red)}}.N\\/A,.INCONCLUSIVE,.PARTIAL{{color:var(--yellow)}}.panel{{padding:20px;margin:16px 0}}h2{{font-size:16px;color:var(--cyan);margin:0 0 14px}}
+.topology{{display:flex;align-items:center;gap:8px;overflow:auto;padding:6px 0}}.node{{min-width:180px;background:#091827;border:1px solid #2e5576;border-radius:10px;padding:13px;text-align:center}}.arrow{{color:var(--yellow);font-size:20px}}
+table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}}th{{color:var(--muted)}}code{{color:#a9efff}}button{{background:#0e7490;color:white;border:0;border-radius:8px;padding:9px 13px;cursor:pointer;margin-right:8px}}
+.note{{color:var(--muted)}}@media(max-width:850px){{.grid{{grid-template-columns:1fr 1fr}}main{{padding:14px}}}}@media print{{body{{background:white;color:#111}}header,.panel{{box-shadow:none;background:white}}}}
+</style></head><body><main>
+<header><h1>CHAIN 3NET · 沪日专线 MIERU 四层质量报告</h1><div class="sub" id="meta"></div>
+<div style="margin-top:14px"><button id="json">下载 JSON</button><button onclick="window.print()">打印／另存 PDF</button></div></header>
+<section class="panel"><h2>TOPOLOGY / 实际业务拓扑</h2><div class="topology" id="topology"></div></section>
+<div class="grid" id="cards"></div>
+<section class="panel"><h2>MIERU / 日本端服务证据</h2><table id="mieru"></table></section>
+<section class="panel"><h2>CHINA ACCESS / 中国三网入口矩阵</h2><div style="overflow:auto"><table><thead><tr><th>地区</th><th>运营商</th><th>实际探针</th><th>ASN</th><th>终点</th><th>RTT</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table></div></section>
+<section class="panel"><h2>BOUNDARY / 判定边界</h2><p class="note" id="method"></p></section>
+</main><script>
+const R={embedded}; const E=s=>String(s??'N/A').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+const badge=(label,obj)=>`<article class="card"><span>${{E(label)}}</span><strong class="${{E(obj.status)}}">${{E(obj.status)}}</strong><small>${{E(obj.reason||obj.evidence||'')}}</small></article>`;
+document.getElementById('meta').textContent=`${{R.generated}} · ${{R.version}} · ${{R.matrix}}`;
+document.getElementById('topology').innerHTML=[
+`<div class="node">中国 Mieru 客户端</div>`,`<b class="arrow">→</b>`,
+`<div class="node">上海入口<br><code>${{E(R.entry.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
+`<div class="node">隐藏专线／映射链</div>`,`<b class="arrow">→</b>`,
+`<div class="node">日本 Mita<br><code>${{E(R.localPrivate.masked)}}:${{R.entry.port}}</code></div>`,`<b class="arrow">→</b>`,
+`<div class="node">日本出口<br><code>${{E(R.exitIdentity.ipMasked)}}</code></div>`].join('');
+document.getElementById('cards').innerHTML=[
+badge('上海入口接入',{{status:R.access.status,reason:`PASS ${{R.access.pass}}/${{R.access.total}} · 覆盖 ${{R.access.coverage}}%`}}),
+badge('上海→日本映射链',R.mappingChain),badge('Mieru 真实握手',R.protocolHandshake),badge('日本出口一致性',R.exitMatch)].join('');
+const M=R.mieruService;
+document.getElementById('mieru').innerHTML=`<tr><th>服务识别</th><td class="${{E(M.status)}}">${{E(M.status)}}</td><th>版本</th><td>${{E(M.version)}}</td></tr>
+<tr><th>运行状态</th><td>${{E(M.runtime)}}</td><th>systemd</th><td>${{E(M.systemd)}}</td></tr>
+<tr><th>NTP</th><td>${{E(M.ntp)}}</td><th>端口监听</th><td class="${{E(R.listener.status)}}">${{E(R.listener.status)}} · ${{E(R.listener.evidence)}}</td></tr>`;
+document.getElementById('rows').innerHTML=R.probes.map(p=>`<tr><td>${{E(p.requestedRegion)}}</td><td>${{E(p.carrierName)}}</td><td>${{E(p.probeCity)}}</td><td>${{p.asnVerified?'已核对':'未核对'}}</td><td>${{p.targetReached?'到达':'未确认'}}</td><td>${{E(p.latency?.avg)}} ms</td><td class="${{E(p.status)}}">${{E(p.status)}}</td><td>${{E(p.reason)}}</td></tr>`).join('');
+document.getElementById('method').textContent=R.methodology;
+document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='ix-route-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
+</script></body></html>""", encoding="utf-8")
+
+
+def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
+    """Map IX access samples onto Chain 3Net's established storage schema."""
+    carrier_names = {"CT": "中国电信", "CU": "中国联通", "CM": "中国移动"}
+    carriers: list[dict[str, Any]] = []
+    for carrier in ("CT", "CU", "CM"):
+        items = [x for x in report["probes"] if x["carrier"] == carrier]
+        passed = [x for x in items if x["status"] == "PASS"]
+        score = round(len(passed) * 100 / len(items)) if items else 0
+        flat = []
+        for item in items:
+            latency = item.get("latency") or {}
+            flat.append({
+                "region": item["requestedRegion"],
+                "label": f"{item['requestedRegion']} {carrier_names[carrier]} → 上海入口",
+                "access": item.get("mode") or "N/A",
+                "publicIp": "",
+                "verified": bool(item.get("asnVerified")),
+                "route": "Mieru TCP 上海入口接入",
+                "evidence": item.get("reason") or "TCP traceroute 终点到达",
+                "score": 100 if item["status"] == "PASS" else 0,
+                "stars": "★★★★★" if item["status"] == "PASS" else "☆☆☆☆☆",
+                "avg": latency.get("avg"), "min": None, "max": None,
+                "p95": latency.get("p95"), "jitter": latency.get("jitter"),
+                "stddev": None, "loss": None,
+                "success": "1/1" if item["status"] == "PASS" else "0/1",
+                "routeHops": len(item.get("route", "").splitlines()),
+                "timeoutHops": 0, "backboneTags": ["Mieru TCP", "上海映射入口"],
+                "reachability": item["status"],
+            })
+        summary = {
+            "region": "入口接入汇总", "label": "中国三网 → 上海 Mieru 入口",
+            "access": report["matrix"], "publicIp": "",
+            "verified": all(x.get("asnVerified") for x in items) if items else False,
+            "route": "Mieru TCP 上海入口接入",
+            "evidence": f"PASS {len(passed)}/{len(items)}；仅为入口接入，不作为普通回程",
+            "score": score, "stars": "★★★★★" if score >= 80 else "★★★☆☆",
+            "avg": round(statistics.mean(
+                x["latency"]["avg"] for x in passed if x.get("latency", {}).get("avg") is not None
+            ), 1) if any(x.get("latency", {}).get("avg") is not None for x in passed) else None,
+            "min": None, "max": None, "p95": None, "jitter": None,
+            "stddev": None, "loss": None,
+            "success": f"{len(passed)}/{len(items)}", "routeHops": 0,
+            "timeoutHops": 0, "backboneTags": ["Mieru TCP", "专线映射链"],
+            "reachability": report["access"]["status"],
+        }
+        carriers.append({
+            "id": carrier, "name": carrier_names[carrier],
+            "route": "本工具不把入口探测伪装为回程",
+            "score": score, "stars": summary["stars"], "probeCount": 0,
+            "routeTypes": 1, "forward": summary,
+            "forwardRoute": "Mieru TCP 上海入口接入",
+            "forwardProbes": flat, "forwardScore": score,
+            "returnScore": 0, "bidirectional": False, "probes": [],
+        })
+    final_score = round(report["access"]["coverage"])
+    return {
+        "version": report["version"], "generated": report["generated"],
+        "target": report["entry"]["masked"], "targetPort": report["entry"]["port"],
+        "returnSshHost": report["exitIdentity"]["ipMasked"],
+        "selfTest": False, "mode": "沪日专线 Mieru 四层验证",
+        "matrix": report["matrix"] + "（入口接入）",
+        "methodology": report["methodology"],
+        "bgp": {
+            "asn": report["exitIdentity"].get("asn") or "N/A",
+            "provider": report["exitIdentity"].get("org") or "N/A",
+            "location": " ".join(filter(None, [
+                report["exitIdentity"].get("country"), report["exitIdentity"].get("city")
+            ])),
+        },
+        "final": {
+            "score": final_score,
+            "stars": "★★★★★" if final_score >= 80 else "★★★☆☆",
+            "title": f"Mieru 映射链 {report['mappingChain']['status']}",
+            "elapsed": "N/A",
+        },
+        "carriers": carriers,
+        "dedicatedLine": {
+            "topology": "中国客户端→上海公网入口→隐藏专线→日本 Mita→日本公网出口",
+            "entry": f"{report['entry']['masked']}:{report['entry']['port']}",
+            "entryAsn": "中国移动映射入口",
+            "exit": report["exitIdentity"]["ipMasked"],
+            "exitAsn": report["exitIdentity"].get("asn") or "N/A",
+            "portStatus": report["mappingChain"]["status"],
+            "internalVerdict": (
+                f"Mita {report['mieruService']['status']}；"
+                f"真实握手 {report['protocolHandshake']['status']}；"
+                "未知私网对端不误算丢包"
+            ),
+        },
+        "ixData": {
+            "version": report["version"],
+            "entry": report["entry"],
+            "exit": report["exitIdentity"]["ipMasked"],
+            "localPrivate": report["localPrivate"]["masked"],
+            "access": report["access"],
+            "mappingChain": report["mappingChain"],
+            "mieruService": {
+                "status": report["mieruService"]["status"],
+                "ntp": report["mieruService"]["ntp"],
+            },
+            "protocolHandshake": report["protocolHandshake"],
+            "internal": {
+                "status": report["internal"]["status"],
+                "reason": report["internal"].get("reason") or "",
+            },
+        },
+    }
+
+
+def publish(report: dict[str, Any]) -> str:
+    try:
+        result = http_json(PUBLIC_REPORT_API, "POST", public_report_payload(report), 30)
+        for key in ("url", "reportUrl", "report_url", "publicUrl"):
+            if result.get(key):
+                return str(result[key])
+        if result.get("id"):
+            return f"{PUBLIC_REPORT_ROOT}/report/{result['id']}"
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:240]
+        field("Chain 3Net", f"上传失败｜HTTP {exc.code}｜{detail}", YELLOW)
+    except Exception as exc:
+        field("Chain 3Net", f"上传失败｜{type(exc).__name__}: {exc}", YELLOW)
+    return ""
+
+
 def main() -> int:
     entry, port, expected_exit, local_private, remote_peer = ask_inputs()
+    client_verified_exit = CLIENT_VERIFIED_EXIT
+    if SELF_TEST and not client_verified_exit:
+        client_verified_exit = "87.86.87.231"
     print(BLUE + "\n  ██╗██╗  ██╗      ██████╗  ██████╗ ██╗   ██╗████████╗███████╗" + RESET)
-    print(CYAN + "  IX-ROUTE · 沪日专线／隐藏内段三层验证 · 独立版" + RESET)
+    print(CYAN + "  IX-ROUTE · 沪日专线／Mieru 四层验证 · Chain 3Net 独立版" + RESET)
 
     section("TOPOLOGY / 检测拓扑", CYAN)
     field("中国公网入口", f"{mask_ip(entry)}:{port}", CYAN)
@@ -619,7 +894,7 @@ def main() -> int:
     field("日本预期出口", mask_ip(expected_exit), GREEN)
     field("日本端内网", mask_ip(local_private), CYAN)
     field("上海内网对端", mask_ip(remote_peer), MAGENTA)
-    field("测试边界", "入口接入、上海→日本映射链、日本出口；纯内段为可选附加项", YELLOW)
+    field("测试边界", "入口接入、映射链、Mieru 服务／握手、日本出口；纯内段为附加项", YELLOW)
 
     identity = (
         {"ip": "87.86.87.231", "asn": "AS9999", "org": "SELF-TEST JP", "country": "Japan", "city": "Tokyo"}
@@ -635,6 +910,7 @@ def main() -> int:
         {"status": "PASS", "evidence": f"SELF-TEST TCP {port} LISTEN"}
         if SELF_TEST else listener_status(port)
     )
+    mieru = mieru_service(port)
     net_context = (
         {"defaultRoute": "default via 172.16.2.1 dev eth0", "entryRoute": "211.136.162.184 via 172.16.2.1 dev eth0"}
         if SELF_TEST else network_context(entry)
@@ -704,9 +980,21 @@ def main() -> int:
     )
     field("纯内段附加测试", internal["status"], GREEN if internal["status"] == "PASS" else YELLOW)
     field("纯内段附加评级", quality_label(internal), CYAN)
-    field("协议握手", "N/A｜未提供协议类型与凭据，不伪判 AnyTLS／Trojan／Mieru", YELLOW)
 
-    section("LAYER 3 / 日本出口公网", GREEN)
+    section("LAYER 3 / Mieru 服务与真实握手", MAGENTA)
+    field("Mieru／Mita 识别", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)
+    field("TCP 业务监听", f"{listener['status']}｜{listener['evidence']}", GREEN if listener["status"] == "PASS" else YELLOW)
+    field("NTP 时间同步", mieru["ntp"], GREEN if mieru["ntp"] == "PASS" else YELLOW)
+    handshake = handshake_verdict(
+        client_verified_exit,
+        expected_exit,
+        identity.get("ip", ""),
+        mieru,
+        chain,
+    )
+    field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
+
+    section("LAYER 4 / 日本出口公网", GREEN)
     field("实际公网出口", mask_ip(identity.get("ip", "")), GREEN)
     field("ASN／运营商", f"{identity.get('asn') or 'N/A'}｜{identity.get('org') or 'N/A'}")
     field("位置", f"{identity.get('country') or 'N/A'} {identity.get('city') or ''}")
@@ -716,29 +1004,30 @@ def main() -> int:
     report = {
         "version": VERSION,
         "generated": generated.isoformat(timespec="seconds"),
-        "mode": "HURI_DEDICATED_LINE_THREE_LAYER",
+        "mode": "HURI_MIERU_DEDICATED_LINE_FOUR_LAYER",
         "matrix": "六地区 × 三网" if FULL else "华东四地区 × 三网",
         "entry": {"masked": mask_ip(entry), "port": port},
-        "exitIdentity": identity,
+        "exitIdentity": {**identity, "ipMasked": mask_ip(identity.get("ip", ""))},
         "exitMatch": exit_match,
         "localPrivate": {"masked": mask_ip(local_private), "status": local_status},
         "remotePeer": {"masked": mask_ip(remote_peer)},
         "networkContext": net_context,
         "listener": listener,
+        "mieruService": mieru,
         "access": access,
         "mappingChain": chain,
         "internal": internal,
         "probes": probes,
-        "protocolHandshake": {
-            "status": "N/A",
-            "reason": "未提供协议类型与认证材料；TCP 到达不能替代真实应用握手",
-        },
+        "protocolHandshake": handshake,
+        "clientVerifiedExit": mask_ip(client_verified_exit),
         "methodology": (
             "中国侧使用 Globalping 指定中国电信 AS4134、联通 AS4837、移动 AS9808，"
             "对上海入口业务端口执行 TCP traceroute；默认聚焦上海、安徽、江苏、浙江，"
             "--full 扩展北京与广东。日本出口本机核对公网 IP、业务监听、本机内网地址、"
             "默认路由及到上海入口的路由；入口可达且日本端同端口监听、私网地址吻合时，"
-            "给出端口映射链证据。供应商确实提供上海内网对端时，才用 20 次 ICMP 与 "
+            "给出端口映射链证据；自动识别 mita 版本、运行状态、端口与 NTP。"
+            "只有中国客户端连接 Mieru 后实测出口与日本端实际／预期出口一致，"
+            "才把真实握手判为 PASS。供应商确实提供上海内网对端时，才用 20 次 ICMP 与 "
             "MTR／traceroute 增测专线纯内段。"
             "探针失败、DNS 失败、权限不足或缺少对端均记 N/A／INCONCLUSIVE，"
             "不会换算为 100% 业务丢包。"
@@ -747,25 +1036,32 @@ def main() -> int:
 
     output_name = f"ix-route-report-{generated.strftime('%Y%m%d-%H%M%S')}"
     preferred_root = Path("/root") if os.geteuid() == 0 else Path.cwd()
-    output_dir = preferred_root / output_name
+    chain_root = preferred_root / "Chain 3Net"
+    output_dir = chain_root / output_name
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
-        output_dir = Path.cwd() / output_name
+        output_dir = Path.cwd() / "Chain 3Net" / output_name
         output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / "report.json"
     md_path = output_dir / "report.md"
+    html_path = output_dir / "report.html"
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(markdown_report(report), encoding="utf-8")
+    write_html(report, html_path)
+    public_url = "" if SELF_TEST or NO_PUBLISH else publish(report)
 
-    section("FINAL / 三层独立结论", CYAN)
+    section("FINAL / 四层独立结论", CYAN)
     field("上海入口接入", f"{access['status']}｜PASS {access['pass']}/{access['total']}｜覆盖 {access['coverage']}%", GREEN if access["status"] == "PASS" else YELLOW)
     field("上海→日本映射链", f"{chain['status']}｜{chain['reason']}", GREEN if chain["status"] == "PASS" else YELLOW)
     field("专线纯内段附加项", f"{internal['status']}｜{quality_label(internal)}", GREEN if internal["status"] == "PASS" else YELLOW)
+    field("Mieru／Mita 服务", f"{mieru['status']}｜{mieru['evidence']}", GREEN if mieru["status"] == "PASS" else YELLOW)
+    field("Mieru 真实握手", f"{handshake['status']}｜{handshake['reason']}", GREEN if handshake["status"] == "PASS" else YELLOW)
     field("日本出口公网", f"{exit_match['status']}｜{mask_ip(identity.get('ip', ''))}", GREEN if exit_match["status"] == "PASS" else YELLOW)
-    field("协议真实握手", "N/A｜需协议类型与测试凭据", YELLOW)
+    field("HTML 网页", str(html_path), GREEN)
     field("Markdown 报告", str(md_path), GREEN)
     field("JSON 数据", str(json_path), GREEN)
+    field("Chain 3Net 公共页", public_url or ("已禁用" if NO_PUBLISH else "N/A｜本地报告已保留"), GREEN if public_url else YELLOW)
     field("重要说明", "IX-style 不等于证明经过某个 IXP；本工具用于专线／隐藏内段分层验证", MAGENTA)
     if SELF_TEST:
         field("SELF-TEST", "PASS｜交互隔离、N/A 逻辑、报告生成均正常", GREEN)
