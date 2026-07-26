@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.17 UPLOAD-FIX"
+VERSION="v0.9 RC4.2.18 GET-UPLOAD-FIX"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.17 UPLOAD-FIX
+中国三网 VPS 双程质量检测 v0.9 RC4.2.18 GET-UPLOAD-FIX
 
 用法：
   bash 3net-route.sh --port 443
@@ -126,7 +126,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.17 UPLOAD-FIX")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.18 GET-UPLOAD-FIX")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -135,6 +135,7 @@ PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
+PUBLIC_REPORT_SYNC_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-sync"
 TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
 TCPQUALITY_RAW_BASE = (
     "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
@@ -3184,8 +3185,23 @@ def cli_upload_envelope(payload: dict[str, Any]) -> bytes:
     return json.dumps(envelope, separators=(",", ":")).encode("ascii")
 
 
-def curl_json_upload(url: str, payload: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
-    body = cli_upload_envelope(payload)
+def cli_sync_payload(payload: dict[str, Any]) -> str:
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=9)
+    if len(compressed) > 192 * 1024:
+        raise RuntimeError("压缩报告超过 192 KB 上限；本地 HTML／JSON 已保留")
+    return base64.urlsafe_b64encode(compressed).rstrip(b"=").decode("ascii")
+
+
+def curl_get_json(
+    url: str,
+    params: dict[str, Any],
+    timeout: int = 45,
+) -> dict[str, Any]:
     command = [
         "curl",
         "--silent",
@@ -3193,21 +3209,21 @@ def curl_json_upload(url: str, payload: dict[str, Any], timeout: int = 45) -> di
         "--compressed",
         "--connect-timeout", "12",
         "--max-time", str(timeout),
-        "--retry", "2",
+        "--retry", "3",
         "--retry-delay", "1",
-        "--request", "POST",
-        "--header", "Content-Type: application/json",
+        "--request", "GET",
         "--header", "Accept: application/json",
         "--header", "Cache-Control: no-cache",
-        "--user-agent", "3net-route-cli/RC4.2.17",
-        "--data-binary", "@-",
-        "--write-out", "\n%{http_code}",
-        url,
+        "--user-agent", "Mozilla/5.0 3net-route-cli/RC4.2.18",
+        "--get",
     ]
+    for name, value in params.items():
+        command.extend(["--data-urlencode", f"{name}={value}"])
+    command.extend(["--write-out", "\\n%{http_code}", url])
+
     try:
         completed = subprocess.run(
             command,
-            input=body,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout + 8,
@@ -3218,21 +3234,20 @@ def curl_json_upload(url: str, payload: dict[str, Any], timeout: int = 45) -> di
 
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", "replace").strip()
-        detail = re.sub(r"\s+", " ", detail)[:160]
+        detail = re.sub(r"\\s+", " ", detail)[:160]
         raise RuntimeError(
             f"上传网络失败（curl {completed.returncode}）"
             + (f"｜{detail}" if detail else "")
         )
 
     try:
-        response_body, status_text = completed.stdout.rsplit(b"\n", 1)
+        response_body, status_text = completed.stdout.rsplit(b"\\n", 1)
         status = int(status_text.strip())
     except (ValueError, TypeError) as exc:
         raise RuntimeError("上传接口返回格式异常；本地 HTML／JSON 已保留") from exc
 
     result: dict[str, Any] = {}
-    content_type_is_json = response_body.lstrip().startswith((b"{", b"["))
-    if content_type_is_json:
+    if response_body.lstrip().startswith((b"{", b"[")):
         try:
             parsed = json.loads(response_body.decode("utf-8", "replace"))
             if isinstance(parsed, dict):
@@ -3244,7 +3259,7 @@ def curl_json_upload(url: str, payload: dict[str, Any], timeout: int = 45) -> di
         api_error = str(result.get("error") or "").strip()
         if not api_error:
             api_error = (
-                "站点边缘拒绝了 CLI 请求"
+                "站点边缘拒绝了 GET 请求"
                 if status == 403 else
                 "接口未返回可读 JSON"
             )
@@ -3256,13 +3271,57 @@ def curl_json_upload(url: str, payload: dict[str, Any], timeout: int = 45) -> di
     return result
 
 
+def curl_chunked_upload(
+    url: str,
+    payload: dict[str, Any],
+    timeout: int = 45,
+) -> dict[str, Any]:
+    encoded = cli_sync_payload(payload)
+    chunk_chars = 1500
+    chunks = [
+        encoded[index:index + chunk_chars]
+        for index in range(0, len(encoded), chunk_chars)
+    ]
+    if not chunks or len(chunks) > 128:
+        raise RuntimeError("报告分段数量超过接口上限；本地 HTML／JSON 已保留")
+
+    upload_id = os.urandom(5).hex()
+    ping = curl_get_json(url, {"action": "ping"}, timeout)
+    if ping.get("transport") != "get-chunks-v1":
+        raise RuntimeError("免 POST 上传通道尚未就绪；本地 HTML／JSON 已保留")
+
+    total = len(chunks)
+    for part, chunk in enumerate(chunks):
+        result = curl_get_json(
+            url,
+            {
+                "action": "chunk",
+                "id": upload_id,
+                "part": part,
+                "total": total,
+                "data": chunk,
+            },
+            timeout,
+        )
+        if result.get("accepted") != part:
+            raise RuntimeError(
+                f"上传第 {part + 1}/{total} 段确认异常；本地 HTML／JSON 已保留"
+            )
+
+    return curl_get_json(
+        url,
+        {
+            "action": "complete",
+            "id": upload_id,
+            "total": total,
+        },
+        timeout,
+    )
+
+
 def publish(report: dict[str, Any]) -> str:
     try:
-        result = curl_json_upload(
-            PUBLIC_REPORT_API,
-            public_report_payload(report),
-            45,
-        )
+        result = curl_chunked_upload(\n            PUBLIC_REPORT_SYNC_API,\n            public_report_payload(report),\n            45,\n        )
         for key in ("url", "reportUrl", "report_url", "publicUrl"):
             if result.get(key):
                 return str(result[key])
