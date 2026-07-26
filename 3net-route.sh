@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.13 PROVINCE-LATENCY-HEATMAP"
+VERSION="v0.9 RC4.2.14 ROUTE-LATENCY-THROUGHPUT"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.13 省份延迟热图版
+中国三网 VPS 双程质量检测 v0.9 RC4.2.14 线路／延迟／吞吐证据版
 
 用法：
   bash 3net-route.sh
   bash 3net-route.sh --extended
+  bash 3net-route.sh --extended --speed
   bash 3net-route.sh --self-test
   bash 3net-route.sh --target 203.55.99.88 --port 443
   bash 3net-route.sh --target 203.55.99.88 --port 443 --forward-evidence /root/forward_evidence.json
@@ -21,12 +22,14 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   业务端口示例：443（Trojan／AnyTLS 等协议实际监听端口，不是 SSH 22）
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
+  --speed：追加北上广三网公网单线程速度（9 组），约需 4～12 分钟并消耗测速流量。
   去程：优先读取中国本地端主动实测证据；缺项才使用 Globalping 同省远端探针。
   同省无探针时：一次收集中国境内同运营商多探针快照，按地区分配并避免重复。
   全国参考与指定地区分开统计，不会把 REFERENCE-PASS 写成指定地区 PASS。
   NOT-TESTED 与复用探针不计入指定省份矩阵；全国参考不会补足省份覆盖。
   最终结论以双程线路类型为主，不再输出总分／星级。
   CMD、HTML 与 JSON 均列出各省实测 AVG／P95、相对热度百分比及绿黄橙红渐层。
+  单线程速度显示回程重传、回程 Mbps、去程 Mbps、相对百分位与绝对色带；不生成总分。
   回程：当前出口 VPS → 对应地区三网固定／动态目标。
   net.sh／TcpQuality 的节点均是 VPS→中国回程目标，不会被冒充为中国→VPS 去程。
   NAT 专线入口端口由三网外部 TCP traceroute 共同核对，不从出口反连入口。
@@ -41,6 +44,7 @@ TARGET_PORT=""
 NO_INSTALL=0
 FORWARD_EVIDENCE=""
 EXTENDED=0
+SPEED_TEST=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) SELF_TEST=1; shift ;;
@@ -48,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --port) TARGET_PORT="${2:-}"; shift 2 ;;
     --forward-evidence) FORWARD_EVIDENCE="${2:-}"; shift 2 ;;
     --extended) EXTENDED=1; shift ;;
+    --speed) SPEED_TEST=1; shift ;;
     --no-install) NO_INSTALL=1; shift ;;
     *) echo "[ERROR] 未知参数：$1"; exit 2 ;;
   esac
@@ -87,6 +92,7 @@ export THREE_NET_TARGET="$TARGET"
 export THREE_NET_TARGET_PORT="$TARGET_PORT"
 export THREE_NET_FORWARD_EVIDENCE="$FORWARD_EVIDENCE"
 export THREE_NET_EXTENDED="$EXTENDED"
+export THREE_NET_SPEED_TEST="$SPEED_TEST"
 
 # 将 Python 源码放到独立文件描述符 3，保留标准输入给 input() 读取终端。
 # 这样直接运行、curl 进程替换、管道输入三种方式都不会在交互提示处 EOF。
@@ -103,10 +109,12 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -115,14 +123,20 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.13 PROVINCE-LATENCY-HEATMAP")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.14 ROUTE-LATENCY-THROUGHPUT")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
+SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
+TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
+TCPQUALITY_RAW_BASE = (
+    "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
+    f"{TCPQUALITY_COMMIT}"
+)
 TCPQUALITY_NODES_API = os.environ.get(
     "THREE_NET_RETURN_POOL",
     "https://tcpquality.ibsgss.uk/getNodes?format=tsv&scope=cdn",
@@ -415,7 +429,7 @@ def ask_target() -> tuple[str, int]:
     field("重要提醒", "这里填写 Trojan／AnyTLS／Hysteria 等协议实际监听端口，不是 SSH 登录端口 22", YELLOW)
     field("完整输入示例", "上方输入 203.55.99.88；下方输入 443", WHITE)
     while not valid_public_ipv4(TARGET):
-        TARGET = input("请输入国内入口／被测 VPS 的 IPv4〔例 203.55.99.88〕：").strip()
+        TARGET = input("请输入被测 VPS 的公网 IPv4〔例 203.55.99.88〕：").strip()
         if not valid_public_ipv4(TARGET):
             print(RED + "  IPv4 无效，请重新输入。" + RESET)
     while True:
@@ -685,6 +699,534 @@ def tcp_samples(host: str, port: int = 80, count: int = 5, timeout: float = 4.0)
             pass
         time.sleep(0.12)
     return values
+
+
+def speed_value(value: str) -> float | None:
+    value = value.strip()
+    if not value or value.lower() in {"failed", "null", "n/a"}:
+        return None
+    try:
+        number = float(value)
+    except ValueError:
+        return None
+    return round(number, 1) if number >= 0 else None
+
+
+def retrans_value(value: str) -> int | None:
+    value = value.strip()
+    if not value or value.lower() in {"failed", "null", "n/a"}:
+        return None
+    try:
+        number = int(float(value))
+    except ValueError:
+        return None
+    return max(0, number)
+
+
+def speed_band(value: float | None) -> tuple[str, str]:
+    if value is None:
+        return "N/A", "#596579"
+    if value < 30:
+        return "<30 Mbps", "#ff4d5e"
+    if value < 100:
+        return "30–99 Mbps", "#ff9f43"
+    if value < 300:
+        return "100–299 Mbps", "#f5df4d"
+    if value < 500:
+        return "300–499 Mbps", "#8ee63f"
+    return "≥500 Mbps", "#38e87b"
+
+
+def retrans_band(value: int | None) -> tuple[str, str]:
+    if value is None:
+        return "N/A", "#596579"
+    if value < 100:
+        return "低", "#38e87b"
+    if value < 500:
+        return "中", "#f5df4d"
+    if value < 1000:
+        return "偏高", "#ff9f43"
+    return "高", "#ff4d5e"
+
+
+def speed_row(
+    region: str,
+    carrier: str,
+    city: str,
+    return_mbps: float | None,
+    forward_mbps: float | None,
+    return_retransmits: int | None,
+) -> dict[str, Any]:
+    carrier_codes = {"电信": "CT", "联通": "CU", "移动": "CM"}
+    complete = return_mbps is not None and forward_mbps is not None
+    partial = return_mbps is not None or forward_mbps is not None
+    return {
+        "region": region,
+        "carrier": carrier_codes.get(carrier, ""),
+        "carrierName": f"中国{carrier}",
+        "nodeCity": city or region,
+        "label": f"{city or region}{carrier}",
+        "returnRetransmits": return_retransmits,
+        "returnMbps": return_mbps,
+        "forwardMbps": forward_mbps,
+        "status": "PASS" if complete else "PARTIAL" if partial else "N/A",
+        "measurement": "PUBLIC_TOS_SINGLE_STREAM",
+        "testsCurrentVpsPublicNetwork": True,
+        "pathIncludesBusinessEntry": False,
+        "pathIncludesBusinessPort": False,
+    }
+
+
+def self_test_speed_rows() -> list[dict[str, Any]]:
+    samples = [
+        ("北京", "电信", "北京", 318.9, 422.0, 703),
+        ("北京", "联通", "北京", 429.1, 430.2, 1644),
+        ("北京", "移动", "北京", 90.2, 436.5, 1264),
+        ("上海", "电信", "上海", 359.9, 446.7, 630),
+        ("上海", "联通", "上海", 50.2, 429.0, 1245),
+        ("上海", "移动", "上海", 59.9, 382.5, 132),
+        ("广东", "电信", "广东", 50.3, 420.5, 814),
+        ("广东", "联通", "广东", 134.9, 433.0, 37),
+        ("广东", "移动", "广东", 156.1, 435.7, 81),
+    ]
+    return [speed_row(*sample) for sample in samples]
+
+
+def newest_speed_csv(started: float, before: set[Path]) -> Path | None:
+    candidates = [
+        path
+        for path in Path("/tmp").glob("zstatic_nping_*.csv")
+        if path not in before and path.is_file()
+    ]
+    if not candidates:
+        candidates = [
+            path
+            for path in Path("/tmp").glob("zstatic_nping_*.csv")
+            if path.is_file() and path.stat().st_mtime >= started - 3
+        ]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def parse_tcpquality_speed_csv(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        for values in csv.reader(handle):
+            if len(values) < 10 or values[0] != "三网单线程速度":
+                continue
+            region = values[1].strip()
+            carrier = values[2].strip()
+            city = values[3].strip()
+            upstream_status = values[6].strip().upper()
+            row = speed_row(
+                region,
+                carrier,
+                city,
+                speed_value(values[7]),
+                speed_value(values[9]),
+                retrans_value(values[8]),
+            )
+            if upstream_status != "OK" and row["status"] == "N/A":
+                row["status"] = "N/A"
+            rows.append(row)
+    order = {"北京": 0, "上海": 1, "广东": 2}
+    carrier_order = {"CT": 0, "CU": 1, "CM": 2}
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row["region"]), str(row["carrier"]))
+        previous = unique.get(key)
+        if previous is None or (
+            row["status"] == "PASS" and previous["status"] != "PASS"
+        ):
+            unique[key] = row
+    return sorted(
+        unique.values(),
+        key=lambda row: (
+            order.get(str(row["region"]), 99),
+            carrier_order.get(str(row["carrier"]), 99),
+        ),
+    )
+
+
+def annotate_speed_visuals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    for key, visual_key in (
+        ("returnMbps", "returnVisual"),
+        ("forwardMbps", "forwardVisual"),
+    ):
+        values = [
+            float(row[key]) for row in rows
+            if isinstance(row.get(key), (int, float))
+        ]
+        low = min(values) if values else 0.0
+        high = max(values) if values else 0.0
+        for row in rows:
+            value = row.get(key)
+            if not isinstance(value, (int, float)):
+                row[visual_key] = {
+                    "measured": False, "mbps": None,
+                    "relativePercentile": None, "absoluteBand": "N/A",
+                    "color": "#596579", "reason": "未取得测速结果",
+                }
+                continue
+            percentile_value = (
+                50 if math.isclose(low, high)
+                else round((float(value) - low) * 100 / (high - low))
+            )
+            band, color = speed_band(float(value))
+            row[visual_key] = {
+                "measured": True, "mbps": round(float(value), 1),
+                "relativePercentile": percentile_value,
+                "absoluteBand": band, "color": color, "reason": "",
+            }
+    for row in rows:
+        retrans = row.get("returnRetransmits")
+        band, color = retrans_band(
+            int(retrans) if isinstance(retrans, (int, float)) else None
+        )
+        row["retransVisual"] = {
+            "measured": isinstance(retrans, (int, float)),
+            "count": int(retrans) if isinstance(retrans, (int, float)) else None,
+            "band": band, "color": color,
+        }
+
+    complete = [row for row in rows if row.get("status") == "PASS"]
+    return_values = [
+        float(row["returnMbps"]) for row in complete
+        if isinstance(row.get("returnMbps"), (int, float))
+    ]
+    forward_values = [
+        float(row["forwardMbps"]) for row in complete
+        if isinstance(row.get("forwardMbps"), (int, float))
+    ]
+    high_retrans = [
+        row for row in complete
+        if isinstance(row.get("returnRetransmits"), (int, float))
+        and int(row["returnRetransmits"]) >= 1000
+    ]
+    bottleneck = min(
+        complete,
+        key=lambda row: min(float(row["returnMbps"]), float(row["forwardMbps"])),
+        default=None,
+    )
+    return {
+        "complete": len(complete),
+        "total": 9,
+        "returnAvgMbps": (
+            round(statistics.mean(return_values), 1) if return_values else None
+        ),
+        "forwardAvgMbps": (
+            round(statistics.mean(forward_values), 1) if forward_values else None
+        ),
+        "returnMinMbps": min(return_values) if return_values else None,
+        "forwardMinMbps": min(forward_values) if forward_values else None,
+        "highRetransmitRows": len(high_retrans),
+        "bottleneck": (
+            {
+                "label": bottleneck["label"],
+                "returnMbps": bottleneck["returnMbps"],
+                "forwardMbps": bottleneck["forwardMbps"],
+            }
+            if bottleneck else None
+        ),
+        "policy": (
+            "Mbps 采用绝对色带并显示同次九组相对百分位；"
+            "重传为原始计数，只用于同次等时长样本比较，不换算总分。"
+        ),
+    }
+
+
+def single_thread_speed() -> dict[str, Any]:
+    boundary = (
+        "本项直接测量当前出口VPS与北上广三网公共TOS测速端之间的单数据流能力；"
+        "回程为VPS→中国测速端，去程为中国测速端→VPS。它与本报告的VPS公网双程用途一致，"
+        "但测速节点不等同指定省份路由探针，也不补足省份矩阵。"
+    )
+    base = {
+        "enabled": SPEED_TEST or SELF_TEST,
+        "source": "ibsgss/TcpQuality pinned upstream",
+        "upstreamCommit": TCPQUALITY_COMMIT,
+        "boundary": boundary,
+        "testsCurrentVpsPublicNetwork": True,
+        "pathIncludesBusinessEntry": False,
+        "pathIncludesBusinessPort": False,
+        "rows": [],
+        "summary": annotate_speed_visuals([]),
+    }
+    if not SPEED_TEST and not SELF_TEST:
+        return {
+            **base,
+            "status": "N/A",
+            "reason": "未使用 --speed；本项未执行",
+        }
+    if SELF_TEST:
+        rows = self_test_speed_rows()
+        return {
+            **base,
+            "status": "PASS",
+            "reason": "SELF-TEST 北上广三网九组完整",
+            "rows": rows,
+            "summary": annotate_speed_visuals(rows),
+        }
+    if os.name != "posix" or not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return {
+            **base,
+            "status": "N/A",
+            "reason": "三网单线程速度需要 Linux root 环境",
+        }
+
+    workdir = Path(tempfile.mkdtemp(prefix="cn3-speed-"))
+    entry_script = workdir / "runTcpQuality.sh"
+    before = set(Path("/tmp").glob("zstatic_nping_*.csv"))
+    started = time.time()
+    try:
+        request = urllib.request.Request(
+            f"{TCPQUALITY_RAW_BASE}/runTcpQuality.sh",
+            headers={"User-Agent": f"3net-route/{VERSION}"},
+        )
+        with urllib.request.urlopen(request, timeout=40) as response:
+            entry_script.write_bytes(response.read())
+        entry_script.chmod(0o700)
+        env = os.environ.copy()
+        env.update({
+            "TCPQUALITY_RAW_BASE": TCPQUALITY_RAW_BASE,
+            "TOS_TIMEOUT": "15",
+            "TOS_WARMUP": "5",
+            "TERM": env.get("TERM") or "xterm",
+        })
+        process = subprocess.Popen(
+            [
+                "bash", str(entry_script), "--no-rootfs",
+                "--only-speedtest", "--no-rank-upload",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            output, _ = process.communicate(timeout=720)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+            return {
+                **base,
+                "status": "N/A",
+                "reason": "三网单线程速度超过12分钟，已终止；建议稍后复测",
+            }
+        csv_path = newest_speed_csv(started, before)
+        rows = parse_tcpquality_speed_csv(csv_path) if csv_path else []
+        summary = annotate_speed_visuals(rows)
+        complete = int(summary["complete"])
+        status = "PASS" if complete == 9 else "PARTIAL" if rows else "N/A"
+        reason = (
+            f"北上广三网公网单线程完整 {complete}/9"
+            if rows else "未取得可解析的三网单线程速度结果"
+        )
+        if process.returncode and not rows:
+            tail = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output or "")
+            tail = " ".join(tail.splitlines()[-3:])[:220]
+            reason += f"；上游退出码 {process.returncode}" + (
+                f"：{tail}" if tail else ""
+            )
+        return {
+            **base,
+            "status": status,
+            "reason": reason,
+            "rows": rows,
+            "summary": summary,
+        }
+    except Exception as exc:
+        return {
+            **base,
+            "status": "N/A",
+            "reason": f"测速辅助项异常 {type(exc).__name__}: {exc}",
+        }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def speed_ansi_color(visual: dict[str, Any]) -> str:
+    palette = {
+        "#38e87b": "\033[38;5;82m",
+        "#8ee63f": "\033[38;5;118m",
+        "#f5df4d": "\033[38;5;226m",
+        "#ff9f43": "\033[38;5;208m",
+        "#ff4d5e": "\033[38;5;196m",
+    }
+    return palette.get(str(visual.get("color")), GRAY)
+
+
+def show_single_thread_speed(speed: dict[str, Any]) -> None:
+    banner("SINGLE STREAM / 三网公网单线程速度（非评分）", MAGENTA)
+    field("测量边界", speed.get("boundary") or "N/A", GRAY)
+    field(
+        "状态",
+        f"{speed.get('status', 'N/A')}｜{speed.get('reason', 'N/A')}",
+        GREEN if speed.get("status") == "PASS" else YELLOW,
+    )
+    rows = speed.get("rows") or []
+    if not rows:
+        return
+    current_region = ""
+    for row in rows:
+        region = str(row.get("region") or "N/A")
+        if region != current_region:
+            print()
+            print(MAGENTA + f"  {region}" + RESET)
+            print(
+                GRAY
+                + f"  {'地区':<14}{'回程重传':>12}{'回程速度／百分位':>25}"
+                + f"{'去程速度／百分位':>25}"
+                + RESET
+            )
+            current_region = region
+        retrans = row.get("returnRetransmits")
+        rv = row.get("returnVisual") or {}
+        fv = row.get("forwardVisual") or {}
+        retrans_text = (
+            "N/A" if retrans is None
+            else f"{int(retrans)}({(row.get('retransVisual') or {}).get('band', 'N/A')})"
+        )
+        return_text = (
+            "N/A" if not rv.get("measured")
+            else f"{rv['mbps']:.1f}M／{rv['relativePercentile']}%"
+        )
+        forward_text = (
+            "N/A" if not fv.get("measured")
+            else f"{fv['mbps']:.1f}M／{fv['relativePercentile']}%"
+        )
+        print(
+            CARRIER_COLOR.get(str(row.get("carrier")), WHITE)
+            + f"  {str(row.get('label') or 'N/A'):<14}"
+            + speed_ansi_color(row.get("retransVisual") or {})
+            + f"{retrans_text:>12}"
+            + speed_ansi_color(rv)
+            + f"{return_text:>25}"
+            + speed_ansi_color(fv)
+            + f"{forward_text:>25}"
+            + RESET
+        )
+    summary = speed.get("summary") or {}
+    field(
+        "吞吐摘要",
+        f"完整 {summary.get('complete', 0)}/9｜"
+        f"回程 AVG {summary.get('returnAvgMbps', 'N/A')} Mbps｜"
+        f"去程 AVG {summary.get('forwardAvgMbps', 'N/A')} Mbps｜"
+        f"高重传 {summary.get('highRetransmitRows', 0)} 组",
+        CYAN,
+    )
+
+
+def build_improvements(
+    grades: list[dict[str, Any]],
+    forward: list[dict[str, Any]],
+    returns: list[dict[str, Any]],
+    speed: dict[str, Any],
+) -> list[str]:
+    notes: list[str] = []
+    incomplete = [
+        CARRIER_NAME[item["carrier"]]
+        for item in grades if not item.get("matrixComplete")
+    ]
+    if incomplete:
+        notes.append(
+            f"{'、'.join(incomplete)}指定省份矩阵未完整；"
+            "应补真实省份探针或导入中国本地端证据，全国参考不得代替省份结论。"
+        )
+
+    mixed = [
+        CARRIER_NAME[item["carrier"]]
+        for item in grades
+        if "混合" in str(item.get("forwardRoute"))
+        or "混合" in str(item.get("returnRoute"))
+    ]
+    if mixed:
+        notes.append(
+            f"{'、'.join(mixed)}存在地区或协议路径混合；"
+            "建议在闲时与晚高峰各跑一次，确认是否为动态调度。"
+        )
+
+    high_latency = [
+        item for item in forward + returns
+        if isinstance(item.get("stats", {}).get("p95"), (int, float))
+        and float(item["stats"]["p95"]) >= 200
+    ]
+    if high_latency:
+        labels = "、".join(
+            f"{CARRIER_NAME[item['carrier']]}{item.get('region') or item.get('city')}"
+            for item in high_latency[:4]
+        )
+        notes.append(f"{labels} P95 已达 200 ms 以上，应优先检查跨境绕路或晚高峰拥塞。")
+
+    lossy = [
+        item for item in returns
+        if isinstance(item.get("stats", {}).get("loss"), (int, float))
+        and float(item["stats"]["loss"]) > 0
+    ]
+    if lossy:
+        labels = "、".join(
+            f"{CARRIER_NAME[item['carrier']]}{item.get('city')}" for item in lossy[:4]
+        )
+        notes.append(f"{labels}出现 TCP 连接失败；需分时段复测，不能只看单次 traceroute。")
+
+    if not speed.get("enabled"):
+        notes.append(
+            "本次未执行单线程吞吐；如需核对三网实际速度与重传，请使用 --speed，"
+            "并注意测速会消耗流量。"
+        )
+    else:
+        rows = speed.get("rows") or []
+        complete = [row for row in rows if row.get("status") == "PASS"]
+        if len(complete) < 9:
+            notes.append(
+                f"北上广三网单线程只完整取得 {len(complete)}/9；"
+                "N/A／PARTIAL 不按 0 Mbps 计，应换时段复测。"
+            )
+        slow = [
+            row for row in complete
+            if min(float(row["returnMbps"]), float(row["forwardMbps"])) < 50
+        ]
+        if slow:
+            labels = "、".join(str(row["label"]) for row in slow[:4])
+            notes.append(
+                f"{labels}至少一个方向低于 50 Mbps；"
+                "优先对照线路带宽上限、晚高峰与单线程拥塞。"
+            )
+        high_retrans = [
+            row for row in complete
+            if isinstance(row.get("returnRetransmits"), (int, float))
+            and int(row["returnRetransmits"]) >= 1000
+        ]
+        if high_retrans:
+            labels = "、".join(str(row["label"]) for row in high_retrans[:4])
+            notes.append(
+                f"{labels}回程重传达到 1000 次以上；"
+                "建议重点检查 VPS→中国方向拥塞、限速与跨境链路波动。"
+            )
+        asymmetric = [
+            row for row in complete
+            if max(float(row["returnMbps"]), float(row["forwardMbps"]))
+            / max(1.0, min(float(row["returnMbps"]), float(row["forwardMbps"])))
+            >= 3
+        ]
+        if asymmetric:
+            labels = "、".join(str(row["label"]) for row in asymmetric[:4])
+            notes.append(
+                f"{labels}去回程单线程速度相差 3 倍以上；"
+                "应按方向分别判断，不能用较快一侧代表双向能力。"
+            )
+
+    if not notes:
+        notes.append(
+            "本次线路、延迟、TCP 成功率与单线程吞吐未见明显异常；"
+            "建议保留闲时和晚高峰两份报告作对照。"
+        )
+    return notes
 
 
 def public_ip() -> tuple[str, str]:
@@ -961,6 +1503,7 @@ def globalping_trace(target: str, port: int, carrier: str,
             "selectionScope": "NO_PROBE",
             "probeHealth": "NOT-AVAILABLE｜省会及同省当前无该运营商在线测点",
             "verified": False, "regionalVerified": False,
+            "routeHops": None, "timeoutHops": None,
             "route": "", "class": "省会测点不可用", "rank": 0,
             "evidence": (
                 f"已先定向查找 {CAPITALS.get(region, region)}，再查同省候选城市；"
@@ -979,7 +1522,9 @@ def globalping_trace(target: str, port: int, carrier: str,
     last_timings: list[float] = []
     target_timings: list[float] = []
     target_reached = False
-    for index, hop in enumerate(entry.get("result", {}).get("hops", []), 1):
+    hop_entries = entry.get("result", {}).get("hops", [])
+    visible_hops = 0
+    for index, hop in enumerate(hop_entries, 1):
         ip = str(hop.get("resolvedAddress") or "")
         hostname = str(hop.get("resolvedHostname") or "")
         timings = [
@@ -988,6 +1533,8 @@ def globalping_trace(target: str, port: int, carrier: str,
         ]
         if timings:
             last_timings = timings
+        if ip or hostname or timings:
+            visible_hops += 1
         if ip == target:
             target_reached = True
             target_timings = timings
@@ -1061,6 +1608,8 @@ def globalping_trace(target: str, port: int, carrier: str,
         "sourceAsn": source_asn, "nationalProbeReused": national_reused,
         "probeFingerprint": probe_fingerprint(entry),
         "regionalVerified": regional_verified,
+        "routeHops": visible_hops,
+        "timeoutHops": max(0, len(hop_entries) - visible_hops),
         "access": access, "probeHealth": health, "verified": verified,
         "route": route, "class": route_class, "rank": rank,
         "evidence": evidence, "targetReached": target_reached,
@@ -1147,6 +1696,8 @@ def load_client_forward_evidence(
                 if target_reached
                 else f"CLIENT-ACTIVE-NO-CONNECT｜TCP 0/{attempts}"
             ),
+            "routeHops": route_hop_count(route) if route else None,
+            "timeoutHops": None,
             "verified": True,
             "route": route,
             "class": route_class,
@@ -1503,6 +2054,7 @@ def self_test_forward(carrier: str, region: str, probe_city: str) -> dict[str, A
     return {
         "carrier": carrier, "region": region, "requestedCity": probe_city,
         "access": f"{region}离线样本｜AS{FORWARD_ASN[carrier]}", "verified": True,
+        "routeHops": 3, "timeoutHops": 0,
         "route": routes[carrier], "class": route_class, "rank": rank, "evidence": evidence,
         "targetReached": True, "reachability": "PASS｜离线外部端口样本",
         "stats": asdict(result_stats), "score": value, "stars": stars(value),
@@ -1947,6 +2499,7 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
     reached = sorted({x["carrier"] for x in tested if x.get("targetReached")})
     entry_asn = origin_asn(target)
     exit_asn = origin_asn(exit_ip) if valid_public_ipv4(exit_ip) else ""
+    native_mode = target == exit_ip
     if reached_samples:
         port_status = (
             f"PASS｜已取得探针中 {len(reached_samples)}/{len(tested)} 组到达入口"
@@ -1960,7 +2513,12 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
     else:
         port_status = "NOT-TESTED｜未取得去程探针；不能据此判定端口不通"
     return {
-        "topology": "中国入口端口映射／NAT → 出口 VPS",
+        "model": "VPS_NATIVE_PUBLIC" if native_mode else "NAT_FORWARDING",
+        "topology": (
+            "同一公网 VPS 原生双向测试"
+            if native_mode else
+            "中国入口端口映射／NAT → 出口 VPS"
+        ),
         "entry": f"{mask_ip(target)}:{port}",
         "entryAsn": entry_asn or "ASN 未取得",
         "exit": mask_ip(exit_ip),
@@ -1968,8 +2526,13 @@ def dedicated_line_assessment(target: str, port: int, exit_ip: str,
         "portStatus": port_status,
         "reachedBy": reached,
         "reachedSamples": reached_samples,
-        "internalVisibility": "HIDDEN_BY_NAT",
+        "internalVisibility": (
+            "NOT_APPLICABLE" if native_mode else "HIDDEN_BY_NAT"
+        ),
         "internalVerdict": (
+            "目标公网 IP 与脚本运行 VPS 的公网 IP 一致；本报告直接评估该 VPS "
+            "对中国三网的公网友好度，不存在需要推测的前置入口或隐藏内段。"
+            if native_mode else
             "入口到出口为端口映射／专线内部段，公共 traceroute 通常只看到中国入口，"
             "不能把隐藏段强判为 CN2、AS9929、CMIN2 或普通国际线路。"
         ),
@@ -2200,10 +2763,10 @@ def write_report(report: dict[str, Any]) -> tuple[Path, Path]:
 *{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top,#12213c,var(--bg) 42%);color:var(--text);font:14px/1.6 "Microsoft YaHei",system-ui,sans-serif}}
 .wrap{{max-width:1280px;margin:30px auto;padding:0 18px}}header,.panel{{border:1px solid #2458aa;background:linear-gradient(145deg,rgba(17,28,48,.98),rgba(7,11,18,.98));box-shadow:0 18px 50px #0008;margin-bottom:18px}}
 header{{padding:28px}}h1{{margin:0;color:#71dcff;letter-spacing:2px}}.sub{{color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}}.panel{{padding:18px;border-top:3px solid var(--line)}}.panel.ct{{border-top-color:var(--ct)}}.panel.cu{{border-top-color:var(--cu)}}.panel.cm{{border-top-color:var(--cm)}}
-h2{{margin:0 0 12px;font-size:18px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #26364f;text-align:left;vertical-align:top}}th{{color:#8ca7d5}}.route-verdict{{font-size:20px;color:#ffe16a;margin-bottom:8px}}.toolbar{{display:flex;gap:10px;margin:12px 0}}button{{background:#173e78;color:white;border:1px solid #3672c8;padding:8px 14px;cursor:pointer}}pre{{white-space:pre-wrap;color:#b8c5db;max-height:260px;overflow:auto}}.heat{{display:inline-block;min-width:190px;padding:7px 10px;border-radius:7px;color:#07101c;font-weight:700;background:linear-gradient(90deg,var(--heat),color-mix(in srgb,var(--heat) 35%,#101827))}}.heat.na{{color:#aab5c7;background:#273143}}.heat small{{display:block;font-weight:500;opacity:.82}}.legend{{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 16px}}.legend span{{padding:4px 9px;border-radius:999px;color:#07101c;font-weight:700}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}.heat{{min-width:150px}}}}
+h2{{margin:0 0 12px;font-size:18px}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #26364f;text-align:left;vertical-align:top}}th{{color:#8ca7d5}}.route-verdict{{font-size:20px;color:#ffe16a;margin-bottom:8px}}.toolbar{{display:flex;gap:10px;margin:12px 0}}button{{background:#173e78;color:white;border:1px solid #3672c8;padding:8px 14px;cursor:pointer}}pre{{white-space:pre-wrap;color:#b8c5db;max-height:260px;overflow:auto}}.heat,.speed{{display:inline-block;min-width:190px;padding:7px 10px;border-radius:7px;color:#07101c;font-weight:700;background:linear-gradient(90deg,var(--heat),color-mix(in srgb,var(--heat) 35%,#101827))}}.heat.na,.speed.na{{color:#aab5c7;background:#273143}}.heat small,.speed small{{display:block;font-weight:500;opacity:.82}}.legend{{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 16px}}.legend span{{padding:4px 9px;border-radius:999px;color:#07101c;font-weight:700}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}.heat,.speed{{min-width:150px}}}}
 </style></head><body><div class="wrap">
 <header><h1>CHINA 3NET ROUTE LAB</h1><div class="sub" id="meta"></div><div class="toolbar"><button id="copy">复制为 NodeSeek 格式</button><button onclick="window.print()">打印／另存 PDF</button><button id="json">下载 JSON</button></div></header>
-<section class="panel" id="topology"></section><div class="grid" id="cards"></div><section class="panel" id="heatmap"></section><div id="details"></div></div>
+<section class="panel" id="topology"></section><div class="grid" id="cards"></div><section class="panel" id="heatmap"></section><section class="panel" id="speed"></section><section class="panel" id="improvements"></section><div id="details"></div></div>
 <script>const R={embedded};
 const E=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 document.getElementById('meta').textContent=R.version+'｜入口 '+R.target.host+':'+R.target.port+'｜出口 '+R.exit.host+'｜'+R.generated;
@@ -2213,11 +2776,11 @@ const heatCell=x=>{{
   if(!v.measured)return `<span class="heat na">N/A<small>${{E(v.reason||'未测')}}</small></span>`;
   return `<span class="heat" style="--heat:${{E(v.color)}}">AVG ${{E(v.avgMs)}} ms｜热度 ${{E(v.relativeHeat)}}%<small>P95 ${{E(v.p95Ms)}} ms｜绝对区间 ${{E(v.absoluteBand)}}</small></span>`;
 }};
-document.getElementById('topology').innerHTML=`<h2>专线／NAT 双端模型</h2><table><tbody>
-<tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部入口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
-<tr><th>中国入口</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>出口 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
+document.getElementById('topology').innerHTML=`<h2>被测网络模型</h2><table><tbody>
+<tr><th>拓扑</th><td>${{E(R.dedicatedLine.topology)}}</td><th>外部端口核对</th><td>${{E(R.dedicatedLine.portStatus)}}</td></tr>
+<tr><th>被测 VPS</th><td>${{E(R.dedicatedLine.entry)}}｜${{E(R.dedicatedLine.entryAsn)}}</td><th>执行 VPS</th><td>${{E(R.dedicatedLine.exit)}}｜${{E(R.dedicatedLine.exitAsn)}}</td></tr>
 <tr><th>矩阵状态</th><td>${{E((R.matrixAssessment||{{}}).status||'N/A')}}</td><th>呈现原则</th><td>线路判定优先｜省份延迟热图｜不使用总分／星级</td></tr>
-<tr><th>专线内段</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
+<tr><th>模型边界</th><td colspan="3">${{E(R.dedicatedLine.internalVerdict)}}</td></tr></tbody></table>`;
 document.getElementById('cards').innerHTML=R.grades.map(g=>`<section class="panel ${{g.carrier.toLowerCase()}}"><h2>${{names[g.carrier]}}</h2><div class="route-verdict">去程 ${{E(g.forwardRoute)}} ↔ 回程 ${{E(g.returnRoute)}}</div><div>矩阵：${{E(g.matrixStatus)}}｜指定地区去程 ${{E(g.forwardRegional)}}｜回程有效 ${{E(g.returnValid)}}</div><div>测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%</div><div>全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜参考不补足省份矩阵</div><div>精品双程：${{g.bidirectionalPremium?'PASS':'未证实'}}</div></section>`).join('');
 const bands=((R.latencyHeatmap||{{}}).absoluteBands||[]).map(b=>`<span style="background:${{E(b.color)}}">${{E(b.range)}}</span>`).join('');
 const heatRows=['CT','CU','CM'].map(c=>{{
@@ -2228,9 +2791,14 @@ const heatRows=['CT','CU','CM'].map(c=>{{
   }}).join('');
 }}).join('');
 document.getElementById('heatmap').innerHTML=`<h2>各省实测延迟热图</h2><div class="sub">${{E((R.latencyHeatmap||{{}}).legend||'')}}</div><div class="legend">${{bands}}</div><table><thead><tr><th>运营商</th><th>地区</th><th>去程</th><th>回程</th><th>双程线路</th></tr></thead><tbody>${{heatRows}}</tbody></table>`;
+const S=R.singleThreadSpeed||{{rows:[],status:'N/A',reason:'未执行'}};
+const speedCell=v=>!v?.measured?`<span class="speed na">N/A<small>${{E(v?.reason||'未测')}}</small></span>`:`<span class="speed" style="--heat:${{E(v.color)}}">${{E(v.mbps)}} Mbps<small>同次百分位 ${{E(v.relativePercentile)}}%｜${{E(v.absoluteBand)}}</small></span>`;
+const speedRows=(S.rows||[]).map(x=>`<tr><td>${{E(x.region)}}</td><td>${{E(x.label)}}</td><td><span class="speed" style="--heat:${{E(x.retransVisual?.color||'#596579')}}">${{E(x.returnRetransmits??'N/A')}}<small>${{E(x.retransVisual?.band||'N/A')}}</small></span></td><td>${{speedCell(x.returnVisual)}}</td><td>${{speedCell(x.forwardVisual)}}</td><td>${{E(x.status)}}</td></tr>`).join('');
+document.getElementById('speed').innerHTML=`<h2>三网公网单线程速度（非评分）</h2><div class="sub">${{E(S.boundary||S.reason||'N/A')}}</div>${{speedRows?`<table><thead><tr><th>地区</th><th>测速节点</th><th>回程重传</th><th>回程速度</th><th>去程速度</th><th>状态</th></tr></thead><tbody>${{speedRows}}</tbody></table>`:`<p>${{E(S.reason||'未执行')}}</p>`}}`;
+document.getElementById('improvements').innerHTML=`<h2>最终判定建议改善</h2><ol>${{(R.improvements||['当前未生成额外建议']).map(x=>`<li>${{E(x)}}</li>`).join('')}}</ol>`;
 document.getElementById('details').innerHTML=['CT','CU','CM'].map(c=>`<section class="panel ${{c.toLowerCase()}}"><h2>${{names[c]}} ${{E(R.matrixLabel||'多地区')}}双程证据</h2><table><thead><tr><th>方向／地区</th><th>测点健康／线路</th><th>骨干标签／中文路由注释</th><th>延迟热度</th><th>原始质量数据</th><th>判定证据</th></tr></thead><tbody>${{R.forward.filter(x=>x.carrier===c).map(x=>`<tr><td>去程／${{E(x.region)}}<br>${{E(x.access)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{heatCell(x)}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}${{R.returns.filter(x=>x.carrier===c).map(x=>`<tr><td>回程／${{E(x.probeCapital||x.city)}}</td><td>${{E(x.probeHealth||'N/A')}}<br>${{E(x.class)}}</td><td>${{E((x.backboneTags||[]).join(' → '))}}<br>${{E(x.routeNote)}}</td><td>${{heatCell(x)}}</td><td>${{E(JSON.stringify(x.stats))}}</td><td>${{E(x.evidence)}}</td></tr>`).join('')}}</tbody></table></section>`).join('');
 function nodeSeek(){{
-  const header=`## 中国三网 VPS 双程质量报告\n\n- 入口：${{R.target.host}}:${{R.target.port}}\n- 出口：${{R.exit.host}}\n- 入口核对：${{R.dedicatedLine.portStatus}}\n- 专线内段：NAT 隐藏，不强判线路等级\n- 版本：${{R.version}}\n\n`;
+  const header=`## 中国三网 VPS 双程质量报告\n\n- 被测 VPS：${{R.target.host}}:${{R.target.port}}\n- 执行 VPS：${{R.exit.host}}\n- 外部端口核对：${{R.dedicatedLine.portStatus}}\n- 网络模型：${{R.dedicatedLine.topology}}\n- 版本：${{R.version}}\n\n`;
   const tabs=':::: tabs\\n'+['CT','CU','CM'].map(c=>{{
     const g=R.grades.find(x=>x.carrier===c);
     const forwards=R.forward.filter(x=>x.carrier===c);
@@ -2240,7 +2808,9 @@ function nodeSeek(){{
     const returnRows=returns.map(x=>`- 回程（VPS→${{x.probeCapital||x.city}}）：测点 ${{x.probeHealth||'N/A'}}｜${{x.class}}｜骨干 ${{(x.backboneTags||[]).join(' → ')||'未识别'}}｜${{visual(x)}}｜LOSS ${{x.stats.loss??'N/A'}}%｜注释 ${{x.routeNote||'N/A'}}`).join('\\n');
     return `::: tab-item ${{names[c]}}\n线路判定：去程 ${{g.forwardRoute}} ↔ 回程 ${{g.returnRoute}}｜矩阵 ${{g.matrixStatus}}｜测量覆盖 ${{Math.round((g.measurementCoverage||0)*100)}}%｜可判定证据 ${{Math.round((g.scorableCoverage||0)*100)}}%｜指定地区去程 ${{g.forwardRegional}}｜全国独立参考 ${{g.forwardReference||0}}｜复用参考 ${{g.forwardSharedReference||0}}｜回程有效 ${{g.returnValid}}｜精品双程 ${{g.bidirectionalPremium?'PASS':'未证实'}}｜不使用总分／星级\n\n${{forwardRows}}\n${{returnRows}}\n:::`;
   }}).join('\\n\\n')+'\\n::::';
-  return header+tabs+'\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。';
+  const speedText=(R.singleThreadSpeed?.rows||[]).map(x=>`- ${{x.label}}：回程 ${{x.returnMbps??'N/A'}} Mbps／重传 ${{x.returnRetransmits??'N/A'}}；去程 ${{x.forwardMbps??'N/A'}} Mbps`).join('\\n');
+  const advice=(R.improvements||[]).map((x,i)=>`${{i+1}}. ${{x}}`).join('\\n');
+  return header+tabs+`\\n\\n### 三网单线程速度\\n${{speedText||'N/A｜未执行 --speed'}}\\n\\n### 改善建议\\n${{advice||'无'}}\\n\\n> traceroute 跳点不回应不等于端到端丢包；去程 LOSS 显示 N/A，只有 TCP connect 才计算业务探测丢包。`;
 }}
 document.getElementById('copy').onclick=async()=>{{await navigator.clipboard.writeText(nodeSeek());alert('NodeSeek 格式已复制')}};
 document.getElementById('json').onclick=()=>{{const a=document.createElement('a');a.download='3net-report.json';a.href=URL.createObjectURL(new Blob([JSON.stringify(R,null,2)],{{type:'application/json'}}));a.click()}};
@@ -2276,7 +2846,8 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "p95": s.get("p95"), "jitter": s.get("jitter"), "stddev": None,
             "loss": s.get("loss"),
             "success": f"{s.get('success', 0)}/{s.get('expected', 0)}",
-            "routeHops": 0, "timeoutHops": 0,
+            "routeHops": item.get("routeHops"),
+            "timeoutHops": item.get("timeoutHops"),
             "backboneTags": item.get("backboneTags", []),
             "routeNote": item.get("routeNote", ""),
             "probeCapital": item.get("probeCapital", CAPITALS.get(item.get("region", ""), "")),
@@ -2350,7 +2921,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "regionalSuccess": f"{len(regional_forward_items)}/{len(forward_items)}",
             "nationalReference": len(reference_forward_items),
             "sharedReference": len(shared_reference_items),
-            "routeHops": 0, "timeoutHops": 0,
+            "routeHops": None, "timeoutHops": None,
             "backboneTags": sorted({
                 tag for x in valid_forward_items for tag in x.get("backboneTags", [])
             }),
@@ -2402,7 +2973,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
         for x in report["grades"]
     )
     final_title = (
-        "三网完整矩阵｜线路判定＋省份延迟热图"
+        "三网完整矩阵｜线路＋延迟＋单线程吞吐"
         if matrix_complete else
         f"PARTIAL｜指定省份矩阵未完整｜指定地区去程 "
         f"{forward_regional_total}/{EXPECTED_PER_DIRECTION}"
@@ -2416,6 +2987,7 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             f"{MATRIX_CITIES} × 三网去程＋回程（{TOTAL_MATRIX_GROUPS} 组）"
         ),
         "methodology": report["methodology"],
+        "speedMethodology": report.get("speedMethodology", ""),
         "bgp": {"asn": report["dedicatedLine"]["exitAsn"],
                 "provider": report["exit"]["identity"], "location": ""},
         "final": {
@@ -2425,12 +2997,17 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
             "ratingEnabled": False,
             "ratingEligible": False,
             "matrixComplete": matrix_complete,
-            "presentationPolicy": "ROUTE_CLASS_FIRST｜PROVINCE_LATENCY_HEATMAP",
+            "presentationPolicy": (
+                "ROUTE_CLASS_FIRST｜PROVINCE_LATENCY_HEATMAP｜"
+                "SINGLE_STREAM_THROUGHPUT｜NO_SCORE"
+            ),
             "matrixStatus": "COMPLETE" if matrix_complete else "PARTIAL",
             "title": final_title,
             "elapsed": "N/A",
         },
         "carriers": carriers,
+        "singleThreadSpeed": report.get("singleThreadSpeed", {}),
+        "improvements": report.get("improvements", []),
         "latencyHeatmap": report.get("latencyHeatmap", {}),
         "matrixAssessment": report.get("matrixAssessment", {}),
         "dedicatedLine": report["dedicatedLine"],
@@ -2464,10 +3041,11 @@ def main() -> int:
         exit_ip, exit_identity = public_ip()
 
     banner("TARGET / 双端检测模型", CYAN)
-    field("国内入口目标", f"{mask_ip(target)}:{port}", CYAN)
-    field("当前出口 VPS", f"{mask_ip(exit_ip)}｜{exit_identity or '本机原生执行'}", GREEN)
+    native_mode = target == exit_ip
+    field("被测 VPS", f"{mask_ip(target)}:{port}", CYAN)
+    field("执行位置", f"{mask_ip(exit_ip)}｜{exit_identity or '本机原生执行'}", GREEN)
     field("认证方式", "VPS 本机原生执行｜不使用 SSH／密码／私钥", GREEN)
-    field("入口核对方式", "中国本地端主动证据优先；缺项才使用 Globalping，不以回程反推", CYAN)
+    field("去程核对方式", "中国本地端主动证据优先；缺项才使用 Globalping，不以回程反推", CYAN)
     field("测试矩阵", f"{MATRIX_LABEL}｜{MATRIX_CITIES}", MAGENTA)
 
     client_forward, client_forward_status = load_client_forward_evidence(
@@ -2523,13 +3101,26 @@ def main() -> int:
         )
 
     dedicated_line = dedicated_line_assessment(target, port, exit_ip, forward)
-    banner("DEDICATED LINE / 专线与 NAT 内段", MAGENTA)
+    banner(
+        "VPS MODEL / 原生公网双向模型"
+        if native_mode else
+        "FORWARDING MODEL / 入口与 NAT 内段",
+        MAGENTA,
+    )
     field("网络拓扑", dedicated_line["topology"], CYAN)
     field("外部端口", dedicated_line["portStatus"],
           GREEN if dedicated_line["reachedBy"] else YELLOW)
-    field("入口 ASN", dedicated_line["entryAsn"], CYAN)
+    field("目标 ASN", dedicated_line["entryAsn"], CYAN)
     field("出口 ASN", dedicated_line["exitAsn"], GREEN)
-    field("内段可见性", "NAT 隐藏｜不强判精品或普通线路", YELLOW)
+    field(
+        "内段可见性",
+        (
+            "不适用｜目标与执行 VPS 为同一公网 IP"
+            if native_mode else
+            "NAT 隐藏｜不强判精品或普通线路"
+        ),
+        GREEN if native_mode else YELLOW,
+    )
     field("判断边界", dedicated_line["internalVerdict"], GRAY)
 
     return_pool, return_pool_status = load_return_probe_pool()
@@ -2553,6 +3144,14 @@ def main() -> int:
             returns.append(item)
             show_return(item, index, return_total)
 
+    if SPEED_TEST:
+        banner("NEXT / 开始三网公网单线程测速", YELLOW)
+        field(
+            "预计耗时",
+            "约 4～12 分钟｜北上广三网 9 组｜会消耗实际测速流量",
+            YELLOW,
+        )
+    speed = single_thread_speed()
     latency_heatmap = annotate_latency_visuals(forward, returns)
     grades = [grade(c, forward, returns) for c in ("CT", "CU", "CM")]
     measured_total = sum(
@@ -2582,7 +3181,10 @@ def main() -> int:
         "matrixComplete": matrix_complete,
         "ratingEnabled": False,
         "ratingEligible": False,
-        "presentationPolicy": "ROUTE_CLASS_FIRST｜PROVINCE_LATENCY_HEATMAP｜NO_SCORE",
+        "presentationPolicy": (
+            "ROUTE_CLASS_FIRST｜PROVINCE_LATENCY_HEATMAP｜"
+            "SINGLE_STREAM_THROUGHPUT｜NO_SCORE"
+        ),
         "ratingReason": (
             "指定省份去程与回程全部完成；本版仍不生成总分或星级"
             if matrix_complete else
@@ -2618,6 +3220,11 @@ def main() -> int:
         GREEN if matrix_assessment["matrixComplete"] else YELLOW,
     )
     show_latency_heatmap(forward, returns)
+    show_single_thread_speed(speed)
+    improvements = build_improvements(grades, forward, returns, speed)
+    banner("IMPROVEMENTS / 最终判定建议改善", MAGENTA)
+    for index, suggestion in enumerate(improvements, start=1):
+        field(f"建议 {index}", suggestion, YELLOW)
 
     # 评分只保留在运行期供旧分类回归使用；用户报告与公开载荷不再输出
     # 样本分、总分或星级，避免延迟和骨干线路被一个抽象数字覆盖。
@@ -2637,41 +3244,69 @@ def main() -> int:
             f"{MATRIX_CITIES} × 三网去程＋回程（{TOTAL_MATRIX_GROUPS} 组）"
         ),
         "selfTest": SELF_TEST,
-        "target": {"host": mask_ip(target), "port": port, "role": "国内入口"},
-        "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "出口 VPS 本机"},
+        "target": {"host": mask_ip(target), "port": port, "role": "被测 VPS 公网"},
+        "exit": {"host": mask_ip(exit_ip), "identity": exit_identity, "role": "脚本执行 VPS"},
         "forwardEvidence": {
             "status": client_forward_status,
             "clientActive": true_forward_count,
             "total": len(forward),
         },
         "methodology": "默认使用成熟的北上广三网主矩阵；--extended 才追加合肥、南京、杭州。去程优先读取 cn3-forward-evidence/v1：中国本地 Windows 客户端对目标业务端口执行真实 TCP connect 与 tracert，且证据目标必须与本次 IP／端口完全一致；未覆盖项先由 Globalping 请求同省真实外部探针。省会及同省没有探针时，一次收集中国境内同运营商名称及各省网 ASN 的多探针共享快照；北上广与扩展模式使用相同池规则，按实际城市和地区 ASN 优先分配并避免重复。全国参考只证明该运营商网络到入口的线路与可达性，不冒充指定省份，也不能补足指定省份矩阵。仍无探针时标记 NOT-TESTED，不得写成入口不通。完整矩阵必须由指定省份去程探针与对应省份回程目标实际执行；实际执行但未接通保留为真实失败，NOT-TESTED 与复用参考不冒充失败。最终结论以去回程骨干线路类型为主，不生成总分或星级；各省实测 AVG／P95 以相对热度百分比和绿黄橙红渐层呈现，全国参考不进入省份延迟热图。net.sh 的 zstaticcdn 目标、TcpQuality 动态节点池以及 zhanghanyun／oneclickvirt backtrace 均为 VPS→中国回程，只用于回程稳定性，绝不冒充去程。回程先使用 TcpQuality 真实端口主备节点与 NetQuality 域名备用，TCP／ICMP／UDP 交叉取证；三协议仍无骨干证据时，才按 oneclickvirt/backtrace 的设计切换 spiritLHLS/icmp_targets 同省同运营商最多三个 ICMP 地址。若多协议同时观察到精品与普通线路，按动态混合保守降级。CN2 GIA 至少需要两个可见 CN2 跳点，单一 CN2 特征或多个 163 交付跳点只判混合／证据不足。",
+        "speedMethodology": (
+            "--speed 固定调用已锁定提交的 TcpQuality 北上广三网公共 TOS 单线程测试；"
+            "回程定义为当前 VPS→中国测速端，去程定义为中国测速端→当前 VPS。"
+            "测速结果不补足省份路由矩阵，不参与总分或星级。"
+        ),
         "forward": forward,
         "returns": returns,
         "grades": grades,
         "latencyHeatmap": latency_heatmap,
+        "singleThreadSpeed": speed,
+        "improvements": improvements,
         "matrixAssessment": matrix_assessment,
         "dedicatedLine": dedicated_line,
         "privacy": "报告中的入口与出口 IPv4 均只保留前两段。",
     }
     if SELF_TEST:
         public_payload = public_report_payload(report)
+        speed_check = public_payload.get("singleThreadSpeed") or {}
         if (
             public_payload["final"].get("score") is not None
             or public_payload["final"].get("stars") != "不使用评分"
             or not public_payload.get("latencyHeatmap", {}).get("forward")
         ):
             raise AssertionError("公开报告载荷必须使用省份延迟热图，且不得恢复总分／星级")
+        if (
+            len(speed_check.get("rows") or []) != 9
+            or int((speed_check.get("summary") or {}).get("complete", 0)) != 9
+        ):
+            raise AssertionError("单线程速度必须包含北上广三网九组与完整摘要")
+        if any(
+            item.get("routeHops") == 0
+            for carrier in public_payload["carriers"]
+            for item in carrier.get("forwardProbes") or []
+            if item.get("verified")
+        ):
+            raise AssertionError("已核对去程不得再硬编码显示 0 hops")
     html_path, json_path = write_report(report)
     banner("REPORT / 报告输出", MAGENTA)
     field("HTML 报告", html_path, GREEN)
     field("JSON 数据", json_path, GREEN)
-    field("页面功能", "双程证据／NodeSeek 复制／JSON 下载／打印 PDF", CYAN)
+    field(
+        "页面功能",
+        "双程线路／延迟热图／单线程吞吐／改善建议／NodeSeek／JSON／PDF",
+        CYAN,
+    )
     if not SELF_TEST:
         public_url = publish(report)
         if public_url:
             field("公共报告", public_url, GREEN)
     else:
-        field("SELF-TEST", "PASS｜离线分类、延迟热图、排版与报告生成完成", GREEN)
+        field(
+            "SELF-TEST",
+            "PASS｜离线分类、延迟热图、单线程吞吐、跳数与报告生成完成",
+            GREEN,
+        )
     field("隐私", f"入口 {mask_ip(target)}｜出口 {mask_ip(exit_ip)}；无 SSH 凭据", CYAN)
     return 0
 
