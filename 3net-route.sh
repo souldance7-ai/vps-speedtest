@@ -13,6 +13,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   bash 3net-route.sh --extended --port 443
   bash 3net-route.sh --extended --speed --port 443
   bash 3net-route.sh --self-test
+  bash 3net-route.sh --retry-upload /root/中国三网VPS双程质量报告_YYYYMMDD_HHMMSS.json
   bash 3net-route.sh --target 203.55.99.88 --port 443
   bash 3net-route.sh --target 203.55.99.88 --port 443 --forward-evidence /root/forward_evidence.json
 
@@ -21,6 +22,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   业务端口示例：443（Trojan／AnyTLS／REALITY 等 TCP 协议实际监听端口，不是 SSH 22）
   UDP-only 协议端口不能作为本脚本的 TCP 业务端口核对目标。
   --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
+  --retry-upload：只重传已生成的 JSON 并取得公共报告网址，不重新执行路由或测速。
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   --speed：追加北上广三网公网单线程速度（9 组），约需 4～12 分钟并消耗测速流量。
@@ -46,6 +48,7 @@ NO_INSTALL=0
 FORWARD_EVIDENCE=""
 EXTENDED=0
 SPEED_TEST=0
+RETRY_UPLOAD=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) SELF_TEST=1; shift ;;
@@ -54,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --forward-evidence) FORWARD_EVIDENCE="${2:-}"; shift 2 ;;
     --extended) EXTENDED=1; shift ;;
     --speed) SPEED_TEST=1; shift ;;
+    --retry-upload) RETRY_UPLOAD="${2:-}"; shift 2 ;;
     --no-install) NO_INSTALL=1; shift ;;
     *) echo "[ERROR] 未知参数：$1"; exit 2 ;;
   esac
@@ -94,6 +98,7 @@ export THREE_NET_TARGET_PORT="$TARGET_PORT"
 export THREE_NET_FORWARD_EVIDENCE="$FORWARD_EVIDENCE"
 export THREE_NET_EXTENDED="$EXTENDED"
 export THREE_NET_SPEED_TEST="$SPEED_TEST"
+export THREE_NET_RETRY_UPLOAD="$RETRY_UPLOAD"
 
 # 将 Python 源码放到独立文件描述符 3，保留标准输入给 input() 读取终端。
 # 这样直接运行、curl 进程替换、管道输入三种方式都不会在交互提示处 EOF。
@@ -133,6 +138,7 @@ SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
 TARGET = os.environ.get("THREE_NET_TARGET", "").strip()
 PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
+RETRY_UPLOAD_PATH = os.environ.get("THREE_NET_RETRY_UPLOAD", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
 PUBLIC_REPORT_SYNC_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-sync"
@@ -3341,6 +3347,24 @@ def publish(report: dict[str, Any]) -> str:
 
 def main() -> int:
     logo()
+    if RETRY_UPLOAD_PATH:
+        retry_path = Path(RETRY_UPLOAD_PATH).expanduser().resolve()
+        if not retry_path.is_file():
+            raise RuntimeError(f"找不到已生成的 JSON：{retry_path}")
+        try:
+            retry_report = json.loads(retry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"无法读取已生成的 JSON：{exc}") from exc
+        if not isinstance(retry_report, dict):
+            raise RuntimeError("已生成的 JSON 不是有效报告对象")
+        banner("REPORT RETRY / 已测结果免重跑上传", MAGENTA)
+        field("JSON 数据", retry_path, GREEN)
+        field("处理方式", "只上传现有报告；不重新执行路由、延迟或速度测试", CYAN)
+        public_url = publish(retry_report)
+        if not public_url:
+            return 8
+        field("公共报告", public_url, GREEN)
+        return 0
     if SELF_TEST:
         exit_ip, exit_identity = "45.207.225.70", "SELF-TEST VPS"
     else:
