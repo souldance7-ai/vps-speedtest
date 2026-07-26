@@ -1,39 +1,43 @@
 # LazyVPS VPS 测速正式 v1.0
 
 
-## 独立工具：沪日专线／IX-style 三层检测
+## 独立工具：中国三网入口去程／TCP应答与专线映射核对 v1.2.2
 
-`ix-route.sh` 是与 `3net-route.sh` 完全独立的专线检测器，适用于“上海公网入口 → NAT／IPLC／IEPL 隐藏内段 → 日本出口”架构。名称中的 IX-style 不代表已经证明经过某个 IXP。
+`ix-route.sh` 与 `3net-route.sh` 完全独立，适用于“中国用户 → 中国侧公网入口 → NAT／IPLC／IEPL／中转隐藏内段 → 出口 VPS”架构。
 
-### 在日本出口 VPS 一键执行
+正式版不再用“出口 VPS → 中国公共目标”的默认公网 traceroute 冒充专线回程。每组去程后只确认原中国探针是否收到同一入口、同一业务端口的 TCP 应答；该结果不是独立反向逐跳路由，也不计算回程分数。若能提供或自动识别入口端私网对端，才额外验证出口→入口私网对端的同路径内段回程。
+
+v1.2.2 可用 `--speed` 在 CMD 与报告中追加北京、上海、广东三网单线程速度。新版把六地区 × 三网 RTT 改为证据网格，主标题直接显示 `中国三网探针 → 脱敏入口IP:脱敏端口`，每格列出实际探针省市、ASN、脱敏入口、精确／备援状态和 TCP 应答；顶部与运营商卡分开统计三网运营商探针和第三方参考点，避免把参考点应答算进中国电信等运营商探针。速度与重传使用色彩渐层条并显示方向箭头，已取得数据标为 `VALID` 而非质量 `PASS`，缺测保持 `N/A`。该辅助项来自固定提交版本的开源 [TcpQuality](https://github.com/ibsgss/TcpQuality)，测量“出口 VPS ↔ 中国三网公共测速端”，不经过中国侧业务入口，不参与隐藏专线映射链与真实协议握手判定。
+
+### 在出口 VPS 一键执行完整六地区 × 三网
 
 ```bash
-    bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/ix-route.sh?ver=IX0.5-RC2")
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/refs/heads/agent/fix-ix-forward-probes/ix-route.sh") --full --speed
 ```
 
-交互输入示例：
+脚本会依次引导输入：
 
-- 上海公网入口：`211.136.162.184`
-- 协议业务端口：`10101`（AnyTLS）或 `10102`（Trojan），不是 SSH `22`／管理端口 `10100`
-- 预期日本公网出口：`114.111.176.37`
-- 日本端专线内网：`172.16.2.101`
-- 上海端专线内网对端：已知时填写；未知直接回车，纯内段结果显示 N/A
+- 中国侧公网入口 IPv4
+- 协议业务端口（不是 SSH／管理端口）
+- 预期公网出口（未知可留空）
+- 出口端专线内网 IPv4（未知可留空）
+- 入口端专线内网对端（未知可留空；脚本会尝试从活动连接识别）
 
-默认测试北京、上海、广东 × 中国电信／联通／移动；加 `--full` 扩展安徽、江苏、浙江。v0.5 RC2 改为“省会＋运营商名称／省级接入 ASN”定向找探针；省会无探针时只允许退到同省城市，并标明实际城市与退选原因，禁止跨省替代。回程同时尝试 TCP/443、ICMP、UDP，先按骨干证据等级选择，等级相同才比较回覆跳数。回程分数来自 CN2／AS9929／CMIN2 等实际骨干证据，不再把“traceroute 有跳点”直接计为 100 分。
+`--full` 生成18组TCP去程＋对应18组原探针TCP应答确认，`--speed` 追加北上广三网九组公网单线程辅助测速。所有用户相关入口、出口、私网对端及客户端实测 IPv4 在 JSON、HTML、Markdown 与公共页中只保留前两段；业务端口末三位统一显示为 `***`。最终判定不输出分数／星级，并列出缺失证据、低速与高重传等建议改善。
+
+[完整使用说明与判定边界](IX_ROUTE_GUIDE.md) · [查看脚本](ix-route.sh)
 
 ---
 
-## RC4.2.8 真去程闭环版
+## RC4.2.5 六省会测点健康检查版
 
-适用于在 VPS 内检测中国电信、联通、移动的去程与回程质量，覆盖北京、上海、广东、安徽、江苏、浙江六省三网，并生成 CMD、HTML、JSON、公共报告及 NodeSeek 格式。
+适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京市、上海市、广州市、合肥市、南京市、杭州市六个省会，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
 
-RC4.2.8 将多个开源工具按真实方向应用：`runTcpQuality.sh` 只是入口，核心动态节点池、`net.sh` 的 `*.ip.zstaticcdn.com`、[zhanghanyun/backtrace](https://github.com/zhanghanyun/backtrace) 与 [oneclickvirt/backtrace](https://github.com/oneclickvirt/backtrace) 均由 VPS 主动访问中国目标，所以都属于回程，不能作为中国→VPS 去程。新版保留 TcpQuality 动态回程池，并把 NetQuality 六省三网域名作为静态目标的第二级备用。
+RC4.2.5 修正 RC4.2.4 将 `limit` 错放进 Globalping `locations` 对象、导致大量 HTTP 422 的请求格式问题。新版先扫描北京市／上海市／广州市／合肥市／南京市／杭州市各省会当前全部在线探针，再按省级接入 ASN 家族与运营商名称筛选三网测点；上海联通 AS4808、广州联通 AS17622、北京移动 AS56048 等不再因“不是骨干 ASN”被误删。接入 ASN 只用于确认测点所属运营商，精品／普通线路仍严格按 traceroute 的实际骨干证据判定。
 
-去程新增 `cn3-forward-evidence/v1`：中国本地 Windows 客户端直接对业务 IP／端口执行 TCP connect 与 tracert，生成证据文件；VPS 端用 `--forward-evidence` 导入后，优先采用该真实去程，未覆盖的省份／运营商才由 Globalping 补测，仍无探针则保持 `INCONCLUSIVE`。证据目标 IP 或端口不一致会整份拒绝，避免把旧结果套到新 VPS。
+去程每列新增 `ONLINE-EXACT`、`ONLINE-FAMILY`、`OFFLINE` 测点健康状态；找不到同省会同运营商探针时直接标记 `INCONCLUSIVE`，不使用武汉、西安、徐州等跨省探针代替。回程依次尝试 TCP/443、ICMP、UDP traceroute，采用有效回覆跳点最多的一组，避免目标未开放 TCP/80 时整组测不出来。CMD、HTML、JSON 与 NodeSeek 会同步显示测点健康、实际 ASN、骨干标签及中文路由注释。
 
-回程质量用实际节点端口的 TCP connect 计算，并以 TCP traceroute、ICMP、UDP 三种路由交叉取证。三种协议仍无骨干证据时，再使用 oneclickvirt 采用的 [spiritLHLS/icmp_targets](https://github.com/spiritLHLS/icmp_targets) 同省同运营商备用地址，每组最多尝试三个；若不同协议同时观察到精品与普通路由，保守标记为动态混合，不再只挑最好的一条。CN2 GIA、AS9929、CMIN2 等等级仍只依实际跳点判断。CMD、HTML、JSON 与 NodeSeek 同步显示节点来源、实际端口、主备切换、多协议路径、骨干标签和中文路由注释。
-
-[AntPing](https://antping.com/) 继续仅用于人工交叉复核，不调用其未公开网页接口。
+[AntPing](https://antping.com/) 当前可用于人工交叉复核国内 TCP 连通与路由追踪；脚本不调用其未公开网页接口，避免接口或页面改版再次造成批量失效。
 
 ### VPS / Linux 一键执行（推荐）
 
@@ -58,22 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-### Windows 中国本地端生成真实去程证据
-
-先把电脑切到要测试的网络（例如合肥电信、联通 CPE 或移动 CPE），在 Windows CMD 执行：
-
-```cmd
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/cn3_client_probe.ps1 -OutFile cn3_client_probe.ps1; .\cn3_client_probe.ps1 -VpsHost 你的业务入口IP -Ports 你的业务端口 -Carrier CT -Region 安徽 -City 合肥市 -EvidenceOut .\forward_evidence.json"
-```
-
-`CT`／`CU`／`CM` 分别表示电信／联通／移动。同一目标与端口重复执行会保留其他运营商记录，并更新当前运营商＋地区记录。随后将文件传到 VPS：
-
-```cmd
-scp .\forward_evidence.json root@你的VPS_IP:/root/forward_evidence.json
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh --target 你的业务入口IP --port 你的业务端口 --forward-evidence /root/forward_evidence.json'"
-```
-
-> 当前版本：RC4.2.8 真去程闭环版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.5 六省会测点健康检查版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
 
 ---
 
@@ -140,7 +129,7 @@ ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh http
 示例：
 
 ```cmd
-ssh root@103.97.200.42 "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL -o /root/cn3_vps_server_test.sh https://raw.githubusercontent.com/souldance7-ai/VPS-/main/cn3_vps_server_test.sh && chmod +x /root/cn3_vps_server_test.sh && bash /root/cn3_vps_server_test.sh --standard'"
 ```
 
 > Windows CMD 不要直接执行 `bash <(curl ...)`，那是 Linux Bash 语法。
