@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.21 SHARED-JSON-UPLOAD"
+VERSION="v0.9 RC4.2.22 IX-V122-POST"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.21 SHARED-JSON-UPLOAD
+中国三网 VPS 双程质量检测 v0.9 RC4.2.22 IX-V122-POST
 
 用法：
   bash 3net-route.sh
@@ -132,7 +132,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.21 SHARED-JSON-UPLOAD")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.22 IX-V122-POST")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -142,7 +142,7 @@ FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
 RETRY_UPLOAD_PATH = os.environ.get("THREE_NET_RETRY_UPLOAD", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
-PUBLIC_REPORT_CLI_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
+PUBLIC_REPORT_ROOT = "https://china-3net-route-report.souldance4.chatgpt.site"
 TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
 TCPQUALITY_RAW_BASE = (
     "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
@@ -3184,114 +3184,31 @@ def cli_upload_envelope(payload: dict[str, Any]) -> bytes:
     return json.dumps(envelope, separators=(",", ":")).encode("ascii")
 
 
-def curl_post_json(
-    url: str,
-    body: bytes,
-    timeout: int = 45,
-) -> dict[str, Any]:
-    command = [
-        "curl",
-        "--silent",
-        "--show-error",
-        "--compressed",
-        "--connect-timeout", "12",
-        "--max-time", str(timeout),
-        "--retry", "2",
-        "--retry-delay", "1",
-        "--request", "POST",
-        "--header", "Content-Type: application/json",
-        "--header", "Accept: application/json",
-        "--header", "Cache-Control: no-cache",
-        "--user-agent", "3net-route-cli/RC4.2.21",
-        "--data-binary", "@-",
-        "--write-out", "\\n%{http_code}",
-        url,
-    ]
-
-    try:
-        completed = subprocess.run(
-            command,
-            input=body,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout + 8,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("上传连接超时；本地 HTML／JSON 已保留") from exc
-
-    if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", "replace").strip()
-        detail = re.sub(r"\s+", " ", detail)[:160]
-        raise RuntimeError(
-            f"上传网络失败（curl {completed.returncode}）"
-            + (f"｜{detail}" if detail else "")
-        )
-
-    try:
-        response_body, status_text = completed.stdout.rsplit(b"\n", 1)
-        status = int(status_text.strip())
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError("上传接口返回格式异常；本地 HTML／JSON 已保留") from exc
-
-    result: dict[str, Any] = {}
-    if response_body.lstrip().startswith((b"{", b"[")):
-        try:
-            parsed = json.loads(response_body.decode("utf-8", "replace"))
-            if isinstance(parsed, dict):
-                result = parsed
-        except json.JSONDecodeError:
-            result = {}
-
-    if not 200 <= status < 300:
-        api_error = str(result.get("error") or "").strip()
-        if not api_error:
-            api_error = (
-                "站点边缘拒绝了 POST 请求"
-                if status == 403 else
-                "接口未返回可读 JSON"
-            )
-        raise RuntimeError(
-            f"HTTP {status}｜{api_error}；本地 HTML／JSON 已保留"
-        )
-    if not result:
-        raise RuntimeError("上传接口未返回有效 JSON；本地 HTML／JSON 已保留")
-    return result
-
-
 def publish(report: dict[str, Any]) -> str:
+    """Use the verified IX v1.2.2 transport: one urllib POST to /api/reports."""
     payload = public_report_payload(report)
-    raw_body = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    attempts = (
-        ("标准 POST", PUBLIC_REPORT_API, raw_body),
-        ("压缩 POST", PUBLIC_REPORT_CLI_API, cli_upload_envelope(payload)),
-    )
-    errors: list[str] = []
-    for label, url, body in attempts:
-        try:
-            result = curl_post_json(url, body, 45)
-            for key in ("url", "reportUrl", "report_url", "publicUrl"):
-                if result.get(key):
-                    return str(result[key])
-            if result.get("id"):
-                return (
-                    "https://china-3net-route-report.souldance4.chatgpt.site"
-                    f"/r/{result['id']}"
-                )
-            errors.append(f"{label} 未返回报告网址")
-        except Exception as exc:
-            detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
-            errors.append(f"{label}：{detail}")
-    field(
-        "公共报告",
-        "上传失败｜" + "；".join(errors)
-        + "；请使用本地 JSON 在报告站浏览器上传",
-        YELLOW,
-    )
+    try:
+        result = http_json(PUBLIC_REPORT_API, "POST", payload, 30)
+        candidates = [result]
+        if isinstance(result, dict):
+            candidates.extend(
+                value for value in result.values() if isinstance(value, dict)
+            )
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in ("url", "reportUrl", "report_url", "publicUrl", "public_url"):
+                if candidate.get(key):
+                    value = str(candidate[key])
+                    return value if value.startswith("http") else PUBLIC_REPORT_ROOT + value
+            if candidate.get("id"):
+                return f"{PUBLIC_REPORT_ROOT}/report/{candidate['id']}"
+        field("公共报告", f"上传响应缺少公共网址｜{str(result)[:220]}", YELLOW)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:360]
+        field("公共报告", f"上传失败｜HTTP {exc.code}｜{detail}", YELLOW)
+    except Exception as exc:
+        field("公共报告", f"上传失败｜{type(exc).__name__}: {exc}", YELLOW)
     return ""
 
 
