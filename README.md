@@ -29,48 +29,68 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 ---
 
-## RC4.2.26 VPS 双程质量检测
+## 中国三网 VPS 双程质量检测 v1.0.0 正式版
 
-适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量。默认使用北京、上海、广东三网主矩阵；加入 `--extended` 后扩展至合肥、南京、杭州，并生成 HTML、JSON、公共报告及 NodeSeek 格式。
+适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，并生成 CMD、HTML、JSON、NodeSeek 与公共报告。脚本不会默认指定 443；未传 `--port` 时会询问协议实际监听的 TCP 业务端口。
 
-RC4.2.26 保留公开载荷与本地完整 HTML／JSON，并恢复开源工具应有的零配置上传。脚本先使用与 IX v1.2.2 相同的标准 POST；若机房出口被边缘层拒绝，则自动改用公共 GET 分段通道上传。使用者不需要自建中继，也不需要配置密钥、来源白名单或额外服务器。
+### 永久固定的一键入口
 
-终端标题已移除 `░▒▓█` Unicode 渐层块，改为纯 ASCII 分隔线，避免 Windows CMD、SSH 控制台与不同字体产生紫色花屏。脚本不会默认指定 443；未传 `--port` 时会在运行中询问实际 TCP 业务端口。
+以后发布新版本时，只替换下列固定文件的内容，不再把 RC 编号、日期或 `?ver=` 参数写进执行命令。正式版与 RC 版分开维护；新功能先进入 RC，验证后才同步到正式版。若新增独立工具，则新增文件名，不改动既有稳定入口。
 
-[AntPing](https://antping.com/) 当前可用于人工交叉复核国内 TCP 连通与路由追踪；脚本不调用其未公开网页接口，避免接口或页面改版再次造成批量失效。
+| 通道 | 固定文件 | 默认内容 |
+|---|---|---|
+| 正式标准版 | `3net-route.sh` | 北上广三网双程，不执行单线程测速 |
+| 正式含测速版 | `3net-route-speed.sh` | 六地区扩展＋北上广三网9组单线程测速 |
+| RC 标准版 | `3net-route-rc.sh` | 新功能公开验证，不执行单线程测速 |
+| RC 含测速版 | `3net-route-rc-speed.sh` | RC 六地区扩展＋9组单线程测速 |
 
-### VPS / Linux 一键执行（推荐）
-
-```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.26") --extended --speed
-```
-
-运行后按提示输入：
-
-- 协议实际监听的 TCP 业务端口（不是 SSH 端口 `22`）
-- 只有明确核对某个服务时，才需要自行加入 `--port 业务端口`
-
-### 下载到 VPS 后执行
+#### 正式标准版（推荐日常检测）
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh
+bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh")
 ```
 
-### Windows CMD 远程触发
+#### 正式含测速版
+
+```bash
+bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-speed.sh")
+```
+
+#### 开源 RC 标准版
+
+```bash
+bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-rc.sh")
+```
+
+#### 开源 RC 含测速版
+
+```bash
+bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-rc-speed.sh")
+```
+
+运行后填写协议实际监听的 TCP 业务端口，不要填写 SSH 端口 `22`。正式／RC 的含测速入口已固定自动加入 `--extended --speed`，不必再手动输入参数。
+
+### 下载到 VPS 后执行正式标准版
+
+```bash
+curl -fsSL --retry 3 https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh
+```
+
+### Windows CMD 远程触发正式标准版
 
 ```cmd
-ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
+ssh root@你的VPS_IP "bash -lc 'curl -fsSL --retry 3 https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
 ### 已测报告免重跑上传
 
-若完整测试已经结束，只需重传现有 JSON，不会重新执行路由、延迟或速度测试：
-
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.26") --retry-upload "/root/中国三网VPS双程质量报告_YYYYMMDD_HHMMSS.json"
+bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh") --retry-upload "/root/中国三网VPS双程质量报告_YYYYMMDD_HHMMSS.json"
 ```
 
-> 当前版本：RC4.2.26 ZERO-CONFIG-UPLOAD。公开使用前请自行确认业务端口及当地法律与服务商条款。
+公共报告会先尝试标准 POST，失败后再尝试公共 GET 分段通道。若来源网络仍被边缘层拒绝，本地 HTML／JSON 会继续保留，可稍后用固定正式入口执行 `--retry-upload`；不需要自建中继、密钥或来源白名单。
+
+> 当前正式版：v1.0.0 FINAL。当前公开 RC 基线：v0.9 RC4.2.26。执行命令以后不随内部版本号变化。
 
 ---
 
