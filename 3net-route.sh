@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.20 POST-UPLOAD-RESTORE"
+VERSION="v0.9 RC4.2.21 SHARED-JSON-UPLOAD"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.20 POST-UPLOAD-RESTORE
+中国三网 VPS 双程质量检测 v0.9 RC4.2.21 SHARED-JSON-UPLOAD
 
 用法：
   bash 3net-route.sh
@@ -132,7 +132,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.20 POST-UPLOAD-RESTORE")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.21 SHARED-JSON-UPLOAD")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -3202,7 +3202,7 @@ def curl_post_json(
         "--header", "Content-Type: application/json",
         "--header", "Accept: application/json",
         "--header", "Cache-Control: no-cache",
-        "--user-agent", "3net-route-cli/RC4.2.20",
+        "--user-agent", "3net-route-cli/RC4.2.21",
         "--data-binary", "@-",
         "--write-out", "\\n%{http_code}",
         url,
@@ -3295,22 +3295,28 @@ def publish(report: dict[str, Any]) -> str:
     return ""
 
 
+def publish_report_file(json_path: Path) -> str:
+    """Use one JSON-on-disk upload path for retry and completed test runs."""
+    resolved_path = json_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        raise RuntimeError(f"找不到已生成的 JSON：{resolved_path}")
+    try:
+        stored_report = json.loads(resolved_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"无法读取已生成的 JSON：{exc}") from exc
+    if not isinstance(stored_report, dict):
+        raise RuntimeError("已生成的 JSON 不是有效报告对象")
+    return publish(stored_report)
+
+
 def main() -> int:
     logo()
     if RETRY_UPLOAD_PATH:
         retry_path = Path(RETRY_UPLOAD_PATH).expanduser().resolve()
-        if not retry_path.is_file():
-            raise RuntimeError(f"找不到已生成的 JSON：{retry_path}")
-        try:
-            retry_report = json.loads(retry_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"无法读取已生成的 JSON：{exc}") from exc
-        if not isinstance(retry_report, dict):
-            raise RuntimeError("已生成的 JSON 不是有效报告对象")
         banner("REPORT RETRY / 已测结果免重跑上传", MAGENTA)
         field("JSON 数据", retry_path, GREEN)
         field("处理方式", "只上传现有报告；不重新执行路由、延迟或速度测试", CYAN)
-        public_url = publish(retry_report)
+        public_url = publish_report_file(retry_path)
         if not public_url:
             return 8
         field("公共报告", public_url, GREEN)
@@ -3601,7 +3607,7 @@ def main() -> int:
         CYAN,
     )
     if not SELF_TEST:
-        public_url = publish(report)
+        public_url = publish_report_file(json_path)
         if public_url:
             field("公共报告", public_url, GREEN)
     else:
