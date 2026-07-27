@@ -29,26 +29,26 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 ---
 
-## RC4.2.5 六省会测点健康检查版
+## RC4.2.20 VPS 双程质量检测
 
-适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，覆盖北京市、上海市、广州市、合肥市、南京市、杭州市六个省会，并生成 HTML、JSON、公共报告及 NodeSeek 图片格式。
+适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量。默认使用北京、上海、广东三网主矩阵；加入 `--extended` 后扩展至合肥、南京、杭州，并生成 HTML、JSON、公共报告及 NodeSeek 格式。
 
-RC4.2.5 修正 RC4.2.4 将 `limit` 错放进 Globalping `locations` 对象、导致大量 HTTP 422 的请求格式问题。新版先扫描北京市／上海市／广州市／合肥市／南京市／杭州市各省会当前全部在线探针，再按省级接入 ASN 家族与运营商名称筛选三网测点；上海联通 AS4808、广州联通 AS17622、北京移动 AS56048 等不再因“不是骨干 ASN”被误删。接入 ASN 只用于确认测点所属运营商，精品／普通线路仍严格按 traceroute 的实际骨干证据判定。
+RC4.2.20 恢复公共报告的标准 `POST /api/reports` 上报，并保留压缩 POST 作为第二通道；已删除会被部分机房边缘策略拒绝的 GET 分段上报。两条 POST 都失败时，本地 HTML／JSON 仍会保留，并提示使用报告站浏览器上传。
 
-去程每列新增 `ONLINE-EXACT`、`ONLINE-FAMILY`、`OFFLINE` 测点健康状态；找不到同省会同运营商探针时直接标记 `INCONCLUSIVE`，不使用武汉、西安、徐州等跨省探针代替。回程依次尝试 TCP/443、ICMP、UDP traceroute，采用有效回覆跳点最多的一组，避免目标未开放 TCP/80 时整组测不出来。CMD、HTML、JSON 与 NodeSeek 会同步显示测点健康、实际 ASN、骨干标签及中文路由注释。
+终端标题已移除 `░▒▓█` Unicode 渐层块，改为纯 ASCII 分隔线，避免 Windows CMD、SSH 控制台与不同字体产生紫色花屏。脚本不会默认指定 443；未传 `--port` 时会在运行中询问实际 TCP 业务端口。
 
 [AntPing](https://antping.com/) 当前可用于人工交叉复核国内 TCP 连通与路由追踪；脚本不调用其未公开网页接口，避免接口或页面改版再次造成批量失效。
 
 ### VPS / Linux 一键执行（推荐）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.20") --extended --speed
 ```
 
 运行后按提示输入：
 
-- 目标 IP，例如 `203.55.99.88`
-- 协议业务端口，例如 `443`（不是 SSH 端口 `22`）
+- 协议实际监听的 TCP 业务端口（不是 SSH 端口 `22`）
+- 只有明确核对某个服务时，才需要自行加入 `--port 业务端口`
 
 ### 下载到 VPS 后执行
 
@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.5 六省会测点健康检查版。公开使用前请自行确认目标 IP、业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.20 POST-UPLOAD-RESTORE。公开使用前请自行确认业务端口及当地法律与服务商条款。
 
 ---
 
