@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v1.0.0 FINAL"
+VERSION="v0.9 RC4.2.26 ZERO-CONFIG-UPLOAD"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v1.0.0 FINAL
+中国三网 VPS 双程质量检测 v0.9 RC4.2.26 ZERO-CONFIG-UPLOAD
 
 用法：
   bash 3net-route.sh
@@ -24,9 +24,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   UDP-only 协议端口不能作为本脚本的 TCP 业务端口核对目标。
   --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
   --retry-upload：只重传已生成的 JSON 并取得公共报告网址，不重新执行路由或测速。
-  公共报告上传：先使用标准 POST；失败时自动尝试公共 GET 分段通道。
-  若来源网络仍被边缘层拒绝，本地 HTML／JSON 会保留，可稍后使用 --retry-upload 重试。
-  使用者不需要自建中继、密钥或来源白名单。
+  公共报告零配置上传：先使用与 IX v1.2.2 相同的标准 POST；
+  若机房出口被边缘拒绝，则自动切换为 GET 分段上传，不需要中继、密钥或白名单。
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   --speed：追加北上广三网公网单线程速度（9 组），约需 4～12 分钟并消耗测速流量。
@@ -137,7 +136,7 @@ from typing import Any
 
 VERSION = os.environ.get(
     "THREE_NET_VERSION",
-    "v1.0.0 FINAL",
+    "v0.9 RC4.2.26 ZERO-CONFIG-UPLOAD",
 )
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
@@ -3256,7 +3255,7 @@ def curl_get_json(
         "--request", "GET",
         "--header", "Accept: application/json",
         "--header", "Cache-Control: no-cache",
-        "--user-agent", "Mozilla/5.0 3net-route-cli/1.0.0",
+        "--user-agent", "Mozilla/5.0 3net-route-cli/RC4.2.26",
         "--get",
     ]
     for name, value in params.items():
