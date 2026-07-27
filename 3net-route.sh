@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.18 GET-UPLOAD-FIX"
+VERSION="v0.9 RC4.2.20 POST-UPLOAD-RESTORE"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.18 GET-UPLOAD-FIX
+中国三网 VPS 双程质量检测 v0.9 RC4.2.20 POST-UPLOAD-RESTORE
 
 用法：
-  bash 3net-route.sh --port 443
-  bash 3net-route.sh --extended --port 443
-  bash 3net-route.sh --extended --speed --port 443
+  bash 3net-route.sh
+  bash 3net-route.sh --extended
+  bash 3net-route.sh --extended --speed
+  bash 3net-route.sh --port 8443
   bash 3net-route.sh --self-test
   bash 3net-route.sh --retry-upload /root/中国三网VPS双程质量报告_YYYYMMDD_HHMMSS.json
-  bash 3net-route.sh --target 203.55.99.88 --port 443
-  bash 3net-route.sh --target 203.55.99.88 --port 443 --forward-evidence /root/forward_evidence.json
+  bash 3net-route.sh --target 203.55.99.88 --port 8443
+  bash 3net-route.sh --target 203.55.99.88 --port 8443 --forward-evidence /root/forward_evidence.json
 
 说明：
   本脚本直接在被测 VPS 上运行，自动识别当前 VPS 公网 IPv4，不要求输入中国入口 IP。
-  业务端口示例：443（Trojan／AnyTLS／REALITY 等 TCP 协议实际监听端口，不是 SSH 22）
+  未指定 --port 时会在运行中询问；请填写协议实际监听的 TCP 业务端口，不默认假定 443。
   UDP-only 协议端口不能作为本脚本的 TCP 业务端口核对目标。
   --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
   --retry-upload：只重传已生成的 JSON 并取得公共报告网址，不重新执行路由或测速。
@@ -131,7 +132,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.18 GET-UPLOAD-FIX")
+VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.20 POST-UPLOAD-RESTORE")
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -140,8 +141,8 @@ PORT_TEXT = os.environ.get("THREE_NET_TARGET_PORT", "").strip()
 FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
 RETRY_UPLOAD_PATH = os.environ.get("THREE_NET_RETRY_UPLOAD", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
-PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
-PUBLIC_REPORT_SYNC_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-sync"
+PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
+PUBLIC_REPORT_CLI_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
 TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
 TCPQUALITY_RAW_BASE = (
     "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
@@ -386,17 +387,9 @@ def rule(char: str = "═", color: str = BLUE) -> None:
 
 
 def banner(title: str, color: str = CYAN) -> None:
-    inner = WIDTH - 4
-    deco = "░▒▓█"
-    title_width = visible_len(title)
-    room = max(0, inner - title_width - 4)
-    left = (deco * ((room // 2 + 3) // 4))[: room // 2]
-    right = ("█▓▒░" * ((room - len(left) + 3) // 4))[: room - len(left)]
-    print(BLUE + "╔" + "═" * (WIDTH - 2) + "╗" + RESET)
-    print(BLUE + "║ " + color + left + "  " + title + "  " + right +
-          " " * max(0, inner - len(left) - len(right) - title_width - 4) +
-          BLUE + " ║" + RESET)
-    print(BLUE + "╚" + "═" * (WIDTH - 2) + "╝" + RESET)
+    print(BLUE + "=" * WIDTH + RESET)
+    print(color + f"  {title}" + RESET)
+    print(BLUE + "=" * WIDTH + RESET)
 
 
 def field(label: str, value: Any, color: str = WHITE) -> None:
@@ -443,7 +436,7 @@ def ask_target(detected_ip: str) -> tuple[str, int]:
     if not TARGET and valid_public_ipv4(detected_ip):
         TARGET = detected_ip
     field("当前 VPS IPv4", mask_ip(TARGET), CYAN)
-    field("协议端口示例", "443", GREEN)
+    field("协议端口", "按实际服务填写；脚本不默认指定 443", GREEN)
     field("重要提醒", "填写 Trojan／AnyTLS／REALITY 等 TCP 业务端口，不是 SSH 22；UDP-only 端口不适用", YELLOW)
     field("IP 输入", "已自动识别；普通 VPS 本机检测无需填写中国入口 IP", GREEN)
     while not valid_public_ipv4(TARGET):
@@ -452,7 +445,7 @@ def ask_target(detected_ip: str) -> tuple[str, int]:
             print(RED + "  IPv4 无效，请重新输入。" + RESET)
     while True:
         if not PORT_TEXT:
-            PORT_TEXT = input("请输入协议业务端口〔例 443；不是 SSH 22〕：").strip()
+            PORT_TEXT = input("请输入协议实际监听的 TCP 业务端口〔不是 SSH 22〕：").strip()
         try:
             port = int(PORT_TEXT)
             if 1 <= port <= 65535:
@@ -3191,21 +3184,9 @@ def cli_upload_envelope(payload: dict[str, Any]) -> bytes:
     return json.dumps(envelope, separators=(",", ":")).encode("ascii")
 
 
-def cli_sync_payload(payload: dict[str, Any]) -> str:
-    raw = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    compressed = gzip.compress(raw, compresslevel=9)
-    if len(compressed) > 192 * 1024:
-        raise RuntimeError("压缩报告超过 192 KB 上限；本地 HTML／JSON 已保留")
-    return base64.urlsafe_b64encode(compressed).rstrip(b"=").decode("ascii")
-
-
-def curl_get_json(
+def curl_post_json(
     url: str,
-    params: dict[str, Any],
+    body: bytes,
     timeout: int = 45,
 ) -> dict[str, Any]:
     command = [
@@ -3215,21 +3196,22 @@ def curl_get_json(
         "--compressed",
         "--connect-timeout", "12",
         "--max-time", str(timeout),
-        "--retry", "3",
+        "--retry", "2",
         "--retry-delay", "1",
-        "--request", "GET",
+        "--request", "POST",
+        "--header", "Content-Type: application/json",
         "--header", "Accept: application/json",
         "--header", "Cache-Control: no-cache",
-        "--user-agent", "Mozilla/5.0 3net-route-cli/RC4.2.18",
-        "--get",
+        "--user-agent", "3net-route-cli/RC4.2.20",
+        "--data-binary", "@-",
+        "--write-out", "\\n%{http_code}",
+        url,
     ]
-    for name, value in params.items():
-        command.extend(["--data-urlencode", f"{name}={value}"])
-    command.extend(["--write-out", "\\n%{http_code}", url])
 
     try:
         completed = subprocess.run(
             command,
+            input=body,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout + 8,
@@ -3265,7 +3247,7 @@ def curl_get_json(
         api_error = str(result.get("error") or "").strip()
         if not api_error:
             api_error = (
-                "站点边缘拒绝了 GET 请求"
+                "站点边缘拒绝了 POST 请求"
                 if status == 403 else
                 "接口未返回可读 JSON"
             )
@@ -3277,72 +3259,40 @@ def curl_get_json(
     return result
 
 
-def curl_chunked_upload(
-    url: str,
-    payload: dict[str, Any],
-    timeout: int = 45,
-) -> dict[str, Any]:
-    encoded = cli_sync_payload(payload)
-    chunk_chars = 1500
-    chunks = [
-        encoded[index:index + chunk_chars]
-        for index in range(0, len(encoded), chunk_chars)
-    ]
-    if not chunks or len(chunks) > 128:
-        raise RuntimeError("报告分段数量超过接口上限；本地 HTML／JSON 已保留")
-
-    upload_id = os.urandom(5).hex()
-    ping = curl_get_json(url, {"action": "ping"}, timeout)
-    if ping.get("transport") != "get-chunks-v1":
-        raise RuntimeError("免 POST 上传通道尚未就绪；本地 HTML／JSON 已保留")
-
-    total = len(chunks)
-    for part, chunk in enumerate(chunks):
-        result = curl_get_json(
-            url,
-            {
-                "action": "chunk",
-                "id": upload_id,
-                "part": part,
-                "total": total,
-                "data": chunk,
-            },
-            timeout,
-        )
-        if result.get("accepted") != part:
-            raise RuntimeError(
-                f"上传第 {part + 1}/{total} 段确认异常；本地 HTML／JSON 已保留"
-            )
-
-    return curl_get_json(
-        url,
-        {
-            "action": "complete",
-            "id": upload_id,
-            "total": total,
-        },
-        timeout,
-    )
-
-
 def publish(report: dict[str, Any]) -> str:
-    try:
-        result = curl_chunked_upload(
-            PUBLIC_REPORT_SYNC_API,
-            public_report_payload(report),
-            45,
-        )
-        for key in ("url", "reportUrl", "report_url", "publicUrl"):
-            if result.get(key):
-                return str(result[key])
-        if result.get("id"):
-            return f"https://china-3net-route-report.souldance4.chatgpt.site/r/{result['id']}"
-        field("公共报告", "上传完成，但接口未返回报告网址；本地 HTML／JSON 已保留", YELLOW)
-        return ""
-    except Exception as exc:
-        detail = re.sub(r"\s+", " ", str(exc)).strip()[:220]
-        field("公共报告", f"上传失败｜{detail}", YELLOW)
-        return ""
+    payload = public_report_payload(report)
+    raw_body = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    attempts = (
+        ("标准 POST", PUBLIC_REPORT_API, raw_body),
+        ("压缩 POST", PUBLIC_REPORT_CLI_API, cli_upload_envelope(payload)),
+    )
+    errors: list[str] = []
+    for label, url, body in attempts:
+        try:
+            result = curl_post_json(url, body, 45)
+            for key in ("url", "reportUrl", "report_url", "publicUrl"):
+                if result.get(key):
+                    return str(result[key])
+            if result.get("id"):
+                return (
+                    "https://china-3net-route-report.souldance4.chatgpt.site"
+                    f"/r/{result['id']}"
+                )
+            errors.append(f"{label} 未返回报告网址")
+        except Exception as exc:
+            detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
+            errors.append(f"{label}：{detail}")
+    field(
+        "公共报告",
+        "上传失败｜" + "；".join(errors)
+        + "；请使用本地 JSON 在报告站浏览器上传",
+        YELLOW,
+    )
+    return ""
 
 
 def main() -> int:
