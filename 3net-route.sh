@@ -107,9 +107,7 @@ python3 /dev/fd/3 3<<'PY'
 from __future__ import annotations
 
 import csv
-import base64
 import datetime as dt
-import gzip
 import html
 import io
 import ipaddress
@@ -3173,17 +3171,6 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def cli_upload_envelope(payload: dict[str, Any]) -> bytes:
-    """Compress and armor the report so route evidence cannot trip edge WAF rules."""
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    compressed = gzip.compress(raw, compresslevel=9, mtime=0)
-    envelope = {
-        "encoding": "gzip+base64",
-        "payload": base64.b64encode(compressed).decode("ascii"),
-    }
-    return json.dumps(envelope, separators=(",", ":")).encode("ascii")
-
-
 def publish(report: dict[str, Any]) -> str:
     """Use the verified IX v1.2.2 transport: one urllib POST to /api/reports."""
     payload = public_report_payload(report)
@@ -3483,17 +3470,14 @@ def main() -> int:
     }
     if SELF_TEST:
         public_payload = public_report_payload(report)
-        upload_envelope = json.loads(cli_upload_envelope(public_payload).decode("ascii"))
-        upload_round_trip = json.loads(
-            gzip.decompress(base64.b64decode(upload_envelope["payload"])).decode("utf-8")
-        )
+        raw_upload_payload = json.dumps(
+            public_payload, ensure_ascii=False
+        ).encode("utf-8")
+        upload_round_trip = json.loads(raw_upload_payload.decode("utf-8"))
         speed_check = public_payload.get("singleThreadSpeed") or {}
         serialized_payload = json.dumps(public_payload, ensure_ascii=False)
-        if (
-            upload_envelope.get("encoding") != "gzip+base64"
-            or upload_round_trip != public_payload
-        ):
-            raise AssertionError("CLI 压缩上传封包无法无损还原")
+        if upload_round_trip != public_payload:
+            raise AssertionError("IX v1.2.2 标准 JSON POST 载荷无法无损还原")
         if (
             not public_payload.get("latencyHeatmap", {}).get("forward")
             or any(
