@@ -29,11 +29,11 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 ---
 
-## RC4.2.23 VPS 双程质量检测
+## RC4.2.24 VPS 双程质量检测
 
 适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量。默认使用北京、上海、广东三网主矩阵；加入 `--extended` 后扩展至合肥、南京、杭州，并生成 HTML、JSON、公共报告及 NodeSeek 格式。
 
-RC4.2.23 将完整测试结束后的自动上报与 `--retry-upload` 收敛为同一条浏览器式路径：直接读取已经落盘的原始 JSON，先取得报告站 Cookie，再以 curl HTTP POST 上传 `/api/reports`。不再把 RC 报告二次转换为另一份公共载荷；自动上报与浏览器选择 JSON 上传使用相同的数据。上传失败时本地 HTML／JSON 仍会保留。
+RC4.2.24 撤回 RC4.2.23 的原始 JSON／Cookie 上传实验，恢复已在 VPS 实机成功的 RC4.2.20 公开载荷：读取落盘 JSON 后先生成脱敏的 `public_report_payload`，再以固定 curl POST 提交 `/api/reports`；必要时使用 `/api/cli-reports` 压缩 POST 备援。完整测试与 `--retry-upload` 共用这条路径，上传失败时本地 HTML／JSON 仍会保留。
 
 终端标题已移除 `░▒▓█` Unicode 渐层块，改为纯 ASCII 分隔线，避免 Windows CMD、SSH 控制台与不同字体产生紫色花屏。脚本不会默认指定 443；未传 `--port` 时会在运行中询问实际 TCP 业务端口。
 
@@ -42,7 +42,7 @@ RC4.2.23 将完整测试结束后的自动上报与 `--retry-upload` 收敛为�
 ### VPS / Linux 一键执行（推荐）
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.23") --extended --speed
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.24") --extended --speed
 ```
 
 运行后按提示输入：
@@ -62,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-> 当前版本：RC4.2.23 RAW-JSON-BROWSER-UPLOAD。公开使用前请自行确认业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.24 RC20-PAYLOAD-RESTORE。公开使用前请自行确认业务端口及当地法律与服务商条款。
 
 ---
 
