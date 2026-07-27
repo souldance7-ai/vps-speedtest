@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.22 IX-V122-POST"
+VERSION="v0.9 RC4.2.23 RAW-JSON-BROWSER-UPLOAD"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.22 IX-V122-POST
+中国三网 VPS 双程质量检测 v0.9 RC4.2.23 RAW-JSON-BROWSER-UPLOAD
 
 用法：
   bash 3net-route.sh
@@ -130,7 +130,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-VERSION = os.environ.get("THREE_NET_VERSION", "v0.9 RC4.2.22 IX-V122-POST")
+VERSION = os.environ.get(
+    "THREE_NET_VERSION",
+    "v0.9 RC4.2.23 RAW-JSON-BROWSER-UPLOAD",
+)
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
 SPEED_TEST = os.environ.get("THREE_NET_SPEED_TEST") == "1"
@@ -3171,46 +3174,156 @@ def public_report_payload(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def publish(report: dict[str, Any]) -> str:
-    """Use the verified IX v1.2.2 transport: one urllib POST to /api/reports."""
-    payload = public_report_payload(report)
-    try:
-        result = http_json(PUBLIC_REPORT_API, "POST", payload, 30)
-        candidates = [result]
-        if isinstance(result, dict):
-            candidates.extend(
-                value for value in result.values() if isinstance(value, dict)
+def public_url_from_response(result: dict[str, Any]) -> str:
+    candidates = [result]
+    candidates.extend(
+        value for value in result.values() if isinstance(value, dict)
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in (
+            "url", "reportUrl", "report_url", "publicUrl", "public_url"
+        ):
+            if candidate.get(key):
+                value = str(candidate[key])
+                return (
+                    value
+                    if value.startswith("http")
+                    else PUBLIC_REPORT_ROOT + value
+                )
+        if candidate.get("id"):
+            return f"{PUBLIC_REPORT_ROOT}/report/{candidate['id']}"
+    return ""
+
+
+def publish_raw_json(raw_body: bytes) -> str:
+    """Upload the on-disk report exactly like the site's browser uploader."""
+    browser_agent = (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/150.0 Safari/537.36"
+    )
+    with tempfile.TemporaryDirectory(prefix="3net-upload-") as temp_dir:
+        cookie_jar = Path(temp_dir) / "cookies.txt"
+        bootstrap = [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--compressed",
+            "--connect-timeout", "10",
+            "--max-time", "20",
+            "--cookie-jar", str(cookie_jar),
+            "--user-agent", browser_agent,
+            "--output", "/dev/null",
+            PUBLIC_REPORT_ROOT + "/",
+        ]
+        subprocess.run(
+            bootstrap,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=24,
+            check=False,
+        )
+        command = [
+            "curl",
+            "--silent",
+            "--show-error",
+            "--compressed",
+            "--connect-timeout", "12",
+            "--max-time", "45",
+            "--retry", "2",
+            "--retry-delay", "1",
+            "--request", "POST",
+            "--header", "Content-Type: application/json",
+            "--header", "Accept: application/json",
+            "--header", f"Origin: {PUBLIC_REPORT_ROOT}",
+            "--referer", PUBLIC_REPORT_ROOT + "/",
+            "--cookie", str(cookie_jar),
+            "--user-agent", browser_agent,
+            "--data-binary", "@-",
+            "--write-out", "\n%{http_code}",
+            PUBLIC_REPORT_API,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                input=raw_body,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=53,
+                check=False,
             )
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            for key in ("url", "reportUrl", "report_url", "publicUrl", "public_url"):
-                if candidate.get(key):
-                    value = str(candidate[key])
-                    return value if value.startswith("http") else PUBLIC_REPORT_ROOT + value
-            if candidate.get("id"):
-                return f"{PUBLIC_REPORT_ROOT}/report/{candidate['id']}"
-        field("公共报告", f"上传响应缺少公共网址｜{str(result)[:220]}", YELLOW)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:360]
-        field("公共报告", f"上传失败｜HTTP {exc.code}｜{detail}", YELLOW)
-    except Exception as exc:
-        field("公共报告", f"上传失败｜{type(exc).__name__}: {exc}", YELLOW)
+        except subprocess.TimeoutExpired:
+            field("公共报告", "上传超时｜本地 HTML／JSON 已保留", YELLOW)
+            return ""
+
+    if completed.returncode != 0:
+        detail = re.sub(
+            r"\s+",
+            " ",
+            completed.stderr.decode("utf-8", "replace"),
+        ).strip()[:220]
+        field(
+            "公共报告",
+            f"上传失败｜curl {completed.returncode}"
+            + (f"｜{detail}" if detail else ""),
+            YELLOW,
+        )
+        return ""
+
+    try:
+        response_body, status_text = completed.stdout.rsplit(b"\n", 1)
+        status = int(status_text.strip())
+    except (ValueError, TypeError):
+        field("公共报告", "上传响应格式异常｜本地 JSON 已保留", YELLOW)
+        return ""
+
+    result: dict[str, Any] = {}
+    if response_body.lstrip().startswith(b"{"):
+        try:
+            parsed = json.loads(response_body.decode("utf-8", "replace"))
+            if isinstance(parsed, dict):
+                result = parsed
+        except json.JSONDecodeError:
+            result = {}
+
+    if not 200 <= status < 300:
+        api_error = str(result.get("error") or "").strip()
+        if not api_error:
+            api_error = re.sub(
+                r"\s+",
+                " ",
+                response_body.decode("utf-8", "replace"),
+            ).strip()[:220]
+        field(
+            "公共报告",
+            f"上传失败｜HTTP {status}"
+            + (f"｜{api_error}" if api_error else ""),
+            YELLOW,
+        )
+        return ""
+
+    public_url = public_url_from_response(result)
+    if public_url:
+        return public_url
+    field("公共报告", f"上传响应缺少公共网址｜{str(result)[:220]}", YELLOW)
     return ""
 
 
 def publish_report_file(json_path: Path) -> str:
-    """Use one JSON-on-disk upload path for retry and completed test runs."""
+    """Use one raw JSON-on-disk path for retry and completed test runs."""
     resolved_path = json_path.expanduser().resolve()
     if not resolved_path.is_file():
         raise RuntimeError(f"找不到已生成的 JSON：{resolved_path}")
     try:
-        stored_report = json.loads(resolved_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw_body = resolved_path.read_bytes()
+        stored_report = json.loads(raw_body.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"无法读取已生成的 JSON：{exc}") from exc
     if not isinstance(stored_report, dict):
         raise RuntimeError("已生成的 JSON 不是有效报告对象")
-    return publish(stored_report)
+    return publish_raw_json(raw_body)
 
 
 def main() -> int:
