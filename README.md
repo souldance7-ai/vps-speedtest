@@ -29,11 +29,11 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 ---
 
-## RC4.2.25 VPS 双程质量检测
+## RC4.2.26 VPS 双程质量检测
 
 适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量。默认使用北京、上海、广东三网主矩阵；加入 `--extended` 后扩展至合肥、南京、杭州，并生成 HTML、JSON、公共报告及 NodeSeek 格式。
 
-RC4.2.25 保留公开载荷与本地完整 HTML／JSON。当 VPS 直传报告站被边缘层返回 403 时，可自动切换到自建受控上传中继。中继使用来源 IP 白名单、HMAC-SHA256 请求签名、三分钟时间窗与 nonce 防重放；只将 JSON 转发到固定报告 API，不是通用 HTTP 代理。
+RC4.2.26 保留公开载荷与本地完整 HTML／JSON，并恢复开源工具应有的零配置上传。脚本先使用与 IX v1.2.2 相同的标准 POST；若机房出口被边缘层拒绝，则自动改用公共 GET 分段通道上传。使用者不需要自建中继，也不需要配置密钥、来源白名单或额外服务器。
 
 终端标题已移除 `░▒▓█` Unicode 渐层块，改为纯 ASCII 分隔线，避免 Windows CMD、SSH 控制台与不同字体产生紫色花屏。脚本不会默认指定 443；未传 `--port` 时会在运行中询问实际 TCP 业务端口。
 
@@ -42,7 +42,7 @@ RC4.2.25 保留公开载荷与本地完整 HTML／JSON。当 VPS 直传报告站
 ### VPS / Linux 一键执行（推荐）
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.25") --extended --speed
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.26") --extended --speed
 ```
 
 运行后按提示输入：
@@ -62,17 +62,15 @@ curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3n
 ssh root@你的VPS_IP "bash -lc 'curl -fsSL https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh -o /root/3net-route.sh && chmod +x /root/3net-route.sh && bash /root/3net-route.sh'"
 ```
 
-### 可选：在可信出口 VPS 建立受控上传中继
+### 已测报告免重跑上传
 
-先在能够正常上传报告的中继 VPS 执行：
+若完整测试已经结束，只需重传现有 JSON，不会重新执行路由、延迟或速度测试：
 
 ```bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/install-upload-relay.sh") --source-ip 被测VPS公网IPv4 --public-host 中继VPS公网IPv4
+bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh?ver=RC4.2.26") --retry-upload "/root/中国三网VPS双程质量报告_YYYYMMDD_HHMMSS.json"
 ```
 
-安装器会输出一条客户端配置命令。只在被测 VPS 执行该命令；之后完整测试与 `--retry-upload` 都会在直传失败时自动使用中继。客户端密钥保存在 `/etc/three-net-upload-relay-client.env`，权限必须保持 `600`。
-
-> 当前版本：RC4.2.25 TPE101-HMAC-RELAY。公开使用前请自行确认业务端口及当地法律与服务商条款。
+> 当前版本：RC4.2.26 ZERO-CONFIG-UPLOAD。公开使用前请自行确认业务端口及当地法律与服务商条款。
 
 ---
 
