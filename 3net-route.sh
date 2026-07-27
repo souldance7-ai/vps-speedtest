@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.24 RC20-PAYLOAD-RESTORE"
+VERSION="v0.9 RC4.2.25 TPE101-HMAC-RELAY"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.24 RC20-PAYLOAD-RESTORE
+中国三网 VPS 双程质量检测 v0.9 RC4.2.25 TPE101-HMAC-RELAY
 
 用法：
   bash 3net-route.sh
@@ -24,6 +24,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   UDP-only 协议端口不能作为本脚本的 TCP 业务端口核对目标。
   --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
   --retry-upload：只重传已生成的 JSON 并取得公共报告网址，不重新执行路由或测速。
+  直传被站点边缘拒绝时，可读取 /etc/three-net-upload-relay-client.env，
+  自动切换到来源白名单＋HMAC-SHA256 签名的受控上传中继。
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   --speed：追加北上广三网公网单线程速度（9 组），约需 4～12 分钟并消耗测速流量。
@@ -63,6 +65,19 @@ while [[ $# -gt 0 ]]; do
     *) echo "[ERROR] 未知参数：$1"; exit 2 ;;
   esac
 done
+
+RELAY_ENV_FILE="${THREE_NET_RELAY_ENV_FILE:-/etc/three-net-upload-relay-client.env}"
+if [[ -r "$RELAY_ENV_FILE" ]]; then
+  RELAY_ENV_META="$(stat -c '%u:%a' "$RELAY_ENV_FILE" 2>/dev/null || true)"
+  if [[ "$RELAY_ENV_META" == "0:600" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$RELAY_ENV_FILE"
+    set +a
+  else
+    echo "[WARN] 已忽略不安全的中继配置：$RELAY_ENV_FILE（必须为 root:root、权限 600）"
+  fi
+fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[ERROR] 找不到 python3；Debian 请先执行：apt-get update && apt-get install -y python3"
@@ -110,6 +125,8 @@ import base64
 import csv
 import datetime as dt
 import gzip
+import hashlib
+import hmac
 import html
 import io
 import ipaddress
@@ -117,6 +134,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -134,7 +152,7 @@ from typing import Any
 
 VERSION = os.environ.get(
     "THREE_NET_VERSION",
-    "v0.9 RC4.2.24 RC20-PAYLOAD-RESTORE",
+    "v0.9 RC4.2.25 TPE101-HMAC-RELAY",
 )
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
@@ -147,6 +165,8 @@ GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
 PUBLIC_REPORT_CLI_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
 PUBLIC_REPORT_ROOT = "https://china-3net-route-report.souldance4.chatgpt.site"
+REPORT_RELAY_URL = os.environ.get("THREE_NET_RELAY_URL", "").strip()
+REPORT_RELAY_SECRET = os.environ.get("THREE_NET_RELAY_SECRET", "").strip()
 TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
 TCPQUALITY_RAW_BASE = (
     "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
@@ -3286,29 +3306,108 @@ def curl_post_json(
     return result
 
 
+def relay_post_json(body: bytes, timeout: int = 50) -> dict[str, Any]:
+    """Send one signed report to the controlled relay without exposing its secret."""
+    if not REPORT_RELAY_URL or not REPORT_RELAY_SECRET:
+        raise RuntimeError("未配置受控中继")
+    if not REPORT_RELAY_URL.startswith(("http://", "https://")):
+        raise RuntimeError("中继地址必须是 HTTP／HTTPS URL")
+    if len(REPORT_RELAY_SECRET) < 32:
+        raise RuntimeError("中继密钥长度不足")
+
+    timestamp = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    signed = f"{timestamp}\n{nonce}\n".encode("ascii") + body
+    signature = hmac.new(
+        REPORT_RELAY_SECRET.encode("utf-8"),
+        signed,
+        hashlib.sha256,
+    ).hexdigest()
+    request = urllib.request.Request(
+        REPORT_RELAY_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+            "User-Agent": "3net-route-relay/RC4.2.25",
+            "X-Relay-Timestamp": timestamp,
+            "X-Relay-Nonce": nonce,
+            "X-Relay-Signature": signature,
+        },
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status = int(response.status)
+            response_body = response.read(1024 * 1024)
+    except urllib.error.HTTPError as exc:
+        status = int(exc.code)
+        response_body = exc.read(1024 * 1024)
+    except Exception as exc:
+        raise RuntimeError(f"中继连接失败｜{exc}") from exc
+
+    try:
+        parsed = json.loads(response_body.decode("utf-8", "replace"))
+        result = parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        result = {}
+    if not 200 <= status < 300:
+        detail = str(result.get("error") or "中继未返回可读 JSON")
+        raise RuntimeError(f"中继 HTTP {status}｜{detail}")
+    if not result:
+        raise RuntimeError("中继上游未返回有效 JSON")
+    return result
+
+
 def publish(report: dict[str, Any]) -> str:
-    """Restore RC4.2.20 public-payload POST, including its compressed fallback."""
+    """Try direct upload, then the signed relay, then the legacy compressed API."""
     payload = public_report_payload(report)
     raw_body = json.dumps(
         payload,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    attempts = (
-        ("标准 POST", PUBLIC_REPORT_API, raw_body),
-        ("压缩 POST", PUBLIC_REPORT_CLI_API, cli_upload_envelope(payload)),
-    )
     errors: list[str] = []
-    for label, url, body in attempts:
-        try:
-            result = curl_post_json(url, body, 45)
-            public_url = public_url_from_response(result)
-            if public_url:
-                return public_url
-            errors.append(f"{label} 未返回报告网址")
-        except Exception as exc:
-            detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
-            errors.append(f"{label}：{detail}")
+    try:
+        result = curl_post_json(PUBLIC_REPORT_API, raw_body, 45)
+        public_url = public_url_from_response(result)
+        if public_url:
+            return public_url
+        errors.append("标准 POST 未返回报告网址")
+    except Exception as exc:
+        detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
+        errors.append(f"标准 POST：{detail}")
+
+    if REPORT_RELAY_URL or REPORT_RELAY_SECRET:
+        if REPORT_RELAY_URL and REPORT_RELAY_SECRET:
+            try:
+                result = relay_post_json(raw_body, 50)
+                public_url = public_url_from_response(result)
+                if public_url:
+                    field("上传通道", "HMAC-SHA256 受控中继", GREEN)
+                    return public_url
+                errors.append("受控中继未返回报告网址")
+            except Exception as exc:
+                detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
+                errors.append(f"受控中继：{detail}")
+        else:
+            errors.append("受控中继配置不完整")
+
+    try:
+        result = curl_post_json(
+            PUBLIC_REPORT_CLI_API,
+            cli_upload_envelope(payload),
+            45,
+        )
+        public_url = public_url_from_response(result)
+        if public_url:
+            return public_url
+        errors.append("压缩 POST 未返回报告网址")
+    except Exception as exc:
+        detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
+        errors.append(f"压缩 POST：{detail}")
     field(
         "公共报告",
         "上传失败｜" + "；".join(errors)
