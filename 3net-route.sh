@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v0.9 RC4.2.25 TPE101-HMAC-RELAY"
+VERSION="v0.9 RC4.2.26 ZERO-CONFIG-UPLOAD"
 SCRIPT_NAME="$(basename "$0")"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-中国三网 VPS 双程质量检测 v0.9 RC4.2.25 TPE101-HMAC-RELAY
+中国三网 VPS 双程质量检测 v0.9 RC4.2.26 ZERO-CONFIG-UPLOAD
 
 用法：
   bash 3net-route.sh
@@ -24,8 +24,8 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   UDP-only 协议端口不能作为本脚本的 TCP 业务端口核对目标。
   --target：仅供高级用法手动覆盖自动识别结果；普通 VPS 本机检测不需要填写。
   --retry-upload：只重传已生成的 JSON 并取得公共报告网址，不重新执行路由或测速。
-  直传被站点边缘拒绝时，可读取 /etc/three-net-upload-relay-client.env，
-  自动切换到来源白名单＋HMAC-SHA256 签名的受控上传中继。
+  公共报告零配置上传：先使用与 IX v1.2.2 相同的标准 POST；
+  若机房出口被边缘拒绝，则自动切换为 GET 分段上传，不需要中继、密钥或白名单。
   默认：北京市／上海市／广州市 × 三网去程＋回程（18 组），恢复成熟北上广主矩阵。
   --extended：追加合肥市／南京市／杭州市，扩展为六地区 36 组。
   --speed：追加北上广三网公网单线程速度（9 组），约需 4～12 分钟并消耗测速流量。
@@ -65,19 +65,6 @@ while [[ $# -gt 0 ]]; do
     *) echo "[ERROR] 未知参数：$1"; exit 2 ;;
   esac
 done
-
-RELAY_ENV_FILE="${THREE_NET_RELAY_ENV_FILE:-/etc/three-net-upload-relay-client.env}"
-if [[ -r "$RELAY_ENV_FILE" ]]; then
-  RELAY_ENV_META="$(stat -c '%u:%a' "$RELAY_ENV_FILE" 2>/dev/null || true)"
-  if [[ "$RELAY_ENV_META" == "0:600" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$RELAY_ENV_FILE"
-    set +a
-  else
-    echo "[WARN] 已忽略不安全的中继配置：$RELAY_ENV_FILE（必须为 root:root、权限 600）"
-  fi
-fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "[ERROR] 找不到 python3；Debian 请先执行：apt-get update && apt-get install -y python3"
@@ -125,8 +112,6 @@ import base64
 import csv
 import datetime as dt
 import gzip
-import hashlib
-import hmac
 import html
 import io
 import ipaddress
@@ -134,7 +119,6 @@ import json
 import math
 import os
 import re
-import secrets
 import shutil
 import signal
 import socket
@@ -152,7 +136,7 @@ from typing import Any
 
 VERSION = os.environ.get(
     "THREE_NET_VERSION",
-    "v0.9 RC4.2.25 TPE101-HMAC-RELAY",
+    "v0.9 RC4.2.26 ZERO-CONFIG-UPLOAD",
 )
 SELF_TEST = os.environ.get("THREE_NET_SELF_TEST") == "1"
 EXTENDED = os.environ.get("THREE_NET_EXTENDED") == "1"
@@ -163,10 +147,8 @@ FORWARD_EVIDENCE_PATH = os.environ.get("THREE_NET_FORWARD_EVIDENCE", "").strip()
 RETRY_UPLOAD_PATH = os.environ.get("THREE_NET_RETRY_UPLOAD", "").strip()
 GLOBALPING_API = "https://api.globalping.io/v1/measurements"
 PUBLIC_REPORT_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/reports"
-PUBLIC_REPORT_CLI_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-reports"
+PUBLIC_REPORT_SYNC_API = "https://china-3net-route-report.souldance4.chatgpt.site/api/cli-sync"
 PUBLIC_REPORT_ROOT = "https://china-3net-route-report.souldance4.chatgpt.site"
-REPORT_RELAY_URL = os.environ.get("THREE_NET_RELAY_URL", "").strip()
-REPORT_RELAY_SECRET = os.environ.get("THREE_NET_RELAY_SECRET", "").strip()
 TCPQUALITY_COMMIT = "5852b9af8a94afe6299f355673f9e2090a55d8c4"
 TCPQUALITY_RAW_BASE = (
     "https://raw.githubusercontent.com/ibsgss/TcpQuality/"
@@ -3220,23 +3202,47 @@ def public_url_from_response(result: dict[str, Any]) -> str:
     return ""
 
 
-def cli_upload_envelope(payload: dict[str, Any]) -> bytes:
-    """RC4.2.20-compatible compressed fallback for edge-sensitive reports."""
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+def post_report_json(
+    payload: dict[str, Any],
+    timeout: int = 30,
+) -> dict[str, Any]:
+    """Use the same urllib POST shape and headers as IX v1.2.2."""
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        PUBLIC_REPORT_API,
+        data=body,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "ix-route/0.1",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        parsed = json.loads(response.read().decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("标准 POST 未返回有效 JSON")
+    return parsed
+
+
+def cli_sync_payload(payload: dict[str, Any]) -> str:
+    """Compress and URL-safe encode one public report for GET chunk upload."""
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     compressed = gzip.compress(raw, compresslevel=9, mtime=0)
-    envelope = {
-        "encoding": "gzip+base64",
-        "payload": base64.b64encode(compressed).decode("ascii"),
-    }
-    return json.dumps(envelope, separators=(",", ":")).encode("ascii")
+    if len(compressed) > 192 * 1024:
+        raise RuntimeError("压缩报告超过 192 KB 上限；本地 HTML／JSON 已保留")
+    return base64.urlsafe_b64encode(compressed).rstrip(b"=").decode("ascii")
 
 
-def curl_post_json(
+def curl_get_json(
     url: str,
-    body: bytes,
+    params: dict[str, Any],
     timeout: int = 45,
 ) -> dict[str, Any]:
-    """Use the exact curl POST signature that succeeded in RC4.2.20."""
     command = [
         "curl",
         "--silent",
@@ -3244,34 +3250,34 @@ def curl_post_json(
         "--compressed",
         "--connect-timeout", "12",
         "--max-time", str(timeout),
-        "--retry", "2",
+        "--retry", "3",
         "--retry-delay", "1",
-        "--request", "POST",
-        "--header", "Content-Type: application/json",
+        "--request", "GET",
         "--header", "Accept: application/json",
         "--header", "Cache-Control: no-cache",
-        "--user-agent", "3net-route-cli/RC4.2.20",
-        "--data-binary", "@-",
-        "--write-out", "\n%{http_code}",
-        url,
+        "--user-agent", "Mozilla/5.0 3net-route-cli/RC4.2.26",
+        "--get",
     ]
+    for name, value in params.items():
+        command.extend(["--data-urlencode", f"{name}={value}"])
+    command.extend(["--write-out", "\n%{http_code}", url])
+
     try:
         completed = subprocess.run(
             command,
-            input=body,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout + 8,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("上传连接超时；本地 HTML／JSON 已保留") from exc
+        raise RuntimeError("GET 分段上传连接超时；本地 HTML／JSON 已保留") from exc
 
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", "replace").strip()
         detail = re.sub(r"\s+", " ", detail)[:160]
         raise RuntimeError(
-            f"上传网络失败（curl {completed.returncode}）"
+            f"GET 分段上传网络失败（curl {completed.returncode}）"
             + (f"｜{detail}" if detail else "")
         )
 
@@ -3279,7 +3285,7 @@ def curl_post_json(
         response_body, status_text = completed.stdout.rsplit(b"\n", 1)
         status = int(status_text.strip())
     except (ValueError, TypeError) as exc:
-        raise RuntimeError("上传接口返回格式异常；本地 HTML／JSON 已保留") from exc
+        raise RuntimeError("GET 分段接口返回格式异常；本地 HTML／JSON 已保留") from exc
 
     result: dict[str, Any] = {}
     if response_body.lstrip().startswith((b"{", b"[")):
@@ -3294,7 +3300,7 @@ def curl_post_json(
         api_error = str(result.get("error") or "").strip()
         if not api_error:
             api_error = (
-                "站点边缘拒绝了 POST 请求"
+                "站点边缘拒绝了 GET 请求"
                 if status == 403 else
                 "接口未返回可读 JSON"
             )
@@ -3302,123 +3308,98 @@ def curl_post_json(
             f"HTTP {status}｜{api_error}；本地 HTML／JSON 已保留"
         )
     if not result:
-        raise RuntimeError("上传接口未返回有效 JSON；本地 HTML／JSON 已保留")
+        raise RuntimeError("GET 分段接口未返回有效 JSON；本地 HTML／JSON 已保留")
     return result
 
 
-def relay_post_json(body: bytes, timeout: int = 50) -> dict[str, Any]:
-    """Send one signed report to the controlled relay without exposing its secret."""
-    if not REPORT_RELAY_URL or not REPORT_RELAY_SECRET:
-        raise RuntimeError("未配置受控中继")
-    if not REPORT_RELAY_URL.startswith(("http://", "https://")):
-        raise RuntimeError("中继地址必须是 HTTP／HTTPS URL")
-    if len(REPORT_RELAY_SECRET) < 32:
-        raise RuntimeError("中继密钥长度不足")
+def curl_chunked_upload(
+    payload: dict[str, Any],
+    timeout: int = 45,
+) -> dict[str, Any]:
+    encoded = cli_sync_payload(payload)
+    chunk_chars = 1500
+    chunks = [
+        encoded[index:index + chunk_chars]
+        for index in range(0, len(encoded), chunk_chars)
+    ]
+    if not chunks or len(chunks) > 128:
+        raise RuntimeError("报告分段数量超过接口上限；本地 HTML／JSON 已保留")
 
-    timestamp = str(int(time.time()))
-    nonce = secrets.token_hex(16)
-    signed = f"{timestamp}\n{nonce}\n".encode("ascii") + body
-    signature = hmac.new(
-        REPORT_RELAY_SECRET.encode("utf-8"),
-        signed,
-        hashlib.sha256,
-    ).hexdigest()
-    request = urllib.request.Request(
-        REPORT_RELAY_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Cache-Control": "no-cache",
-            "User-Agent": "3net-route-relay/RC4.2.25",
-            "X-Relay-Timestamp": timestamp,
-            "X-Relay-Nonce": nonce,
-            "X-Relay-Signature": signature,
-        },
+    upload_id = os.urandom(5).hex()
+    ping = curl_get_json(
+        PUBLIC_REPORT_SYNC_API,
+        {"action": "ping"},
+        timeout,
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            status = int(response.status)
-            response_body = response.read(1024 * 1024)
-    except urllib.error.HTTPError as exc:
-        status = int(exc.code)
-        response_body = exc.read(1024 * 1024)
-    except Exception as exc:
-        raise RuntimeError(f"中继连接失败｜{exc}") from exc
+    if ping.get("transport") != "get-chunks-v1":
+        raise RuntimeError("零配置上传通道尚未就绪；本地 HTML／JSON 已保留")
 
-    try:
-        parsed = json.loads(response_body.decode("utf-8", "replace"))
-        result = parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        result = {}
-    if not 200 <= status < 300:
-        detail = str(result.get("error") or "中继未返回可读 JSON")
-        raise RuntimeError(f"中继 HTTP {status}｜{detail}")
-    if not result:
-        raise RuntimeError("中继上游未返回有效 JSON")
-    return result
+    total = len(chunks)
+    for part, chunk in enumerate(chunks):
+        result = curl_get_json(
+            PUBLIC_REPORT_SYNC_API,
+            {
+                "action": "chunk",
+                "id": upload_id,
+                "part": part,
+                "total": total,
+                "data": chunk,
+            },
+            timeout,
+        )
+        if result.get("accepted") != part:
+            raise RuntimeError(
+                f"上传第 {part + 1}/{total} 段确认异常；本地 HTML／JSON 已保留"
+            )
+
+    return curl_get_json(
+        PUBLIC_REPORT_SYNC_API,
+        {
+            "action": "complete",
+            "id": upload_id,
+            "total": total,
+        },
+        timeout,
+    )
 
 
 def publish(report: dict[str, Any]) -> str:
-    """Try direct upload, then the signed relay, then the legacy compressed API."""
+    """Try the IX-compatible POST, then the public zero-config GET transport."""
     payload = public_report_payload(report)
-    raw_body = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
     errors: list[str] = []
     try:
-        result = curl_post_json(PUBLIC_REPORT_API, raw_body, 45)
+        result = post_report_json(payload, 30)
         public_url = public_url_from_response(result)
         if public_url:
+            field("上传通道", "标准 POST（IX v1.2.2 同方式）", GREEN)
             return public_url
         errors.append("标准 POST 未返回报告网址")
     except Exception as exc:
         detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
         errors.append(f"标准 POST：{detail}")
 
-    if REPORT_RELAY_URL or REPORT_RELAY_SECRET:
-        if REPORT_RELAY_URL and REPORT_RELAY_SECRET:
-            try:
-                result = relay_post_json(raw_body, 50)
-                public_url = public_url_from_response(result)
-                if public_url:
-                    field("上传通道", "HMAC-SHA256 受控中继", GREEN)
-                    return public_url
-                errors.append("受控中继未返回报告网址")
-            except Exception as exc:
-                detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
-                errors.append(f"受控中继：{detail}")
-        else:
-            errors.append("受控中继配置不完整")
-
     try:
-        result = curl_post_json(
-            PUBLIC_REPORT_CLI_API,
-            cli_upload_envelope(payload),
-            45,
-        )
+        result = curl_chunked_upload(payload, 45)
         public_url = public_url_from_response(result)
         if public_url:
+            field("上传通道", "公共 GET 分段通道（零配置）", GREEN)
             return public_url
-        errors.append("压缩 POST 未返回报告网址")
+        errors.append("GET 分段上传未返回报告网址")
     except Exception as exc:
         detail = re.sub(r"\s+", " ", str(exc)).strip()[:160]
-        errors.append(f"压缩 POST：{detail}")
+        errors.append(f"GET 分段：{detail}")
+
     field(
         "公共报告",
         "上传失败｜" + "；".join(errors)
-        + "；请使用本地 JSON 在报告站浏览器上传",
+        + "；本地 HTML／JSON 已保留",
         YELLOW,
     )
     return ""
 
 
 def publish_report_file(json_path: Path) -> str:
-    """Read the saved report, then use the proven RC4.2.20 public payload."""
+    """Read the saved report and use the same zero-config upload path."""
     resolved_path = json_path.expanduser().resolve()
     if not resolved_path.is_file():
         raise RuntimeError(f"找不到已生成的 JSON：{resolved_path}")
@@ -3692,10 +3673,21 @@ def main() -> int:
             public_payload, ensure_ascii=False
         ).encode("utf-8")
         upload_round_trip = json.loads(raw_upload_payload.decode("utf-8"))
+        encoded_sync_payload = cli_sync_payload(public_payload)
+        padded_sync_payload = encoded_sync_payload + (
+            "=" * (-len(encoded_sync_payload) % 4)
+        )
+        sync_round_trip = json.loads(
+            gzip.decompress(
+                base64.urlsafe_b64decode(padded_sync_payload)
+            ).decode("utf-8")
+        )
         speed_check = public_payload.get("singleThreadSpeed") or {}
         serialized_payload = json.dumps(public_payload, ensure_ascii=False)
         if upload_round_trip != public_payload:
             raise AssertionError("IX v1.2.2 标准 JSON POST 载荷无法无损还原")
+        if sync_round_trip != public_payload:
+            raise AssertionError("公共 GET 分段载荷无法无损还原")
         if (
             not public_payload.get("latencyHeatmap", {}).get("forward")
             or any(
