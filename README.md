@@ -73,6 +73,7 @@ bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps
 运行后填写协议实际监听的 TCP 业务端口，不要填写 SSH 端口 `22`。正式／RC 的含测速入口会自动加入 `--extended --speed`，不必再手动输入参数。测试完成后，CMD 会同步显示浅色报告与深色报告链接；网页可切换主题，并分别复制 NodeSeek 浅色高清／深色高清格式。
 
 > 正式版用于日常检测；RC 版用于新功能验证。若未来新增独立工具，只新增文件名，不改动上述四个稳定入口。
+
 ### 下载到 VPS 后执行正式标准版
 
 ```bash
