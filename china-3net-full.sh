@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v1.1.0"
+VERSION="v1.1.1"
 REPORT_ROOT="https://china-3net-route-report.souldance4.chatgpt.site"
 REPORT_API="${REPORT_ROOT}/api/reports"
 OUTPUT_ROOT="${HOME:-/root}/China-3Net-Full-Diagnostic"
@@ -13,7 +13,7 @@ ONLY=""
 
 usage() {
   cat <<'EOF'
-China 3Net 全能体检 v1.1.0
+China 3Net 全能体检 v1.1.1
 
 连续执行：
   1. 3NT 正式含测速版
@@ -163,7 +163,7 @@ run_module() {
 make_self_test_logs() {
   local id title group status rc started elapsed command log
   local rows=(
-    "3nt|3NT 正式含测速版|route|PASS|0|中国电信 CN2 GIA  回程 312.5 Mbps\n中国联通 AS9929  回程 286.8 Mbps\n中国移动 CMIN2  回程 341.2 Mbps"
+    "3nt|3NT 正式含测速版|route|PASS|0|\\033[92m中国电信 CN2 GIA  回程 312.5 Mbps\\033[0m\\n\\033[93m中国联通 AS9929  回程 286.8 Mbps\\033[0m\\n\\033[96m中国移动 CMIN2  回程 341.2 Mbps\\033[0m"
     "ip|IP 质量体检|identity|PASS|0|IP 类型：数据中心\n风险数据库：低风险\n端口：正常"
     "ipv4|Net.Check.Place IPv4|route|PASS|0|IPv4 路由检测完成\n中国三网回程均有结果"
     "latency|Net.Check.Place 延迟模式|latency|PASS|0|中国大陆平均延迟 42.8 ms\n亚洲平均延迟 31.5 ms"
@@ -241,6 +241,7 @@ from pathlib import Path
 ANSI_RE = re.compile(
     r"(?:\x1B\][^\x07]*(?:\x07|\x1B\\))|(?:\x1B[@-_][0-?]*[ -/]*[@-~])"
 )
+SGR_RE = re.compile(r"\\x1b\\[[0-9;]*m")
 IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 PORT_RE = re.compile(r"(?<!\d):(\d{2,5})(?!\d)")
 
@@ -270,13 +271,27 @@ def mask_ipv4(value: str) -> str:
         return value
 
 
-def sanitize(text: str) -> str:
+def sanitize(text: str, keep_sgr: bool = False) -> str:
+    protected: list[str] = []
+    if keep_sgr:
+        def protect_sgr(match: re.Match[str]) -> str:
+            protected.append(match.group(0))
+            return f"\ue000{len(protected) - 1}\ue001"
+        text = SGR_RE.sub(protect_sgr, text)
     text = ANSI_RE.sub("", text).replace("\r", "\n")
     text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
     text = IPV4_RE.sub(lambda match: mask_ipv4(match.group(0)), text)
     text = PORT_RE.sub(lambda match: ":***" if match.group(1) != "443" else ":443", text)
     lines = [line.expandtabs(2).rstrip() for line in text.splitlines()]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if keep_sgr:
+        text = re.sub(
+            r"\ue000(\d+)\ue001",
+            lambda match: protected[int(match.group(1))],
+            text,
+        )
+    return text
+
 
 
 NOISE_RE = re.compile(
@@ -302,7 +317,7 @@ def extract_result(text: str, module_id: str) -> str:
     lines: list[str] = []
     for raw in text.splitlines():
         line = raw.rstrip()
-        compact = line.strip()
+        compact = ANSI_RE.sub("", line).strip()
         if compact and (
             len(compact) > 260
             or NOISE_RE.search(compact)
@@ -316,7 +331,8 @@ def extract_result(text: str, module_id: str) -> str:
 
     marker = -1
     for index, line in enumerate(lines):
-        if any(pattern.search(line) for pattern in REPORT_MARKERS):
+        visible = ANSI_RE.sub("", line)
+        if any(pattern.search(visible) for pattern in REPORT_MARKERS):
             marker = index
 
     selected = lines[marker:] if marker >= 0 else lines[-140:]
@@ -360,10 +376,11 @@ with meta_path.open(encoding="utf-8", newline="") as handle:
     for row in csv.DictReader(handle, delimiter="\t"):
         raw = Path(row["log"]).read_text(encoding="utf-8", errors="replace")
         clean = sanitize(raw)
+        colored = sanitize(raw, keep_sgr=True)
         result = extract_result(clean, row["id"])
+        result_ansi = extract_result(colored, row["id"])
         debug_log = clean[-2000:].strip()
-        modules.append(
-            {
+        module = {
                 "id": row["id"],
                 "title": row["title"],
                 "group": row["group"],
@@ -376,7 +393,9 @@ with meta_path.open(encoding="utf-8", newline="") as handle:
                 "result": result,
                 "log": debug_log,
             }
-        )
+        if "\x1b[" in result_ansi:
+            module["resultAnsi"] = result_ansi
+        modules.append(module)
 
 counts = {
     key: sum(1 for module in modules if module["status"] == key)
@@ -429,6 +448,7 @@ assert report["reportKind"] == "FULL_DIAGNOSTIC"
 assert len(report["diagnostics"]["modules"]) == 8
 assert report["target"].endswith("*.*")
 assert all("summary" in item and "result" in item and "log" in item for item in report["diagnostics"]["modules"])
+assert any("resultAnsi" in item for item in report["diagnostics"]["modules"])
 assert all("SPONSORSPONSOR" not in item["result"] for item in report["diagnostics"]["modules"])
 print("[SELF-TEST] PASS｜八分项、脱敏、最终结果画面与 JSON 结构完成")
 PY
