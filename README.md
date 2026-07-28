@@ -33,43 +33,46 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest
 
 适用于在 VPS 内直接检测中国电信、联通、移动的去程与回程质量，并生成 CMD、HTML、JSON、NodeSeek 与公共报告。脚本不会默认指定 443；未传 `--port` 时会询问协议实际监听的 TCP 业务端口。
 
-### 永久固定的一键入口
+### 四条固定执行指令（永久不变）
 
-以后发布新版本时，只替换下列固定文件的内容，不再把 RC 编号、日期或 `?ver=` 参数写进执行命令。正式版与 RC 版分开维护；新功能先进入 RC，验证后才同步到正式版。若新增独立工具，则新增文件名，不改动既有稳定入口。
+> 以下四条命令均在 **VPS／Linux 的 Bash** 中执行。以后发布正式版或新 RC 时，只更新固定文件内容，命令中的网址与文件名不再更换，也不再加入版本号、日期或 `?ver=` 参数。
 
-| 通道 | 固定文件 | 默认内容 |
-|---|---|---|
-| 正式标准版 | `3net-route.sh` | 北上广三网双程，不执行单线程测速 |
-| 正式含测速版 | `3net-route-speed.sh` | 六地区扩展＋北上广三网9组单线程测速 |
-| RC 标准版 | `3net-route-rc.sh` | 新功能公开验证，不执行单线程测速 |
-| RC 含测速版 | `3net-route-rc-speed.sh` | RC 六地区扩展＋9组单线程测速 |
-
-#### 正式标准版（推荐日常检测）
+#### 1）正式标准版（推荐日常检测）
 
 ```bash
 bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route.sh")
 ```
 
-#### 正式含测速版
+#### 2）正式含测速版
 
 ```bash
 bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-speed.sh")
 ```
 
-#### 开源 RC 标准版
+#### 3）开源 RC 标准版
 
 ```bash
 bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-rc.sh")
 ```
 
-#### 开源 RC 含测速版
+#### 4）开源 RC 含测速版
 
 ```bash
 bash <(curl -fsSL --retry 3 "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-rc-speed.sh")
 ```
 
-运行后填写协议实际监听的 TCP 业务端口，不要填写 SSH 端口 `22`。正式／RC 的含测速入口已固定自动加入 `--extended --speed`，不必再手动输入参数。
+### 固定入口说明
 
+| 通道 | 固定文件 | 默认内容 |
+|---|---|---|
+| 正式标准版 | `3net-route.sh` | 北上广三网双程，不执行单线程测速 |
+| 正式含测速版 | `3net-route-speed.sh` | 六地区扩展＋北上广三网 9 组单线程测速 |
+| RC 标准版 | `3net-route-rc.sh` | 新功能公开验证，不执行单线程测速 |
+| RC 含测速版 | `3net-route-rc-speed.sh` | RC 六地区扩展＋9 组单线程测速 |
+
+运行后填写协议实际监听的 TCP 业务端口，不要填写 SSH 端口 `22`。正式／RC 的含测速入口会自动加入 `--extended --speed`，不必再手动输入参数。测试完成后，CMD 会同步显示浅色报告与深色报告链接；网页可切换主题，并分别复制 NodeSeek 浅色高清／深色高清格式。
+
+> 正式版用于日常检测；RC 版用于新功能验证。若未来新增独立工具，只新增文件名，不改动上述四个稳定入口。
 ### 下载到 VPS 后执行正式标准版
 
 ```bash
