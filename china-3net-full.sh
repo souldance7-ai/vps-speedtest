@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v1.0.0"
+VERSION="v1.0.1"
 REPORT_ROOT="https://china-3net-route-report.souldance4.chatgpt.site"
 REPORT_API="${REPORT_ROOT}/api/reports"
 OUTPUT_ROOT="${HOME:-/root}/China-3Net-Full-Diagnostic"
@@ -13,24 +13,23 @@ ONLY=""
 
 usage() {
   cat <<'EOF'
-China 3Net 全能体检 v1.0.0
+China 3Net 全能体检 v1.0.1
 
 连续执行：
   1. 3NT 正式含测速版
   2. IP 质量体检
-  3. 网络质量体检
-  4. Net.Check.Place IPv4
-  5. Net.Check.Place 延迟模式
-  6. Net.Check.Place 整路由 TCP 大包模式
-  7. Net.Check.Place 默认双栈
-  8. 硬件质量体检
-  9. 流媒体解锁检测（IPv4）
+  3. Net.Check.Place IPv4
+  4. Net.Check.Place 延迟模式
+  5. Net.Check.Place 整路由 TCP 大包模式
+  6. Net.Check.Place 默认双栈
+  7. 硬件质量体检
+  8. 流媒体解锁检测（IPv4）
 
 用法：
   bash china-3net-full.sh
   bash china-3net-full.sh --port 8443 --province 安徽
   bash china-3net-full.sh --province Anhui
-  bash china-3net-full.sh --only 3nt,ip,network,media
+  bash china-3net-full.sh --only 3nt,ip,ipv4,media
   bash china-3net-full.sh --no-publish
   bash china-3net-full.sh --self-test
 
@@ -38,7 +37,7 @@ China 3Net 全能体检 v1.0.0
   --port PORT       3NT 使用的 TCP 业务端口；不是 SSH 22
   --province NAME   整路由模式的大陆省级行政区中文名或中／英文简称
   --only LIST       只执行指定模块，逗号分隔
-                    3nt,ip,network,ipv4,latency,route,dual,hardware,media
+                    3nt,ip,ipv4,latency,route,dual,hardware,media
   --no-publish      只保留本地 JSON 与原始日志，不上传公共报告
   --self-test       离线生成模拟报告并检查结构
   -h, --help        显示帮助
@@ -136,7 +135,7 @@ run_module() {
   started="$(date -Is)"
   epoch_start="$(date +%s)"
 
-  printf '\n\033[96m[%s/9] %s\033[0m\n' "$((MODULE_INDEX += 1))" "$title"
+  printf '\n\033[96m[%s/8] %s\033[0m\n' "$((MODULE_INDEX += 1))" "$title"
   printf '\033[38;5;245m%s\033[0m\n' "$command"
 
   if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 90 "$url" -o "$script"; then
@@ -166,7 +165,6 @@ make_self_test_logs() {
   local rows=(
     "3nt|3NT 正式含测速版|route|PASS|0|中国电信 CN2 GIA  回程 312.5 Mbps\n中国联通 AS9929  回程 286.8 Mbps\n中国移动 CMIN2  回程 341.2 Mbps"
     "ip|IP 质量体检|identity|PASS|0|IP 类型：数据中心\n风险数据库：低风险\n端口：正常"
-    "network|网络质量体检|network|PASS|0|TCP 拥塞控制：BBR\n国际互联：良好\n丢包：0.0%"
     "ipv4|Net.Check.Place IPv4|route|PASS|0|IPv4 路由检测完成\n中国三网回程均有结果"
     "latency|Net.Check.Place 延迟模式|latency|PASS|0|中国大陆平均延迟 42.8 ms\n亚洲平均延迟 31.5 ms"
     "route|Net.Check.Place 整路由 TCP 大包|route|PASS|0|安徽电信／联通／移动 TCP 大包路由完成"
@@ -200,7 +198,6 @@ else
     "https://raw.githubusercontent.com/souldance7-ai/vps-speedtest/main/3net-route-speed.sh" \
     --port "$PORT"
   run_module "ip" "IP 质量体检" "identity" "https://Check.Place" -I
-  run_module "network" "网络质量体检" "network" "https://Check.Place" -N
   run_module "ipv4" "Net.Check.Place IPv4" "route" "https://Net.Check.Place" -4
   run_module "latency" "Net.Check.Place 延迟模式" "latency" "https://Net.Check.Place" -P
   if [[ -n "$PROVINCE" ]]; then
@@ -337,7 +334,7 @@ report = {
     "target": masked_ip,
     "selfTest": os.environ["FULL_DIAG_SELF_TEST"] == "1",
     "mode": "ALL_IN_ONE_CONTINUOUS",
-    "matrix": "3NT＋IP质量＋网络质量＋IPv4＋延迟＋整路由＋双栈＋硬件＋流媒体",
+    "matrix": "3NT＋IP质量＋IPv4＋延迟＋整路由＋双栈＋硬件＋流媒体",
     "bgp": {"asn": "由分项原始结果核对", "provider": "N/A", "location": "N/A"},
     "final": {
         "title": f"全能体检完成｜{counts['PASS']} 项正常／{counts['WARNING']} 项需复核／{counts['SKIPPED']} 项跳过",
@@ -373,10 +370,10 @@ if [[ "$SELF_TEST" -eq 1 ]]; then
 import json, sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 assert report["reportKind"] == "FULL_DIAGNOSTIC"
-assert len(report["diagnostics"]["modules"]) == 9
+assert len(report["diagnostics"]["modules"]) == 8
 assert report["target"].endswith("*.*")
 assert all("summary" in item and "log" in item for item in report["diagnostics"]["modules"])
-print("[SELF-TEST] PASS｜九分项、脱敏、摘要、日志与 JSON 结构完成")
+print("[SELF-TEST] PASS｜八分项、脱敏、摘要、日志与 JSON 结构完成")
 PY
   exit 0
 fi
