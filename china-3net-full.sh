@@ -163,7 +163,7 @@ run_module() {
 make_self_test_logs() {
   local id title group status rc started elapsed command log
   local rows=(
-    "3nt|3NT 正式含测速版|route|PASS|0|\\033[92m中国电信 CN2 GIA  回程 312.5 Mbps\\033[0m\\n\\033[93m中国联通 AS9929  回程 286.8 Mbps\\033[0m\\n\\033[96m中国移动 CMIN2  回程 341.2 Mbps\\033[0m"
+    "3nt|3NT 正式含测速版|route|PASS|0|\033[92m中国电信 CN2 GIA  回程 312.5 Mbps\033[0m\n\033[93m中国联通 AS9929  回程 286.8 Mbps\033[0m\n\033[96m中国移动 CMIN2  回程 341.2 Mbps\033[0m"
     "ip|IP 质量体检|identity|PASS|0|IP 类型：数据中心\n风险数据库：低风险\n端口：正常"
     "ipv4|Net.Check.Place IPv4|route|PASS|0|IPv4 路由检测完成\n中国三网回程均有结果"
     "latency|Net.Check.Place 延迟模式|latency|PASS|0|中国大陆平均延迟 42.8 ms\n亚洲平均延迟 31.5 ms"
@@ -241,7 +241,7 @@ from pathlib import Path
 ANSI_RE = re.compile(
     r"(?:\x1B\][^\x07]*(?:\x07|\x1B\\))|(?:\x1B[@-_][0-?]*[ -/]*[@-~])"
 )
-SGR_RE = re.compile(r"\\x1b\\[[0-9;]*m")
+SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 IPV4_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 PORT_RE = re.compile(r"(?<!\d):(\d{2,5})(?!\d)")
 
