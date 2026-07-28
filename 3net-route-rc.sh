@@ -3202,6 +3202,21 @@ def public_url_from_response(result: dict[str, Any]) -> str:
     return ""
 
 
+def show_public_report_links(public_url: str) -> None:
+    """Print synchronized light and dark report URLs after upload."""
+    dark_url = public_url.rstrip("/")
+    if dark_url.endswith("/readable"):
+        dark_url = dark_url[:-len("/readable")]
+    readable_url = f"{dark_url}/readable"
+    field("浅色报告", readable_url, GREEN)
+    field("深色报告", dark_url, CYAN)
+    field(
+        "页面切换",
+        "网页内可随时切换浅色／深色；NodeSeek 提供浅色高清与深色高清两套格式",
+        GRAY,
+    )
+
+
 def post_report_json(
     payload: dict[str, Any],
     timeout: int = 30,
@@ -3422,7 +3437,7 @@ def main() -> int:
         public_url = publish_report_file(retry_path)
         if not public_url:
             return 8
-        field("公共报告", public_url, GREEN)
+        show_public_report_links(public_url)
         return 0
     if SELF_TEST:
         exit_ip, exit_identity = "45.207.225.70", "SELF-TEST VPS"
@@ -3720,7 +3735,7 @@ def main() -> int:
     if not SELF_TEST:
         public_url = publish_report_file(json_path)
         if public_url:
-            field("公共报告", public_url, GREEN)
+            show_public_report_links(public_url)
     else:
         field(
             "SELF-TEST",
