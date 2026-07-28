@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="v1.0.1"
+VERSION="v1.1.0"
 REPORT_ROOT="https://china-3net-route-report.souldance4.chatgpt.site"
 REPORT_API="${REPORT_ROOT}/api/reports"
 OUTPUT_ROOT="${HOME:-/root}/China-3Net-Full-Diagnostic"
@@ -13,7 +13,7 @@ ONLY=""
 
 usage() {
   cat <<'EOF'
-China 3Net 全能体检 v1.0.1
+China 3Net 全能体检 v1.1.0
 
 连续执行：
   1. 3NT 正式含测速版
@@ -45,7 +45,7 @@ China 3Net 全能体检 v1.0.1
 说明：
   本工具是独立入口，不修改 3net-route.sh、RC 或 ix-route.sh。
   每个上游脚本在运行时下载并独立执行；单项失败不会阻断后续体检。
-  公共报告仅保存遮罩 IP、分项摘要及截断后的脱敏日志，不保存 SSH 凭据。
+  公共报告只展示各原脚本完成后的最终结果；安装、广告与进度噪声不进入正文。
 EOF
 }
 
@@ -271,31 +271,86 @@ def mask_ipv4(value: str) -> str:
 
 
 def sanitize(text: str) -> str:
-    text = ANSI_RE.sub("", text).replace("\r", "")
+    text = ANSI_RE.sub("", text).replace("\r", "\n")
     text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
     text = IPV4_RE.sub(lambda match: mask_ipv4(match.group(0)), text)
     text = PORT_RE.sub(lambda match: ":***" if match.group(1) != "443" else ":443", text)
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
-    lines = [line for line in lines if line and not re.fullmatch(r"[-=━─┄┅┈┉━░▒▓█ ]+", line)]
+    lines = [line.expandtabs(2).rstrip() for line in text.splitlines()]
     return "\n".join(lines)
+
+
+NOISE_RE = re.compile(
+    r"^(?:WARNING: apt does not have a stable CLI|Hit:\d+|Get:\d+|Ign:\d+|Err:\d+|"
+    r"Reading package lists|Building dependency tree|Reading state information|Fetched |"
+    r"Selecting previously unselected|Preparing to unpack|Unpacking |Setting up |Processing triggers|"
+    r"Lacking necessary dependencies|Packages .+ will be installed|Application .+ will be|"
+    r"Detected parameter|Continue installation|Continue to execute script|"
+    r"(?:SPONSOR|LISTAHOST|RAPIDPROXY){2,})",
+    re.I,
+)
+PROGRESS_RE = re.compile(r"正在检测.*(?:\d{1,3}%|[▏▎▍▌▋▊▉█])", re.I)
+REPORT_MARKERS = (
+    re.compile(r"(?:IP|网络|硬件)质量体检报告", re.I),
+    re.compile(r"(?:NET|IP|HARDWARE) QUALITY CHECK REPORT", re.I),
+    re.compile(r"流媒体(?:解锁|平台)检测", re.I),
+    re.compile(r"三网.*(?:检测|测速|报告|结论)", re.I),
+    re.compile(r"CHINA 3NET|FINAL VERDICT|综合结论", re.I),
+)
+
+
+def extract_result(text: str, module_id: str) -> str:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        compact = line.strip()
+        if compact and (
+            len(compact) > 260
+            or NOISE_RE.search(compact)
+            or PROGRESS_RE.search(compact)
+            or "请选择脚本功能" in compact
+            or "选择IPv4/IPv6检测类型" in compact
+            or re.fullmatch(r"([A-Z]{4,})\1{2,}", compact)
+        ):
+            continue
+        lines.append(line)
+
+    marker = -1
+    for index, line in enumerate(lines):
+        if any(pattern.search(line) for pattern in REPORT_MARKERS):
+            marker = index
+
+    selected = lines[marker:] if marker >= 0 else lines[-140:]
+    while selected and not selected[0].strip():
+        selected.pop(0)
+    while selected and not selected[-1].strip():
+        selected.pop()
+    collapsed: list[str] = []
+    for line in selected:
+        if line.strip() or (collapsed and collapsed[-1].strip()):
+            collapsed.append(line)
+    selected = collapsed[:180]
+    result = "\n".join(selected).strip()
+    if not result:
+        result = "该分项未取得可展示的最终结果。"
+    if len(result) > 18000:
+        result = result[:17800].rstrip() + "\n\n[最终结果过长，公开版已截断]"
+    return result
 
 
 def summarize(text: str) -> list[str]:
     keywords = re.compile(
-        r"(PASS|FAIL|WARNING|YES|NO|支持|解锁|风险|延迟|丢包|抖动|"
+        r"(PASS|FAIL|WARNING|YES|NO|支持|解锁|风险|原生|广播|家宽|机房|延迟|丢包|抖动|"
         r"CN2|AS9929|CMIN2|CMI2|Mbps|Gbps|CPU|内存|磁盘|IPv4|IPv6|"
         r"Netflix|Disney|YouTube|ChatGPT|OpenAI)",
         re.I,
     )
-    lines = [line for line in text.splitlines() if 3 <= len(line) <= 180]
     selected: list[str] = []
-    for line in lines:
-        if keywords.search(line) and line not in selected:
-            selected.append(line)
-        if len(selected) >= 8:
+    for line in text.splitlines():
+        compact = re.sub(r"\s{2,}", " ", line).strip()
+        if 4 <= len(compact) <= 160 and keywords.search(compact) and compact not in selected:
+            selected.append(compact)
+        if len(selected) >= 6:
             break
-    if not selected:
-        selected = lines[:6]
     return selected
 
 
@@ -305,8 +360,8 @@ with meta_path.open(encoding="utf-8", newline="") as handle:
     for row in csv.DictReader(handle, delimiter="\t"):
         raw = Path(row["log"]).read_text(encoding="utf-8", errors="replace")
         clean = sanitize(raw)
-        if len(clean) > 12000:
-            clean = clean[:11800].rstrip() + "\n\n[公开报告日志已截断；完整原始日志保留在被测 VPS]"
+        result = extract_result(clean, row["id"])
+        debug_log = clean[-2000:].strip()
         modules.append(
             {
                 "id": row["id"],
@@ -317,8 +372,9 @@ with meta_path.open(encoding="utf-8", newline="") as handle:
                 "started": row["started"],
                 "elapsedSeconds": int(row["elapsed"]),
                 "command": row["command"],
-                "summary": summarize(clean),
-                "log": clean,
+                "summary": summarize(result),
+                "result": result,
+                "log": debug_log,
             }
         )
 
@@ -351,7 +407,7 @@ report = {
         "elapsedSeconds": int(os.environ["FULL_DIAG_ELAPSED"]),
         "counts": counts,
         "modules": modules,
-        "privacy": "IPv4 仅保留前两段；非 443 端口统一显示为 ***；不上传 SSH 凭据。",
+        "privacy": "正文仅展示原脚本最终结果；IPv4 保留前两段；非 443 端口显示为 ***；不上传 SSH 凭据。",
     },
 }
 
@@ -372,8 +428,9 @@ report = json.load(open(sys.argv[1], encoding="utf-8"))
 assert report["reportKind"] == "FULL_DIAGNOSTIC"
 assert len(report["diagnostics"]["modules"]) == 8
 assert report["target"].endswith("*.*")
-assert all("summary" in item and "log" in item for item in report["diagnostics"]["modules"])
-print("[SELF-TEST] PASS｜八分项、脱敏、摘要、日志与 JSON 结构完成")
+assert all("summary" in item and "result" in item and "log" in item for item in report["diagnostics"]["modules"])
+assert all("SPONSORSPONSOR" not in item["result"] for item in report["diagnostics"]["modules"])
+print("[SELF-TEST] PASS｜八分项、脱敏、最终结果画面与 JSON 结构完成")
 PY
   exit 0
 fi
