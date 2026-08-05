@@ -34,6 +34,7 @@ bash -c '
   [[ "$safe" != */* && -n "$safe" ]]
 ' _ "$PANEL"
 
+if python3 -c 'import yaml' >/dev/null 2>&1; then
 python3 - "${TEST_ROOT}/exports/HuRi-Mieru-FLClash.yaml" <<'PY'
 import sys
 import yaml
@@ -50,6 +51,16 @@ assert groups["🇯🇵 沪日轮巡"]["strategy"] == "round-robin"
 assert groups["🇯🇵 沪日并发"]["strategy"] == "consistent-hashing"
 assert data["rules"] == ["MATCH,🇯🇵 沪日节点"]
 PY
+else
+  grep -q 'server: "2001:db8::10"' "${TEST_ROOT}/exports/HuRi-Mieru-FLClash.yaml" || \
+    fail 'generated YAML is missing the IPv6 node'
+  grep -q 'password: "p#ss:&word-123456"' "${TEST_ROOT}/exports/HuRi-Mieru-FLClash.yaml" || \
+    fail 'generated YAML did not quote a special-character password'
+  grep -q 'strategy: round-robin' "${TEST_ROOT}/exports/HuRi-Mieru-FLClash.yaml" || \
+    fail 'generated YAML is missing round-robin'
+  grep -q 'strategy: consistent-hashing' "${TEST_ROOT}/exports/HuRi-Mieru-FLClash.yaml" || \
+    fail 'generated YAML is missing consistent-hashing'
+fi
 
 grep -q 'p%23ss%3A%26word-123456' "${TEST_ROOT}/exports/HuRi-Mieru-ShareLinks.txt" || \
   fail 'share link credentials were not URI encoded'

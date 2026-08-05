@@ -1013,7 +1013,12 @@ EOF
   chmod 0600 "$server_conf" "$client_conf"
   tmp_psk="$(mktemp /tmp/huri-psk.XXXXXX)"; register_temp "$tmp_psk"
   printf '%s\n' "$psk" > "$tmp_psk"; chmod 0600 "$tmp_psk"
-  wg set "$iface" peer "$client_pub" preshared-key "$tmp_psk" allowed-ips "${address}/32"
+  if ip link show "$iface" >/dev/null 2>&1; then
+    wg set "$iface" peer "$client_pub" preshared-key "$tmp_psk" allowed-ips "${address}/32"
+  else
+    info "接口 $iface 当前未运行，将从已更新的持久配置启动。"
+    systemctl enable --now "wg-quick@${iface}"
+  fi
   store_wg_peer "$iface" "$name" "$address" "$client_pub" "$client_conf"
   ok "客户端已加入：$name / $address"
   ok "配置文件：$client_conf"
