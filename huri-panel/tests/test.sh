@@ -17,6 +17,19 @@ bash -n "$PANEL"
 bash -n "$INSTALLER"
 NO_COLOR=1 bash "$PANEL" --self-test | grep -q '^PASS '
 
+wide_preview="$(NO_COLOR=1 COLUMNS=96 HURI_PREVIEW_PUBLIC_IP=203.0.113.10 bash "$PANEL" --preview-ui)"
+grep -q '██╗  ██╗' <<<"$wide_preview" || fail 'wide ANSI logo is missing'
+grep -q '即时动态硬件监控' <<<"$wide_preview" || fail 'wide hardware status panel is missing'
+grep -q '专线网络与服务参数' <<<"$wide_preview" || fail 'wide network status panel is missing'
+grep -q '203.0.113.10' <<<"$wide_preview" || fail 'preview public IP override is missing'
+
+compact_preview="$(NO_COLOR=1 COLUMNS=70 HURI_PREVIEW_PUBLIC_IP=203.0.113.10 bash "$PANEL" --preview-ui)"
+grep -q 'H U R I   L I N K   C O N S O L E' <<<"$compact_preview" || \
+  fail 'compact header fallback is missing'
+if grep -q '即时动态硬件监控' <<<"$compact_preview"; then
+  fail 'compact header did not collapse below 78 columns'
+fi
+
 HURI_LIB_ONLY=1 \
 HURI_CONFIG_DIR="${TEST_ROOT}/etc" \
 HURI_STATE_DIR="${TEST_ROOT}/state" \
@@ -73,6 +86,7 @@ grep -q 'strategy: consistent-hashing' "$PANEL" || fail 'missing consistent-hash
 grep -q 'PersistentKeepalive = 25' "$PANEL" || fail 'missing NAT keepalive'
 grep -q 'ix-route.sh' "$PANEL" || fail 'missing IX tool link'
 grep -q '3net-route-speed.sh' "$PANEL" || fail 'missing China3Net speed link'
+grep -q -- '--preview-ui' "$PANEL" || fail 'missing UI preview mode'
 
 if grep -Eq -- '-----BEGIN (RSA |OPENSSH |EC )?PRIVATE KEY-----|PrivateKey[[:space:]]*=[[:space:]]*[A-Za-z0-9+/]{40,}' \
   "$PANEL" "$INSTALLER" "$ROOT_DIR/README.md"; then
