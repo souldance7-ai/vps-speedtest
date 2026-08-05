@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 APP_NAME="HuRi Link Console"
 REPOSITORY="souldance7-ai/vps-speedtest"
 RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/main/huri-panel"
@@ -149,6 +149,21 @@ valid_port() {
   is_integer "${1:-}" && (( 10#$1 >= 1025 && 10#$1 <= 65535 ))
 }
 
+valid_port_range() {
+  local value="${1:-}" start end
+  [[ "$value" =~ ^([0-9]{4,5})-([0-9]{4,5})$ ]] || return 1
+  start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+  valid_port "$start" && valid_port "$end" && (( 10#$start <= 10#$end ))
+}
+
+port_in_declared_range() {
+  local port="${1:-}" range="${2:-}" start end
+  valid_port "$port" && valid_port_range "$range" || return 1
+  [[ "$range" =~ ^([0-9]{4,5})-([0-9]{4,5})$ ]] || return 1
+  start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+  (( 10#$port >= 10#$start && 10#$port <= 10#$end ))
+}
+
 valid_mtu() {
   is_integer "${1:-}" && (( 10#$1 >= 1280 && 10#$1 <= 1500 ))
 }
@@ -174,6 +189,24 @@ valid_prefix24() {
   [[ "$value" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
   a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"; c="${BASH_REMATCH[3]}"
   (( 10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 ))
+}
+
+choose_huri_entry_type() {
+  local __label_var="$1" choice selected_label
+  printf '\n%s请对照商家后台“网络信息”选择客户端实际连接的入口：%s\n' "$BCYAN" "$RESET"
+  printf '  1. 移动入口（China Mobile）\n'
+  printf '  2. 外部连接 IP\n'
+  printf '  3. 其他商家明确分配的公网入口／域名\n'
+  printf '%s说明：商家后台通常只显示入口，不显示日本固定出口；出口由 VPS 出站实测，%s\n' "$BYELLOW" "$RESET"
+  printf '%s      或在客户端连接 Mieru 后通过网络检测验证，不能反填为节点入口。%s\n' "$BYELLOW" "$RESET"
+  ask choice "选择入口类型" "1"
+  case "$choice" in
+    1) selected_label="移动入口（China Mobile）" ;;
+    2) selected_label="外部连接 IP" ;;
+    3) selected_label="其他商家公网入口" ;;
+    *) warn "入口类型只能选择 1、2 或 3。"; return 1 ;;
+  esac
+  printf -v "$__label_var" '%s' "$selected_label"
 }
 
 require_root() {
@@ -371,7 +404,7 @@ draw_compact_header() {
     "$BOLD" "$FIRE_RED" "$RESET" "$BOLD$FIRE_AMBER" "$RESET" "$BORDER_GRAY" "$RESET" "$BOLD$FIRE_WHITE" "$RESET"
   printf '%s沪日合规隧道交付控制台%s  D%s · Mieru %s · WG %s套 · v%s%s\n' \
     "$TEXT_GRAY" "$RESET" "$major" "$mita_s" "$wg_s" "$VERSION" "$privacy_badge"
-  printf '%s本机%s %s  %s公网%s %s\n' "$BORDER_GRAY" "$RESET" "$display_local" "$BORDER_GRAY" "$RESET" "$display_pub"
+  printf '%s本机%s %s  %s实测出口%s %s\n' "$BORDER_GRAY" "$RESET" "$display_local" "$BORDER_GRAY" "$RESET" "$display_pub"
   ui_rule "$width" "$BORDER_GRAY"
 }
 
@@ -419,7 +452,7 @@ draw_dashboard_header() {
     "$(( (width - 52) / 2 ))" '' "$BOLD" "$FIRE_AMBER" "$RESET"
   ui_rule "$width" "$BORDER_GRAY"
   status_split_row "${BOLD}${FIRE_AMBER}▣  即时动态硬件监控${RESET}" "${BOLD}${FIRE_AMBER}◎  专线网络与服务参数${RESET}" "$split"
-  status_split_row "${TEXT_GRAY}•${RESET} 主机：${BWHITE}${display_host}${RESET}" "${TEXT_GRAY}•${RESET} 公网：${BWHITE}${display_pub}${RESET}" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 主机：${BWHITE}${display_host}${RESET}" "${TEXT_GRAY}•${RESET} 实测出口：${BWHITE}${display_pub}${RESET}" "$split"
   status_split_row "${TEXT_GRAY}•${RESET} 系统：D${major} / ${kernel}" "${TEXT_GRAY}•${RESET} 本机：${display_local}" "$split"
   status_split_row "${TEXT_GRAY}•${RESET} 处理器：${cpu} vCPU / ${arch}" "${TEXT_GRAY}•${RESET} 接入：${iface} / ${net_mode}" "$split"
   status_split_row "${TEXT_GRAY}•${RESET} 内存：${mem}" "${TEXT_GRAY}•${RESET} TCP：${cc} / ${qdisc}" "$split"
@@ -489,7 +522,7 @@ health_check() {
     printf '============================================================\n'
     printf '系统：%s\n内核：%s\n架构：%s\n虚拟化：%s\n' "$os" "$kernel" "$arch" "$virt"
     printf 'CPU：%s vCPU\n内存：%s\n磁盘：%s\n运行时间：%s\n' "$cpu" "$mem" "$disk" "$uptime_value"
-    printf '默认网卡：%s\n本机 IPv4：%s\n公网 IPv4：%s\nNAT：%s\n' "$iface" "${lip:-unknown}" "${pip:-unknown}" "$nat"
+    printf '默认网卡：%s\n本机／内网 IPv4：%s\n实测日本 BGP 出口 IPv4：%s\nNAT：%s\n' "$iface" "${lip:-unknown}" "${pip:-unknown}" "$nat"
     printf 'TCP 拥塞控制：%s\n默认队列：%s\n时间同步：%s\n' "$cc" "$qdisc" "$sync"
     printf 'Mieru：%s\nWireGuard 实例：%s\n' "$(mita_status_short)" "$(wg_instance_count)"
     printf 'IPv4 转发：%s\n' "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || printf 'unknown')"
@@ -500,7 +533,7 @@ health_check() {
 
   printf '\n'
   [[ "$sync" == "yes" ]] || warn "系统时间未确认同步。Mieru 密钥计算依赖系统时间，部署前应先校时。"
-  [[ "$nat" == "否" ]] || warn "检测到 NAT/内网地址：客户端必须填写商家公网 IP 与公网端口，不能填写本机内网地址。"
+  [[ "$nat" == "否" ]] || warn "检测到 NAT/内网地址：出口公网 IP 不等于可入站地址；客户端必须填写商家后台的移动入口／外部连接 IP 与映射端口。"
   ok "体检报告已保存：$report"
   PUBLIC_IP_CACHE="$pip"
   pause_screen
@@ -697,7 +730,8 @@ configure_mieru_server() {
     fi
   fi
 
-  local existing node_name endpoint mapping_count username generated_password password mtu
+  local existing node_name endpoint endpoint_label port_range detected_egress local_ip
+  local mapping_count username generated_password password mtu
   local i public_port local_port transport ports_json mappings_json config tmp backup_file node_label
   existing="$(mita describe config 2>/dev/null || true)"
   if [[ -n "$existing" && "$existing" != *'{}'* ]]; then
@@ -708,9 +742,22 @@ configure_mieru_server() {
   ask node_name "节点名称" "沪日-Mieru"
   [[ -n "$node_name" && ${#node_name} -le 80 && ! "$node_name" =~ $'\n' ]] || \
     { warn "节点名称无效或超过 80 个字符。"; pause_screen; return; }
-  endpoint="$(public_ipv4)"
-  ask endpoint "客户端使用的公网 IP / 域名" "${endpoint:-}"
-  valid_host "$endpoint" || { warn "公网地址格式无效。"; pause_screen; return; }
+  detected_egress="$(public_ipv4)"; detected_egress="${detected_egress:---}"
+  local_ip="$(local_ipv4 2>/dev/null || true)"; local_ip="${local_ip:---}"
+  printf '\n实测日本 BGP 固定出口：%s\n' "$detected_egress"
+  printf '  该地址由 VPS 出站查询获得，商家后台通常不显示；连接 Mieru 后也可用网络检测验证。\n'
+  printf '  它仅作出站参考，不自动填入节点 server。\n'
+  printf 'VDS 本机／内网地址：%s\n' "$local_ip"
+  choose_huri_entry_type endpoint_label || { pause_screen; return; }
+  ask endpoint "${endpoint_label}（对应商家后台同名 IP／域名）" ""
+  valid_host "$endpoint" || { warn "入口地址格式无效。"; pause_screen; return; }
+  warn "后台“SSH 端口”只用于管理登录；请另选商家确认可用的业务端口。"
+  ask port_range "商家后台“可用端口范围”（格式示例：30000-30099；无默认值）" ""
+  valid_port_range "$port_range" || { warn "端口范围格式无效，必须类似 30000-30099，且上下限为 1025-65535。"; pause_screen; return; }
+  if [[ "$local_ip" != "--" && "$detected_egress" != "--" && "$local_ip" != "$detected_egress" && "$endpoint" == "$detected_egress" ]]; then
+    warn "你填写的是检测到的日本 BGP 出口；NAT 套餐通常不能把它当作客户端入口。"
+    confirm "商家是否明确确认该出口地址也支持入站映射？" "N" || { pause_screen; return; }
+  fi
   ask mapping_count "端口映射数量（1-8）" "1"
   is_integer "$mapping_count" && ((mapping_count >= 1 && mapping_count <= 8)) || \
     { warn "端口映射数量必须为 1-8。"; pause_screen; return; }
@@ -729,8 +776,9 @@ configure_mieru_server() {
   ports_json='[]'; mappings_json='[]'
   for ((i=1; i<=mapping_count; i++)); do
     printf '\n%s第 %s 组端口映射%s\n' "$BMAGENTA" "$i" "$RESET"
-    ask public_port "商家公网端口（客户端填写）" "$((10502 + i))"
-    valid_port "$public_port" || { warn "公网端口必须为 1025-65535。"; pause_screen; return; }
+    ask public_port "商家公网业务端口（必须位于 ${port_range}）" ""
+    port_in_declared_range "$public_port" "$port_range" || \
+      { warn "公网端口必须位于商家后台显示的 ${port_range} 范围内。"; pause_screen; return; }
     public_port=$((10#$public_port))
     ask local_port "VDS 本机监听端口（同端映射直接回车）" "$public_port"
     valid_port "$local_port" || { warn "本机端口必须为 1025-65535。"; pause_screen; return; }
@@ -758,9 +806,15 @@ configure_mieru_server() {
   backup_file="$(backup_mita_description)"
   install -m 0600 "$tmp" "${CONFIG_DIR}/mita-$(stamp).json"
 
-  printf '\n将写入以下本机监听：\n'
-  jq -r '.[] | "  - \(.localPort)/\(.protocol)  ← 公网 \(.publicPort)/\(.protocol)"' <<<"$mappings_json"
-  printf '公网端点：%s\n' "$endpoint"
+  printf '\n%s请按商家后台中文字段核对：%s\n' "$BCYAN" "$RESET"
+  printf '  客户端入口类型：%s\n' "$endpoint_label"
+  printf '  客户端入口地址：%s\n' "$endpoint"
+  printf '  后台可用端口范围：%s\n' "$port_range"
+  jq -r '.[] | "  端口映射：客户端公网 \(.publicPort)/\(.protocol) → VDS 本机 \(.localPort)/\(.protocol)"' <<<"$mappings_json"
+  printf '  VDS 本机／内网：%s\n' "$local_ip"
+  printf '  实测日本 BGP 固定出口：%s（后台可能不显示；出站使用，不写入客户端 server）\n' "$detected_egress"
+  printf '\n'
+  confirm "商家是否确认以上入口与每个 TCP／UDP 映射均已开放？" "N" || { pause_screen; return; }
   confirm "确认应用以上 Mieru 配置？" "N" || { pause_screen; return; }
 
   mita apply config "$tmp"
@@ -980,13 +1034,17 @@ next_wg_iface() {
 
 store_wg_instance() {
   local iface="$1" endpoint="$2" public_port="$3" local_port="$4" prefix="$5" server_pub="$6" mtu="$7" out_iface="$8"
+  local endpoint_label="${9:-商家公网入口}" port_range="${10:-未记录}" egress_ip="${11:-}" local_ip="${12:-}"
   local tmp created
   created="$(date --iso-8601=seconds)"; tmp="$(mktemp /tmp/huri-wg-state.XXXXXX)"; register_temp "$tmp"
   jq --arg iface "$iface" --arg endpoint "$endpoint" --argjson publicPort "$public_port" \
     --argjson localPort "$local_port" --arg prefix "$prefix" --arg serverPublicKey "$server_pub" \
-    --argjson mtu "$mtu" --arg outboundInterface "$out_iface" --arg created "$created" \
+    --argjson mtu "$mtu" --arg outboundInterface "$out_iface" --arg endpointLabel "$endpoint_label" \
+    --arg declaredPortRange "$port_range" --arg egressIp "$egress_ip" --arg localIp "$local_ip" \
+    --arg created "$created" \
     '. + [{interface:$iface,endpoint:$endpoint,publicPort:$publicPort,localPort:$localPort,
       prefix:$prefix,serverPublicKey:$serverPublicKey,mtu:$mtu,outboundInterface:$outboundInterface,
+      endpointLabel:$endpointLabel,declaredPortRange:$declaredPortRange,egressIp:$egressIp,localIp:$localIp,
       createdAt:$created}]' "$WG_STATE_FILE" > "$tmp"
   install -m 0600 "$tmp" "$WG_STATE_FILE"
 }
@@ -1005,24 +1063,48 @@ store_wg_peer() {
 create_wireguard_server() {
   action_header "新购交机：建立 WireGuard 节点"
   rule_wall
-  printf '\nWireGuard 使用 UDP。请先确认该套餐给你的公网 UDP 端口及其本机映射。\n'
+  printf '\nWireGuard 只使用 UDP。脚本不能从商家网页自动读取入口或端口范围。\n'
+  printf '请把后台“外部连接 IP／移动入口／可用端口范围”与本机映射逐项对照填写。\n'
   confirm "继续建立新 WireGuard 实例与首个客户端？" "N" || { pause_screen; return; }
   install_wireguard_packages
   ensure_layout
   install -d -m 0700 /etc/wireguard "${EXPORT_DIR}/WireGuard"
 
-  local iface index endpoint public_port local_port prefix mtu out_iface client_name client_file_name dns
+  local iface index endpoint endpoint_label port_range detected_egress local_ip
+  local public_port local_port prefix mtu out_iface client_name client_file_name dns
   local server_priv server_pub client_priv client_pub psk server_conf client_conf tmp_server tmp_client
   iface="$(next_wg_iface)"; index="${iface##*huri}"
-  endpoint="$(public_ipv4)"; ask endpoint "客户端使用的公网 IP / 域名" "${endpoint:-}"
-  valid_host "$endpoint" || { warn "公网地址无效。"; pause_screen; return; }
-  ask public_port "商家公网 UDP 端口" "$((20000 + index))"
-  valid_port "$public_port" || { warn "端口必须为 1025-65535。"; pause_screen; return; }
+  detected_egress="$(public_ipv4)"; detected_egress="${detected_egress:---}"
+  local_ip="$(local_ipv4 2>/dev/null || true)"; local_ip="${local_ip:---}"
+  printf '\n实测日本 BGP 固定出口：%s\n' "$detected_egress"
+  printf '  该地址由 VPS 出站查询获得，商家后台通常不显示；连接隧道后可用网络检测验证。\n'
+  printf '  它仅作出站参考，不自动填入 Endpoint。\n'
+  printf 'VDS 本机／内网地址：%s\n' "$local_ip"
+  choose_huri_entry_type endpoint_label || { pause_screen; return; }
+  ask endpoint "${endpoint_label}（对应商家后台同名 IP／域名）" ""
+  valid_host "$endpoint" || { warn "入口地址无效。"; pause_screen; return; }
+  warn "后台“SSH 端口”是 TCP 管理入口，不代表同号 UDP 已开放；请另选商家确认可用的 UDP 业务端口。"
+  ask port_range "商家后台“可用端口范围”（格式示例：30000-30099；无默认值）" ""
+  valid_port_range "$port_range" || { warn "端口范围格式无效，必须类似 30000-30099，且上下限为 1025-65535。"; pause_screen; return; }
+  ask public_port "商家公网 UDP 映射端口（必须位于 ${port_range}）" ""
+  port_in_declared_range "$public_port" "$port_range" || \
+    { warn "UDP 映射端口必须位于商家后台显示的 ${port_range} 范围内。"; pause_screen; return; }
   public_port=$((10#$public_port))
-  ask local_port "VDS 本机监听 UDP 端口" "$public_port"
+  ask local_port "VDS 本机监听 UDP 端口（同端映射可直接回车）" "$public_port"
   valid_port "$local_port" || { warn "端口必须为 1025-65535。"; pause_screen; return; }
   local_port=$((10#$local_port))
   if port_in_use "$local_port" UDP; then warn "${local_port}/UDP 已被占用。"; pause_screen; return; fi
+  if [[ "$local_ip" != "--" && "$detected_egress" != "--" && "$local_ip" != "$detected_egress" && "$endpoint" == "$detected_egress" ]]; then
+    warn "你填写的是检测到的日本 BGP 出口；NAT 套餐通常不能把它当作 WireGuard Endpoint。"
+    confirm "商家是否明确确认该出口地址也支持此 UDP 入站映射？" "N" || { pause_screen; return; }
+  fi
+  printf '\n%s请按商家后台中文字段核对：%s\n' "$BCYAN" "$RESET"
+  printf '  客户端入口类型：%s\n' "$endpoint_label"
+  printf '  客户端 Endpoint：%s:%s/UDP\n' "$endpoint" "$public_port"
+  printf '  后台可用端口范围：%s\n' "$port_range"
+  printf '  商家映射目标：VDS 本机／内网 %s:%s/UDP\n' "$local_ip" "$local_port"
+  printf '  实测日本 BGP 固定出口：%s（后台可能不显示；出站使用，不写入 Endpoint）\n' "$detected_egress"
+  confirm "商家是否已确认该入口支持 UDP，并完成上述端口映射？" "N" || { pause_screen; return; }
   ask prefix "隧道 /24 前缀（只填前三段）" "10.88.${index}"
   valid_prefix24 "$prefix" || { warn "前缀示例：10.88.0"; pause_screen; return; }
   if ip -4 route show | grep -Eq "(^|[[:space:]])${prefix//./\.}\.0/24([[:space:]]|$)"; then
@@ -1087,13 +1169,14 @@ EOF
   sysctl -w net.ipv4.ip_forward=1
   systemctl enable --now "wg-quick@${iface}"
   wg show "$iface"
-  store_wg_instance "$iface" "$endpoint" "$public_port" "$local_port" "$prefix" "$server_pub" "$mtu" "$out_iface"
+  store_wg_instance "$iface" "$endpoint" "$public_port" "$local_port" "$prefix" "$server_pub" "$mtu" "$out_iface" \
+    "$endpoint_label" "$port_range" "$detected_egress" "$local_ip"
   store_wg_peer "$iface" "$client_name" "${prefix}.2" "$client_pub" "$client_conf"
   maybe_open_ufw "$local_port" UDP
 
   ok "WireGuard 实例已建立：$iface"
   ok "客户端配置：$client_conf"
-  warn "商家侧必须存在 ${endpoint}:${public_port}/UDP → 本机 ${local_port}/UDP 的映射。"
+  warn "商家侧必须存在“${endpoint_label} ${endpoint}:${public_port}/UDP → VDS 本机 ${local_ip}:${local_port}/UDP”的映射。"
   if command -v qrencode >/dev/null 2>&1 && confirm "立即在终端显示客户端二维码？" "Y"; then
     qrencode -t ANSIUTF8 < "$client_conf"
   fi
@@ -1104,7 +1187,7 @@ select_wg_instance() {
   local __var="$1" count choice
   count="$(jq 'length' "$WG_STATE_FILE")"
   (( count > 0 )) || return 1
-  jq -r 'to_entries[] | "\(.key+1). \(.value.interface)｜\(.value.endpoint):\(.value.publicPort)/UDP｜\(.value.prefix).0/24"' "$WG_STATE_FILE"
+  jq -r 'to_entries[] | "\(.key+1). \(.value.interface)｜\(.value.endpointLabel // "商家公网入口")：\(.value.endpoint):\(.value.publicPort)/UDP｜\(.value.prefix).0/24"' "$WG_STATE_FILE"
   ask choice "选择实例序号" "1"
   is_integer "$choice" && ((choice >= 1 && choice <= count)) || return 1
   printf -v "$__var" '%s' "$((choice - 1))"
@@ -1185,7 +1268,14 @@ show_wireguard_status() {
   else
     wg show || true
     printf '\n%s实例清单：%s\n' "$BCYAN" "$RESET"
-    jq -r '.[] | "- \(.interface)｜公网 \(.endpoint):\(.publicPort)/UDP → 本机 :\(.localPort)/UDP｜\(.prefix).0/24"' "$WG_STATE_FILE"
+    jq -r '.[] |
+      "- \(.interface)\n" +
+      "  客户端入口类型：\(.endpointLabel // "商家公网入口（旧记录未标注）")\n" +
+      "  客户端 Endpoint：\(.endpoint):\(.publicPort)/UDP\n" +
+      "  后台可用端口范围：\(.declaredPortRange // "旧记录未保存")\n" +
+      "  商家映射目标：VDS 本机／内网 \(.localIp // "未记录"):\(.localPort)/UDP\n" +
+      "  实测日本 BGP 固定出口：\(.egressIp // "未记录")（后台可能不显示；不作为 Endpoint）\n" +
+      "  WireGuard 隧道网段：\(.prefix).0/24"' "$WG_STATE_FILE"
     printf '\n%s客户端清单：%s\n' "$BCYAN" "$RESET"
     jq -r '.[] | "- \(.name)｜\(.interface)｜\(.address)｜\(.configFile)"' "$WG_PEERS_FILE"
   fi
@@ -1256,7 +1346,7 @@ show_help() {
   cat <<'EOF'
 
 推荐的新购交机顺序：
-  1. 系统体检：确认 Debian 12/13、NAT、公网 IP、时间同步与可用端口。
+  1. 系统体检：确认 Debian 12/13、NAT、出口公网 IP 与时间同步。
   2. Mieru：安装官方 mita，再建立 TCP 主节点；弱网确有需求时才追加 UDP。
   3. WireGuard：确认商家开放 UDP 后，再生成服务端与客户端二维码。
   4. 集群：把多台沪日节点加入清单，生成 FLClash/Mihomo 配置。
@@ -1265,7 +1355,10 @@ show_help() {
 重要口径：
   - “轮巡”按请求轮换节点；“并发”使用一致性哈希分散不同目标连接。
   - 两者都不是单个下载连接的带宽聚合，也不能突破每台机器或本地宽带上限。
-  - NAT 套餐的公网端口必须由商家映射；Linux 内监听正常不等于公网一定可达。
+  - NAT 套餐应填写后台“移动入口／外部连接 IP”，不能把检测到的日本 BGP 出口直接当入口。
+  - 商家后台可能不显示日本固定出口；面板值来自 VPS 出站查询，连接 Mieru 后也可由网络检测验证。
+  - 业务端口必须位于后台“可用端口范围”；UDP 是否开放及映射目标仍须商家确认。
+  - Linux 内监听正常不等于商家公网入口一定可达。
   - 脚本不改 SSH 端口，不自动关闭现有服务，不保存任何预置账号或真实节点密码。
 EOF
   pause_screen
@@ -1277,6 +1370,10 @@ self_test() {
   valid_port 10503 || { printf 'FAIL valid port\n'; failed=1; }
   valid_port 1024 && { printf 'FAIL low port\n'; failed=1; }
   valid_port 65536 && { printf 'FAIL high port\n'; failed=1; }
+  valid_port_range '30000-30099' || { printf 'FAIL valid port range\n'; failed=1; }
+  valid_port_range '30099-30000' && { printf 'FAIL reversed port range\n'; failed=1; }
+  port_in_declared_range 30050 '30000-30099' || { printf 'FAIL port in range\n'; failed=1; }
+  port_in_declared_range 29999 '30000-30099' && { printf 'FAIL out-of-range port\n'; failed=1; }
   valid_mtu 1280 || { printf 'FAIL mtu 1280\n'; failed=1; }
   valid_mtu 1501 && { printf 'FAIL mtu 1501\n'; failed=1; }
   valid_username 'huri_01' || { printf 'FAIL username\n'; failed=1; }
