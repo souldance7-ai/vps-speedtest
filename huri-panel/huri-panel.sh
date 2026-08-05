@@ -752,8 +752,8 @@ configure_mieru_server() {
   ask endpoint "${endpoint_label}（对应商家后台同名 IP／域名）" ""
   valid_host "$endpoint" || { warn "入口地址格式无效。"; pause_screen; return; }
   warn "后台“SSH 端口”只用于管理登录；请另选商家确认可用的业务端口。"
-  ask port_range "商家后台“可用端口范围”（格式示例：10100-10199）" ""
-  valid_port_range "$port_range" || { warn "端口范围格式无效，必须类似 10100-10199，且上下限为 1025-65535。"; pause_screen; return; }
+  ask port_range "商家后台“可用端口范围”（格式示例：30000-30099；无默认值）" ""
+  valid_port_range "$port_range" || { warn "端口范围格式无效，必须类似 30000-30099，且上下限为 1025-65535。"; pause_screen; return; }
   if [[ "$local_ip" != "--" && "$detected_egress" != "--" && "$local_ip" != "$detected_egress" && "$endpoint" == "$detected_egress" ]]; then
     warn "你填写的是检测到的日本 BGP 出口；NAT 套餐通常不能把它当作客户端入口。"
     confirm "商家是否明确确认该出口地址也支持入站映射？" "N" || { pause_screen; return; }
@@ -1084,8 +1084,8 @@ create_wireguard_server() {
   ask endpoint "${endpoint_label}（对应商家后台同名 IP／域名）" ""
   valid_host "$endpoint" || { warn "入口地址无效。"; pause_screen; return; }
   warn "后台“SSH 端口”是 TCP 管理入口，不代表同号 UDP 已开放；请另选商家确认可用的 UDP 业务端口。"
-  ask port_range "商家后台“可用端口范围”（格式示例：10100-10199）" ""
-  valid_port_range "$port_range" || { warn "端口范围格式无效，必须类似 10100-10199，且上下限为 1025-65535。"; pause_screen; return; }
+  ask port_range "商家后台“可用端口范围”（格式示例：30000-30099；无默认值）" ""
+  valid_port_range "$port_range" || { warn "端口范围格式无效，必须类似 30000-30099，且上下限为 1025-65535。"; pause_screen; return; }
   ask public_port "商家公网 UDP 映射端口（必须位于 ${port_range}）" ""
   port_in_declared_range "$public_port" "$port_range" || \
     { warn "UDP 映射端口必须位于商家后台显示的 ${port_range} 范围内。"; pause_screen; return; }
@@ -1370,10 +1370,10 @@ self_test() {
   valid_port 10503 || { printf 'FAIL valid port\n'; failed=1; }
   valid_port 1024 && { printf 'FAIL low port\n'; failed=1; }
   valid_port 65536 && { printf 'FAIL high port\n'; failed=1; }
-  valid_port_range '10100-10199' || { printf 'FAIL valid port range\n'; failed=1; }
-  valid_port_range '10199-10100' && { printf 'FAIL reversed port range\n'; failed=1; }
-  port_in_declared_range 10150 '10100-10199' || { printf 'FAIL port in range\n'; failed=1; }
-  port_in_declared_range 20000 '10100-10199' && { printf 'FAIL out-of-range port\n'; failed=1; }
+  valid_port_range '30000-30099' || { printf 'FAIL valid port range\n'; failed=1; }
+  valid_port_range '30099-30000' && { printf 'FAIL reversed port range\n'; failed=1; }
+  port_in_declared_range 30050 '30000-30099' || { printf 'FAIL port in range\n'; failed=1; }
+  port_in_declared_range 29999 '30000-30099' && { printf 'FAIL out-of-range port\n'; failed=1; }
   valid_mtu 1280 || { printf 'FAIL mtu 1280\n'; failed=1; }
   valid_mtu 1501 && { printf 'FAIL mtu 1501\n'; failed=1; }
   valid_username 'huri_01' || { printf 'FAIL username\n'; failed=1; }
