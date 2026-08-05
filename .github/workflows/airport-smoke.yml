@@ -1,0 +1,99 @@
+name: airport-smoke
+
+on:
+  push:
+    paths:
+      - "airport-full-tester/**"
+      - ".github/workflows/airport-smoke.yml"
+  pull_request:
+    paths:
+      - "airport-full-tester/**"
+      - ".github/workflows/airport-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  powershell-parser:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell sources
+        shell: powershell
+        run: |
+          $files = Get-ChildItem airport-full-tester -Filter *.ps1 -Recurse
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | Format-List | Out-String | Write-Error
+              exit 1
+            }
+          }
+          Write-Host "PowerShell parser: OK"
+      - name: Validate package files
+        shell: powershell
+        run: |
+          $required = @(
+            'airport-full-tester/run_airport_tester.cmd',
+            'airport-full-tester/airport_full_tester.ps1',
+            'airport-full-tester/setup_mihomo.ps1',
+            'airport-full-tester/export_excel.ps1',
+            'airport-full-tester/README.md',
+            'airport-full-tester/assets/sample-report.svg',
+            'airport-full-tester/assets/airport-cyber-cover-v2.png'
+          )
+          foreach ($path in $required) { if (-not (Test-Path $path)) { throw "Missing: $path" } }
+          [xml](Get-Content 'airport-full-tester/assets/sample-report.svg' -Raw) | Out-Null
+          Write-Host "Package files: OK"
+      - name: Test Mihomo setup path resolution
+        shell: powershell
+        run: |
+          .\airport-full-tester\setup_mihomo.ps1 -SelfTest
+      - name: Execute CMD launchers from path with spaces and parentheses
+        shell: powershell
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'LazyVPS Airport Tester (1)'
+          Copy-Item 'airport-full-tester' $stage -Recurse
+          & (Join-Path $stage 'setup_mihomo.cmd') --self-test
+          if ($LASTEXITCODE -ne 0) { throw "setup_mihomo.cmd self-test failed: $LASTEXITCODE" }
+          & (Join-Path $stage 'run_airport_tester.cmd') --self-test
+          if ($LASTEXITCODE -ne 0) { throw "run_airport_tester.cmd self-test failed: $LASTEXITCODE" }
+      - name: Execute offline SVG renderer self-test
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'airport-renderer-selftest'
+          .\airport-full-tester\airport_full_tester.ps1 -SelfTest -NoColor -OutDir $out
+          $expected = @('report.svg', 'report.html', 'report.xlsx', 'cover.png', 'summary_ranking.csv', 'run_args.json')
+          foreach ($name in $expected) { if (-not (Test-Path (Join-Path $out $name))) { throw "Missing renderer output: $name" } }
+          [xml](Get-Content (Join-Path $out 'report.svg') -Raw) | Out-Null
+          $svgText = Get-Content (Join-Path $out 'report.svg') -Raw -Encoding UTF8
+          $utf8Needle = -join @([char]0x53F0,[char]0x7063,[char]0x2D,[char]0x793A,[char]0x7BC4,[char]0x7BC0,[char]0x9EDE)
+          if (-not $svgText.Contains($utf8Needle)) { throw 'UTF-8 node name missing from SVG output' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $xlsx = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $out 'report.xlsx'))
+          try {
+            $entryNames = @($xlsx.Entries | ForEach-Object { $_.FullName })
+            $entryNames | ForEach-Object { Write-Host "XLSX entry: $_" }
+            foreach ($required in @('[Content_Types].xml', '_rels/.rels', 'xl/workbook.xml', 'xl/styles.xml')) {
+              if ($required -notin $entryNames) { throw "Invalid XLSX: missing $required" }
+            }
+            foreach ($entry in @($xlsx.Entries | Where-Object { $_.FullName.EndsWith('.xml') -or $_.FullName.EndsWith('.rels') })) {
+              $reader = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
+              try { [xml]$reader.ReadToEnd() | Out-Null } finally { $reader.Dispose() }
+            }
+          } finally { $xlsx.Dispose() }
+          Write-Host "Offline renderer: OK"
+      - name: Build Windows package
+        shell: powershell
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'airport-full-tester'
+          Copy-Item 'airport-full-tester' $stage -Recurse
+          Remove-Item (Join-Path $stage 'bin') -Recurse -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path $stage -DestinationPath (Join-Path $env:RUNNER_TEMP 'airport-full-tester-windows.zip') -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airport-full-tester-windows
+          path: ${{ runner.temp }}/airport-full-tester-windows.zip
+          if-no-files-found: error
