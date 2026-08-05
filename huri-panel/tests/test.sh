@@ -58,12 +58,12 @@ bash -c '
   registry_add_node "沪日-A" "203.0.113.10" 10503 TCP "huri_a" "p#ss:&word-123456" 1400
   registry_add_node "沪日-B" "2001:db8::10" 10504 UDP "huri_b" "second-password-123" 1280
   generate_mihomo_config false >/dev/null
-  store_wg_instance "wg-huri0" "198.51.100.10" 10101 10101 "10.88.0" \
-    "test-server-public-key" 1380 "eth0" "移动入口（China Mobile）" "10100-10199" \
+  store_wg_instance "wg-huri0" "198.51.100.10" 30001 30001 "10.88.0" \
+    "test-server-public-key" 1380 "eth0" "移动入口（China Mobile）" "30000-30099" \
     "203.0.113.10" "10.0.0.2"
   jq -e '\''.[0].endpointLabel == "移动入口（China Mobile）" and
-    .[0].declaredPortRange == "10100-10199" and
-    .[0].publicPort == 10101 and .[0].localPort == 10101'\'' "$WG_STATE_FILE" >/dev/null
+    .[0].declaredPortRange == "30000-30099" and
+    .[0].publicPort == 30001 and .[0].localPort == 30001'\'' "$WG_STATE_FILE" >/dev/null
   safe="$(safe_file_component "../../root/unsafe")"
   [[ "$safe" != */* && -n "$safe" ]]
 ' _ "$PANEL"
