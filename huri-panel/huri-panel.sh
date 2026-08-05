@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 APP_NAME="HuRi Link Console"
 REPOSITORY="souldance7-ai/vps-speedtest"
 RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/main/huri-panel"
@@ -266,20 +266,125 @@ wg_instance_count() {
   printf '%s' "$count"
 }
 
-draw_logo() {
-  local major local_ip pub mita_s wg_s
+terminal_columns() {
+  local cols="${COLUMNS:-}"
+  if ! is_integer "$cols" || (( cols < 20 )); then
+    cols="$(tput cols 2>/dev/null || printf '80')"
+  fi
+  is_integer "$cols" || cols=80
+  printf '%s' "$cols"
+}
+
+ui_rule() {
+  local width="${1:-78}" color="${2:-$BBLACK}" line
+  (( width > 96 )) && width=96
+  (( width < 40 )) && width=40
+  printf -v line '%*s' "$width" ''
+  line="${line// /─}"
+  printf '%s%s%s\n' "$color" "$line" "$RESET"
+}
+
+uptime_short() {
+  local seconds days hours minutes
+  seconds="$(awk '{printf "%d",$1}' /proc/uptime 2>/dev/null || printf '0')"
+  is_integer "$seconds" || seconds=0
+  days=$(( seconds / 86400 ))
+  hours=$(( (seconds % 86400) / 3600 ))
+  minutes=$(( (seconds % 3600) / 60 ))
+  if (( days > 0 )); then
+    printf '%s天 %s小时 %s分' "$days" "$hours" "$minutes"
+  else
+    printf '%s小时 %s分' "$hours" "$minutes"
+  fi
+}
+
+status_split_row() {
+  local left="$1" right="$2" split_col="$3"
+  printf '  %s' "$left"
+  if [[ -t 1 ]]; then
+    printf '\033[%sG%s│%s  %s\n' "$split_col" "$BBLACK" "$RESET" "$right"
+  else
+    printf '  |  %s\n' "$right"
+  fi
+}
+
+draw_ansi_logo() {
+  printf '    %s%s██╗  ██╗    ██╗   ██╗    ██████╗     ██╗%s\n' "$BOLD" "$BBLUE" "$RESET"
+  printf '    %s%s██║  ██║    ██║   ██║    ██╔══██╗    ██║%s\n' "$BOLD" "$BBLUE" "$RESET"
+  printf '    %s%s██║  ██║    ██║   ██║    ██║  ██║    ██║%s\n' "$BOLD" "$BCYAN" "$RESET"
+  printf '    %s%s███████║    ██║   ██║    ██████╔╝    ██║%s\n' "$BOLD" "$BCYAN" "$RESET"
+  printf '    %s%s██╔══██║    ██║   ██║    ██╔══██╗    ██║%s\n' "$BOLD" "$BMAGENTA" "$RESET"
+  printf '    %s%s██║  ██║    ██║   ██║    ██║  ██║    ██║%s\n' "$BOLD" "$BMAGENTA" "$RESET"
+  printf '    %s%s██║  ██║    ╚██████╔╝    ██║  ██║    ██║%s\n' "$BOLD" "$BWHITE" "$RESET"
+  printf '    %s%s╚═╝  ╚═╝     ╚═════╝     ╚═╝  ╚═╝    ╚═╝%s\n' "$BOLD" "$WHITE" "$RESET"
+}
+
+draw_compact_header() {
+  local major local_ip pub mita_s wg_s cols width
   major="$(debian_major 2>/dev/null || printf '?')"
   local_ip="$(local_ipv4 2>/dev/null || true)"; local_ip="${local_ip:---}"
   pub="${PUBLIC_IP_CACHE:---}"
   mita_s="$(mita_status_short)"; wg_s="$(wg_instance_count)"
-  printf '%s%s╔══════════════════════════════════════════════════════════════════════╗%s\n' "$BOLD" "$BCYAN" "$RESET"
-  printf '%s%s║%s  %s▓▒░  H U R I   L I N K   C O N S O L E  ░▒▓%s                   %s%s║%s\n' "$BOLD" "$BCYAN" "$RESET" "$BMAGENTA" "$RESET" "$BOLD" "$BCYAN" "$RESET"
-  printf '%s%s║%s  沪日合规隧道交付面板 · Debian 12/13 · v%-25s%s%s║%s\n' "$BOLD" "$BCYAN" "$RESET" "$VERSION" "$BOLD" "$BCYAN" "$RESET"
-  printf '%s%s╠══════════════════════════════════════════════════════════════════════╣%s\n' "$BOLD" "$BCYAN" "$RESET"
-  printf '%s%s║%s  OS D%-2s  本机 %-15s  公网 %-15s                 %s%s║%s\n' "$BOLD" "$BCYAN" "$RESET" "$major" "$local_ip" "$pub" "$BOLD" "$BCYAN" "$RESET"
-  printf '%s%s║%s  Mieru %-8s  WireGuard %-2s套  模式：仅合规隧道                   %s%s║%s\n' "$BOLD" "$BCYAN" "$RESET" "$mita_s" "$wg_s" "$BOLD" "$BCYAN" "$RESET"
-  printf '%s%s╚══════════════════════════════════════════════════════════════════════╝%s\n' "$BOLD" "$BCYAN" "$RESET"
+  cols="$(terminal_columns)"; width="$cols"; (( width > 96 )) && width=96
+
+  printf '%s%s▓▒░%s %sH U R I   L I N K   C O N S O L E%s %s%s░▒▓%s\n' \
+    "$BOLD" "$BMAGENTA" "$RESET" "$BWHITE" "$RESET" "$BOLD" "$BCYAN" "$RESET"
+  printf '%s沪日合规隧道交付控制台%s  D%s · Mieru %s · WireGuard %s套 · v%s\n' \
+    "$BCYAN" "$RESET" "$major" "$mita_s" "$wg_s" "$VERSION"
+  printf '%s本机%s %s  %s公网%s %s\n' "$BBLACK" "$RESET" "$local_ip" "$BBLACK" "$RESET" "$pub"
+  ui_rule "$width"
 }
+
+draw_dashboard_header() {
+  local cols width split major local_ip pub mita_s wg_s host kernel arch cpu mem disk uptime_value
+  local iface cc qdisc net_mode
+  cols="$(terminal_columns)"
+  if (( cols < 78 )); then
+    draw_compact_header
+    return
+  fi
+
+  width="$cols"; (( width > 96 )) && width=96
+  split=$(( width / 2 + 1 ))
+  major="$(debian_major 2>/dev/null || printf '?')"
+  local_ip="$(local_ipv4 2>/dev/null || true)"; local_ip="${local_ip:---}"
+  pub="${PUBLIC_IP_CACHE:---}"
+  mita_s="$(mita_status_short)"; wg_s="$(wg_instance_count)"
+  host="$(hostname -s 2>/dev/null || printf 'unknown')"; host="${host:0:20}"
+  kernel="$(uname -r 2>/dev/null || printf '?')"; kernel="${kernel:0:18}"
+  arch="$(uname -m 2>/dev/null || printf '?')"; cpu="$(nproc 2>/dev/null || printf '?')"
+  mem="$(awk '/MemTotal/{t=$2}/MemAvailable/{a=$2}END{if(t>0)printf "%.0f / %.0f MB",(t-a)/1024,t/1024;else print "--"}' /proc/meminfo 2>/dev/null || printf -- '--')"
+  disk="$(df -hP / 2>/dev/null | awk 'NR==2{print $3" / "$2" ("$5")"}' || printf -- '--')"
+  uptime_value="$(uptime_short)"
+  iface="$(default_iface 2>/dev/null || true)"; iface="${iface:---}"
+  cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '?')"
+  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '?')"
+  net_mode="独立公网"
+  if [[ "$local_ip" == "--" || "$pub" == "--" ]]; then
+    net_mode="待体检"
+  elif is_private_ipv4 "$local_ip" || [[ "$local_ip" != "$pub" ]]; then
+    net_mode="NAT映射"
+  fi
+
+  printf '%s%s●%s %sHuRi Link Console%s %s│%s %sSH→JP COMPLIANT TUNNEL%s %s│ D%s · v%s%s\n' \
+    "$BOLD" "$BMAGENTA" "$RESET" "$BOLD$BMAGENTA" "$RESET" "$BBLACK" "$RESET" \
+    "$BOLD$WHITE" "$RESET" "$DIM" "$major" "$VERSION" "$RESET"
+  ui_rule "$width" "$BBLACK"
+  draw_ansi_logo
+  printf '%s%s                 [ 沪日专线 · 日本 BGP 出口 · 合规隧道交付 ]%s\n' "$BOLD" "$BBLUE" "$RESET"
+  ui_rule "$width" "$BBLACK"
+  status_split_row "${BOLD}${BCYAN}▣  即时动态硬件监控${RESET}" "${BOLD}${BCYAN}◎  专线网络与服务参数${RESET}" "$split"
+  status_split_row "• 主机：${host}" "• 公网：${pub}" "$split"
+  status_split_row "• 系统：D${major} / ${kernel}" "• 本机：${local_ip}" "$split"
+  status_split_row "• 处理器：${cpu} vCPU / ${arch}" "• 接入：${iface} / ${net_mode}" "$split"
+  status_split_row "• 内存：${mem}" "• TCP：${cc} / ${qdisc}" "$split"
+  status_split_row "• 磁盘：${disk}" "• 服务：Mieru ${mita_s} / WG ${wg_s}套" "$split"
+  status_split_row "• 运行：${uptime_value}" "• 模式：仅合规隧道" "$split"
+  ui_rule "$width" "$BBLACK"
+}
+
+# 保留旧函数名，方便已安装版本或外部测试继续调用。
+draw_logo() { draw_dashboard_header; }
 
 rule_wall() {
   printf '%s合规边界：%s仅部署 Mieru / WireGuard；不创建 SS、HTTP(S)、TLS、VLESS、\n' "$BYELLOW" "$RESET"
@@ -288,8 +393,8 @@ rule_wall() {
 
 action_header() {
   clear_screen
-  draw_logo
-  printf '\n%s%s── %s ─────────────────────────────────────────────────────────%s\n\n' "$BOLD" "$BMAGENTA" "$1" "$RESET"
+  draw_compact_header
+  printf '%s%s▶ %s%s\n\n' "$BOLD" "$BMAGENTA" "$1" "$RESET"
 }
 
 read_key() {
@@ -1147,6 +1252,7 @@ ${APP_NAME} v${VERSION}
   bash huri-panel.sh              进入方向键彩色面板（需要 root 与 TTY）
   bash huri-panel.sh --health     执行一次系统体检
   bash huri-panel.sh --self-test  离线自检，不修改系统
+  bash huri-panel.sh --preview-ui 预览新版 ANSI 抬头，不修改系统
   bash huri-panel.sh --install    安装/更新为 huri 命令
   bash huri-panel.sh --version
   bash huri-panel.sh --help
@@ -1170,7 +1276,7 @@ panel_main() {
       5) items=("安装 / 更新 huri 命令" "查看备份与导出" "回滚最近一次网络优化" "帮助与边界") ;;
     esac
     item_count="${#items[@]}"; (( selected < item_count )) || selected=0
-    clear_screen; draw_logo; printf '\n'
+    clear_screen; draw_dashboard_header; printf '\n'
     for ((i=0; i<${#tabs[@]}; i++)); do
       if (( i == tab )); then
         printf ' %s%s[ %s ]%s ' "$BG_CYAN" "$BLACK" "${tabs[$i]}" "$RESET"
@@ -1178,16 +1284,17 @@ panel_main() {
         printf ' %s%s %s %s ' "$DIM" "$WHITE" "${tabs[$i]}" "$RESET"
       fi
     done
-    printf '\n%s────────────────────────────────────────────────────────────────────────%s\n' "$BBLACK" "$RESET"
+    printf '\n'; ui_rule "$(terminal_columns)" "$BBLACK"
     for ((i=0; i<item_count; i++)); do
       if (( i == selected )); then
-        printf '  %s%s▶  %s%s\n' "$BG_MAGENTA" "$BWHITE" "${items[$i]}" "$RESET"
+        printf '  %s%s ▶  %02d  %-43s %s\n' "$BG_MAGENTA" "$BWHITE" "$((i + 1))" "${items[$i]}" "$RESET"
       else
-        printf '     %s%s%s\n' "$BCYAN" "${items[$i]}" "$RESET"
+        printf '     %s%02d%s  %s%s%s\n' "$BBLACK" "$((i + 1))" "$RESET" "$BCYAN" "${items[$i]}" "$RESET"
       fi
     done
-    printf '\n'; rule_wall
-    printf '\n%s←/→ 分页   ↑/↓ 选择   Enter 执行   Q 退出%s\n' "$DIM" "$RESET"
+    printf '\n%s合规边界：%s仅部署 Mieru / WireGuard；完整说明位于「维护 → 帮助与边界」。\n' "$BYELLOW" "$RESET"
+    printf '\n%s←/→%s 分类   %s↑/↓%s 选择   %sEnter%s 执行   %sQ%s 退出\n' \
+      "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET"
     key="$(read_key)"
     case "$key" in
       LEFT) tab=$(( (tab + ${#tabs[@]} - 1) % ${#tabs[@]} )); selected=0 ;;
@@ -1219,6 +1326,11 @@ main() {
     --help|-h) usage; return 0 ;;
     --version|-V) printf '%s v%s\n' "$APP_NAME" "$VERSION"; return 0 ;;
     --self-test) self_test; return ;;
+    --preview-ui)
+      PUBLIC_IP_CACHE="${HURI_PREVIEW_PUBLIC_IP:-203.0.113.10}"
+      draw_dashboard_header
+      return
+      ;;
   esac
 
   require_root
