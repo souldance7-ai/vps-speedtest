@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP_NAME="HuRi Link Console"
 REPOSITORY="souldance7-ai/vps-speedtest"
 RAW_BASE="https://raw.githubusercontent.com/${REPOSITORY}/main/huri-panel"
@@ -24,6 +24,7 @@ CHINA3NET_SPEED_URL="https://raw.githubusercontent.com/${REPOSITORY}/main/3net-r
 TEMP_PATHS=()
 PUBLIC_IP_CACHE=""
 NO_COLOR="${NO_COLOR:-}"
+PRIVACY_MODE="${HURI_PRIVACY_MODE:-0}"
 
 if [[ -t 1 && -z "$NO_COLOR" ]]; then
   RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
@@ -32,11 +33,20 @@ if [[ -t 1 && -z "$NO_COLOR" ]]; then
   BBLACK=$'\033[90m'; BRED=$'\033[91m'; BGREEN=$'\033[92m'; BYELLOW=$'\033[93m'
   BBLUE=$'\033[94m'; BMAGENTA=$'\033[95m'; BCYAN=$'\033[96m'; BWHITE=$'\033[97m'
   BG_BLUE=$'\033[44m'; BG_MAGENTA=$'\033[45m'; BG_CYAN=$'\033[46m'; BG_WHITE=$'\033[47m'
+  FIRE_WHITE=$'\033[38;5;231m'; FIRE_YELLOW=$'\033[38;5;226m'
+  FIRE_AMBER=$'\033[38;5;214m'; FIRE_ORANGE=$'\033[38;5;208m'
+  FIRE_RED=$'\033[38;5;196m'; FIRE_DARKRED=$'\033[38;5;124m'
+  FIRE_SHADOW=$'\033[38;5;238m'; TEXT_GRAY=$'\033[38;5;245m'
+  BORDER_GRAY=$'\033[38;5;239m'; BG_FIRE_AMBER=$'\033[48;5;214m'
+  BG_FIRE_RED=$'\033[48;5;88m'
 else
   RESET=""; BOLD=""; DIM=""; BLACK=""; RED=""; GREEN=""; YELLOW=""
   BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; BBLACK=""; BRED=""; BGREEN=""
   BYELLOW=""; BBLUE=""; BMAGENTA=""; BCYAN=""; BWHITE=""; BG_BLUE=""
   BG_MAGENTA=""; BG_CYAN=""; BG_WHITE=""
+  FIRE_WHITE=""; FIRE_YELLOW=""; FIRE_AMBER=""; FIRE_ORANGE=""
+  FIRE_RED=""; FIRE_DARKRED=""; FIRE_SHADOW=""; TEXT_GRAY=""
+  BORDER_GRAY=""; BG_FIRE_AMBER=""; BG_FIRE_RED=""
 fi
 
 cleanup() {
@@ -277,7 +287,7 @@ terminal_columns() {
 
 ui_rule() {
   local width="${1:-78}" color="${2:-$BBLACK}" line
-  (( width > 96 )) && width=96
+  (( width > 100 )) && width=100
   (( width < 40 )) && width=40
   printf -v line '%*s' "$width" ''
   line="${line// /─}"
@@ -308,43 +318,73 @@ status_split_row() {
   fi
 }
 
-draw_ansi_logo() {
-  printf '    %s%s██╗  ██╗    ██╗   ██╗    ██████╗     ██╗%s\n' "$BOLD" "$BBLUE" "$RESET"
-  printf '    %s%s██║  ██║    ██║   ██║    ██╔══██╗    ██║%s\n' "$BOLD" "$BBLUE" "$RESET"
-  printf '    %s%s██║  ██║    ██║   ██║    ██║  ██║    ██║%s\n' "$BOLD" "$BCYAN" "$RESET"
-  printf '    %s%s███████║    ██║   ██║    ██████╔╝    ██║%s\n' "$BOLD" "$BCYAN" "$RESET"
-  printf '    %s%s██╔══██║    ██║   ██║    ██╔══██╗    ██║%s\n' "$BOLD" "$BMAGENTA" "$RESET"
-  printf '    %s%s██║  ██║    ██║   ██║    ██║  ██║    ██║%s\n' "$BOLD" "$BMAGENTA" "$RESET"
-  printf '    %s%s██║  ██║    ╚██████╔╝    ██║  ██║    ██║%s\n' "$BOLD" "$BWHITE" "$RESET"
-  printf '    %s%s╚═╝  ╚═╝     ╚═════╝     ╚═╝  ╚═╝    ╚═╝%s\n' "$BOLD" "$WHITE" "$RESET"
+mask_ip_for_display() {
+  local value="${1:---}"
+  if [[ "$PRIVACY_MODE" != "1" ]]; then
+    printf '%s' "$value"
+  elif [[ "$value" =~ ^([0-9]{1,3})\.([0-9]{1,3})\. ]]; then
+    printf '%s.%s.x.x' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  elif [[ "$value" == *:* ]]; then
+    printf '%s::xxxx' "${value%%:*}"
+  else
+    printf '已隐藏'
+  fi
+}
+
+mask_host_for_display() {
+  local value="${1:-unknown}"
+  if [[ "$PRIVACY_MODE" == "1" ]]; then
+    printf '主机已隐藏'
+  else
+    printf '%s' "$value"
+  fi
+}
+
+draw_fire_logo() {
+  local width="${1:-96}" pad shadow_bar
+  pad=$(( (width - 66) / 2 )); (( pad < 2 )) && pad=2
+  printf -v shadow_bar '%*s' 58 ''
+  shadow_bar="${shadow_bar// /▀}"
+
+  printf '%*s%s%s██╗  ██╗ ██╗   ██╗ ██████╗  ██╗    ██╗     ██╗ ███╗   ██╗ ██╗  ██╗%s\n' "$pad" '' "$BOLD" "$FIRE_WHITE" "$RESET"
+  printf '%*s%s%s██║  ██║ ██║   ██║ ██╔══██╗ ██║    ██║     ██║ ████╗  ██║ ██║ ██╔╝%s\n' "$pad" '' "$BOLD" "$FIRE_YELLOW" "$RESET"
+  printf '%*s%s%s██║  ██║ ██║   ██║ ██████╔╝ ██║    ██║     ██║ ██╔██╗ ██║ █████╔╝ %s\n' "$pad" '' "$BOLD" "$FIRE_AMBER" "$RESET"
+  printf '%*s%s%s███████║ ██║   ██║ ██╔══██╗ ██║    ██║     ██║ ██║╚██╗██║ ██╔═██╗ %s\n' "$pad" '' "$BOLD" "$FIRE_ORANGE" "$RESET"
+  printf '%*s%s%s██╔══██║ ╚██████╔╝ ██║  ██║ ██║    ███████╗██║ ██║ ╚████║ ██║  ██╗%s\n' "$pad" '' "$BOLD" "$FIRE_RED" "$RESET"
+  printf '%*s%s%s╚═╝  ╚═╝  ╚═════╝  ╚═╝  ╚═╝ ╚═╝    ╚══════╝╚═╝ ╚═╝  ╚═══╝ ╚═╝  ╚═╝%s\n' "$pad" '' "$BOLD" "$FIRE_DARKRED" "$RESET"
+  printf '%*s%s  ░▒▓█▀▀  ░▒▓█▀▀  ░▒▓█▀▀  ░▒▓█▀▀  ░▒▓█▀▀  ░▒▓█▀▀  ░▒▓█▀▀  ░▒▓█▀▀%s\n' "$pad" '' "$FIRE_SHADOW" "$RESET"
+  printf '%*s%s░▒▓█%s%s%s█▓▒░%s\n' "$pad" '' "$BORDER_GRAY" "$FIRE_RED" "$shadow_bar" "$BORDER_GRAY" "$RESET"
 }
 
 draw_compact_header() {
-  local major local_ip pub mita_s wg_s cols width
+  local major local_ip pub display_local display_pub mita_s wg_s cols width privacy_badge
   major="$(debian_major 2>/dev/null || printf '?')"
   local_ip="$(local_ipv4 2>/dev/null || true)"; local_ip="${local_ip:---}"
   pub="${PUBLIC_IP_CACHE:---}"
   mita_s="$(mita_status_short)"; wg_s="$(wg_instance_count)"
-  cols="$(terminal_columns)"; width="$cols"; (( width > 96 )) && width=96
+  display_local="$(mask_ip_for_display "$local_ip")"
+  display_pub="$(mask_ip_for_display "$pub")"
+  privacy_badge=""; [[ "$PRIVACY_MODE" == "1" ]] && privacy_badge=" · 脱敏 ON"
+  cols="$(terminal_columns)"; width="$cols"; (( width > 100 )) && width=100
 
-  printf '%s%s▓▒░%s %sH U R I   L I N K   C O N S O L E%s %s%s░▒▓%s\n' \
-    "$BOLD" "$BMAGENTA" "$RESET" "$BWHITE" "$RESET" "$BOLD" "$BCYAN" "$RESET"
-  printf '%s沪日合规隧道交付控制台%s  D%s · Mieru %s · WireGuard %s套 · v%s\n' \
-    "$BCYAN" "$RESET" "$major" "$mita_s" "$wg_s" "$VERSION"
-  printf '%s本机%s %s  %s公网%s %s\n' "$BBLACK" "$RESET" "$local_ip" "$BBLACK" "$RESET" "$pub"
-  ui_rule "$width"
+  printf '%s%s●%s %sHuRi Link Console%s %s│%s %sSH→JP COMPLIANT TUNNEL%s\n' \
+    "$BOLD" "$FIRE_RED" "$RESET" "$BOLD$FIRE_AMBER" "$RESET" "$BORDER_GRAY" "$RESET" "$BOLD$FIRE_WHITE" "$RESET"
+  printf '%s沪日合规隧道交付控制台%s  D%s · Mieru %s · WG %s套 · v%s%s\n' \
+    "$TEXT_GRAY" "$RESET" "$major" "$mita_s" "$wg_s" "$VERSION" "$privacy_badge"
+  printf '%s本机%s %s  %s公网%s %s\n' "$BORDER_GRAY" "$RESET" "$display_local" "$BORDER_GRAY" "$RESET" "$display_pub"
+  ui_rule "$width" "$BORDER_GRAY"
 }
 
 draw_dashboard_header() {
-  local cols width split major local_ip pub mita_s wg_s host kernel arch cpu mem disk uptime_value
-  local iface cc qdisc net_mode
+  local cols width split major local_ip pub display_local display_pub mita_s wg_s host display_host kernel arch cpu mem disk uptime_value
+  local iface cc qdisc net_mode privacy_badge
   cols="$(terminal_columns)"
-  if (( cols < 78 )); then
+  if (( cols < 86 )); then
     draw_compact_header
     return
   fi
 
-  width="$cols"; (( width > 96 )) && width=96
+  width="$cols"; (( width > 100 )) && width=100
   split=$(( width / 2 + 1 ))
   major="$(debian_major 2>/dev/null || printf '?')"
   local_ip="$(local_ipv4 2>/dev/null || true)"; local_ip="${local_ip:---}"
@@ -365,22 +405,27 @@ draw_dashboard_header() {
   elif is_private_ipv4 "$local_ip" || [[ "$local_ip" != "$pub" ]]; then
     net_mode="NAT映射"
   fi
+  display_host="$(mask_host_for_display "$host")"
+  display_local="$(mask_ip_for_display "$local_ip")"
+  display_pub="$(mask_ip_for_display "$pub")"
+  privacy_badge=""; [[ "$PRIVACY_MODE" == "1" ]] && privacy_badge=" · 脱敏 ON"
 
-  printf '%s%s●%s %sHuRi Link Console%s %s│%s %sSH→JP COMPLIANT TUNNEL%s %s│ D%s · v%s%s\n' \
-    "$BOLD" "$BMAGENTA" "$RESET" "$BOLD$BMAGENTA" "$RESET" "$BBLACK" "$RESET" \
-    "$BOLD$WHITE" "$RESET" "$DIM" "$major" "$VERSION" "$RESET"
-  ui_rule "$width" "$BBLACK"
-  draw_ansi_logo
-  printf '%s%s                 [ 沪日专线 · 日本 BGP 出口 · 合规隧道交付 ]%s\n' "$BOLD" "$BBLUE" "$RESET"
-  ui_rule "$width" "$BBLACK"
-  status_split_row "${BOLD}${BCYAN}▣  即时动态硬件监控${RESET}" "${BOLD}${BCYAN}◎  专线网络与服务参数${RESET}" "$split"
-  status_split_row "• 主机：${host}" "• 公网：${pub}" "$split"
-  status_split_row "• 系统：D${major} / ${kernel}" "• 本机：${local_ip}" "$split"
-  status_split_row "• 处理器：${cpu} vCPU / ${arch}" "• 接入：${iface} / ${net_mode}" "$split"
-  status_split_row "• 内存：${mem}" "• TCP：${cc} / ${qdisc}" "$split"
-  status_split_row "• 磁盘：${disk}" "• 服务：Mieru ${mita_s} / WG ${wg_s}套" "$split"
-  status_split_row "• 运行：${uptime_value}" "• 模式：仅合规隧道" "$split"
-  ui_rule "$width" "$BBLACK"
+  printf '%s%s●%s %sHuRi Link Console%s %s│%s %sSH→JP COMPLIANT TUNNEL%s %s│ D%s · v%s%s%s\n' \
+    "$BOLD" "$FIRE_RED" "$RESET" "$BOLD$FIRE_AMBER" "$RESET" "$BORDER_GRAY" "$RESET" \
+    "$BOLD$FIRE_WHITE" "$RESET" "$TEXT_GRAY" "$major" "$VERSION" "$privacy_badge" "$RESET"
+  ui_rule "$width" "$BORDER_GRAY"
+  draw_fire_logo "$width"
+  printf '%*s%s%s🔥 [ 沪日 IPLC 专线 · 日本 BGP 独立出口 · 合规隧道 ]%s\n' \
+    "$(( (width - 52) / 2 ))" '' "$BOLD" "$FIRE_AMBER" "$RESET"
+  ui_rule "$width" "$BORDER_GRAY"
+  status_split_row "${BOLD}${FIRE_AMBER}▣  即时动态硬件监控${RESET}" "${BOLD}${FIRE_AMBER}◎  专线网络与服务参数${RESET}" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 主机：${BWHITE}${display_host}${RESET}" "${TEXT_GRAY}•${RESET} 公网：${BWHITE}${display_pub}${RESET}" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 系统：D${major} / ${kernel}" "${TEXT_GRAY}•${RESET} 本机：${display_local}" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 处理器：${cpu} vCPU / ${arch}" "${TEXT_GRAY}•${RESET} 接入：${iface} / ${net_mode}" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 内存：${mem}" "${TEXT_GRAY}•${RESET} TCP：${cc} / ${qdisc}" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 磁盘：${disk}" "${TEXT_GRAY}•${RESET} 服务：Mieru ${mita_s} / WG ${wg_s}套" "$split"
+  status_split_row "${TEXT_GRAY}•${RESET} 运行：${uptime_value}" "${TEXT_GRAY}•${RESET} 模式：仅合规隧道" "$split"
+  ui_rule "$width" "$BORDER_GRAY"
 }
 
 # 保留旧函数名，方便已安装版本或外部测试继续调用。
@@ -1253,6 +1298,7 @@ ${APP_NAME} v${VERSION}
   bash huri-panel.sh --health     执行一次系统体检
   bash huri-panel.sh --self-test  离线自检，不修改系统
   bash huri-panel.sh --preview-ui 预览新版 ANSI 抬头，不修改系统
+  bash huri-panel.sh --privacy   脱敏显示主机名及 IP 后进入面板
   bash huri-panel.sh --install    安装/更新为 huri 命令
   bash huri-panel.sh --version
   bash huri-panel.sh --help
@@ -1279,7 +1325,7 @@ panel_main() {
     clear_screen; draw_dashboard_header; printf '\n'
     for ((i=0; i<${#tabs[@]}; i++)); do
       if (( i == tab )); then
-        printf ' %s%s[ %s ]%s ' "$BG_CYAN" "$BLACK" "${tabs[$i]}" "$RESET"
+        printf ' %s%s[ %s ]%s ' "$BG_FIRE_AMBER" "$BLACK" "${tabs[$i]}" "$RESET"
       else
         printf ' %s%s %s %s ' "$DIM" "$WHITE" "${tabs[$i]}" "$RESET"
       fi
@@ -1287,14 +1333,14 @@ panel_main() {
     printf '\n'; ui_rule "$(terminal_columns)" "$BBLACK"
     for ((i=0; i<item_count; i++)); do
       if (( i == selected )); then
-        printf '  %s%s ▶  %02d  %-43s %s\n' "$BG_MAGENTA" "$BWHITE" "$((i + 1))" "${items[$i]}" "$RESET"
+        printf '  %s%s ▶  %02d  %-43s %s\n' "$BG_FIRE_RED" "$FIRE_WHITE" "$((i + 1))" "${items[$i]}" "$RESET"
       else
         printf '     %s%02d%s  %s%s%s\n' "$BBLACK" "$((i + 1))" "$RESET" "$BCYAN" "${items[$i]}" "$RESET"
       fi
     done
     printf '\n%s合规边界：%s仅部署 Mieru / WireGuard；完整说明位于「维护 → 帮助与边界」。\n' "$BYELLOW" "$RESET"
-    printf '\n%s←/→%s 分类   %s↑/↓%s 选择   %sEnter%s 执行   %sQ%s 退出\n' \
-      "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET"
+    printf '\n%s←/→%s 分类   %s↑/↓%s 选择   %sEnter%s 执行   %sP%s 脱敏   %sQ%s 退出\n' \
+      "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET" "$BWHITE" "$RESET"
     key="$(read_key)"
     case "$key" in
       LEFT) tab=$(( (tab + ${#tabs[@]} - 1) % ${#tabs[@]} )); selected=0 ;;
@@ -1302,6 +1348,7 @@ panel_main() {
       UP) selected=$(( (selected + item_count - 1) % item_count )) ;;
       DOWN) selected=$(( (selected + 1) % item_count )) ;;
       QUIT|ESC) clear_screen; show_cursor; return ;;
+      p|P) [[ "$PRIVACY_MODE" == "1" ]] && PRIVACY_MODE=0 || PRIVACY_MODE=1 ;;
       ENTER)
         case "${tab}:${selected}" in
           0:0) health_check ;; 0:1) apply_optimization ;; 0:2) show_ports_services ;;
@@ -1322,6 +1369,10 @@ panel_main() {
 }
 
 main() {
+  if [[ "${1:-}" == "--privacy" ]]; then
+    PRIVACY_MODE=1
+    shift
+  fi
   case "${1:-}" in
     --help|-h) usage; return 0 ;;
     --version|-V) printf '%s v%s\n' "$APP_NAME" "$VERSION"; return 0 ;;
