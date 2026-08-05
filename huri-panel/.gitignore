@@ -1,0 +1,9 @@
+# Never commit generated credentials, private keys or local state.
+exports/
+state/
+backups/
+*.local
+*.conf
+*ShareLinks*
+*private*
+*preshared*
