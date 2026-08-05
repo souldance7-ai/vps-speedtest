@@ -25,6 +25,7 @@ grep -q '░▒▓█▀▀' <<<"$wide_preview" || fail 'wide ANSI shadow layer 
 grep -q '即时动态硬件监控' <<<"$wide_preview" || fail 'wide hardware status panel is missing'
 grep -q '专线网络与服务参数' <<<"$wide_preview" || fail 'wide network status panel is missing'
 grep -q '203.0.113.10' <<<"$wide_preview" || fail 'preview public IP override is missing'
+grep -q '实测出口' <<<"$wide_preview" || fail 'detected egress IP is not labeled as measured egress'
 
 compact_preview="$(NO_COLOR=1 COLUMNS=70 HURI_PREVIEW_PUBLIC_IP=203.0.113.10 bash "$PANEL" --preview-ui)"
 grep -q 'HuRi Link Console │ SH→JP COMPLIANT TUNNEL' <<<"$compact_preview" || \
@@ -51,9 +52,18 @@ bash -c '
   set -Eeuo pipefail
   source "$1"
   ensure_layout
+  ask() { printf -v "$1" "%s" "1"; }
+  choose_huri_entry_type selected_entry >/dev/null
+  [[ "$selected_entry" == "移动入口（China Mobile）" ]]
   registry_add_node "沪日-A" "203.0.113.10" 10503 TCP "huri_a" "p#ss:&word-123456" 1400
   registry_add_node "沪日-B" "2001:db8::10" 10504 UDP "huri_b" "second-password-123" 1280
   generate_mihomo_config false >/dev/null
+  store_wg_instance "wg-huri0" "198.51.100.10" 10101 10101 "10.88.0" \
+    "test-server-public-key" 1380 "eth0" "移动入口（China Mobile）" "10100-10199" \
+    "203.0.113.10" "10.0.0.2"
+  jq -e '\''.[0].endpointLabel == "移动入口（China Mobile）" and
+    .[0].declaredPortRange == "10100-10199" and
+    .[0].publicPort == 10101 and .[0].localPort == 10101'\'' "$WG_STATE_FILE" >/dev/null
   safe="$(safe_file_component "../../root/unsafe")"
   [[ "$safe" != */* && -n "$safe" ]]
 ' _ "$PANEL"
@@ -95,6 +105,14 @@ grep -q 'HANDSHAKE_STANDARD' "$PANEL" || fail 'missing Mieru handshake mode'
 grep -q 'strategy: round-robin' "$PANEL" || fail 'missing round-robin group'
 grep -q 'strategy: consistent-hashing' "$PANEL" || fail 'missing consistent-hashing group'
 grep -q 'PersistentKeepalive = 25' "$PANEL" || fail 'missing NAT keepalive'
+grep -q '商家后台“可用端口范围”' "$PANEL" || fail 'missing provider port-range prompt'
+grep -q '移动入口（China Mobile）' "$PANEL" || fail 'missing provider entry label'
+grep -q '实测日本 BGP 固定出口.*不.*Endpoint' "$PANEL" || fail 'missing ingress/egress warning'
+grep -q '商家后台通常只显示入口，不显示日本固定出口' "$PANEL" || \
+  fail 'missing provider-panel versus measured-egress explanation'
+if grep -q '商家公网 UDP 端口.*20000' "$PANEL"; then
+  fail 'WireGuard still exposes the obsolete fixed port 20000'
+fi
 grep -q 'ix-route.sh' "$PANEL" || fail 'missing IX tool link'
 grep -q '3net-route-speed.sh' "$PANEL" || fail 'missing China3Net speed link'
 grep -q -- '--preview-ui' "$PANEL" || fail 'missing UI preview mode'
